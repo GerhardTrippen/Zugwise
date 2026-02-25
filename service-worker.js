@@ -1,13 +1,13 @@
 // sw.js - Service Worker for Zugwise PWA
 // Place this file in your root directory (same level as index.html)
 
-const CACHE_NAME = 'zugwise-v0.5';
+const CACHE_NAME = 'zugwise-v0.5.1';
 
 // Origins that don't send CORS headers — must use no-cors (gives opaque responses)
 const NO_CORS_ORIGINS = ['docs.opencv.org', 'cdn.tailwindcss.com'];
 
 // Generate piece asset paths: 12 sets × 12 pieces = 144 SVGs
-const PIECE_SETS = ['chessnut','california','maestro','fresca','cardinal','gioco','tatiana','dubrovny','icpieces','kosal','staunty','rhosgfx'];
+const PIECE_SETS = ['maestro','chessnut','california','fresca','cardinal','gioco','tatiana','dubrovny','icpieces','kosal','staunty','rhosgfx'];
 const PIECE_FILES = ['wK','wQ','wR','wB','wN','wP','bK','bQ','bR','bB','bN','bP'];
 const PIECE_ASSETS = PIECE_SETS.flatMap(s => PIECE_FILES.map(p => `./pieces/${s}/${p}.svg`));
 

@@ -1,4 +1,4 @@
-var CONFIG={pieceStyle:localStorage.getItem('zugwise_pieceStyle')||'chessnut',apiUrl:'http://localhost:5000',usePyodide:false};
+var CONFIG={pieceStyle:localStorage.getItem('zugwise_pieceStyle')||'maestro',apiUrl:'http://localhost:5000',usePyodide:false};
 var chess=null;
 var state={board:null,moves:[],sans:[],currentPly:0,stuckPly:null,stuckInfo:null,legalMoves:[],selectedFix:null,debugVisible:false,errorArrow:null,fixArrow:null,ocrArrow:null,missingMoveCandidates:[],editMode:null,editSortMode:'similarity',confirmedPly:0,fixedPlies:[],hasGridImage:false,ocrCells:[],inputMode:null,previewPly:null,pendingConfirmation:null,approvedPlies:[],lockedPlies:[],boardSelection:null,mergeTierMap:null,mergeLockedPlies:null,mergeSettings:{lockMode:'tier1'}};
 var INITIAL_FEN='rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';

@@ -13,11 +13,11 @@
 
 var DEFAULT_PROFILES = [
     {
-        name: "CFC 40-Move (2 pages)",
+        name: "MCC 40-Move (2 pages)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
-            { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 21 }
+            { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 41 }
         ]
     },
     {
@@ -32,7 +32,7 @@ var DEFAULT_PROFILES = [
         builtin: true,
         pages: [
             { format: '2col', rowCount: 25, headerRows: 1, footerRows: 1, startingMove: 1 },
-            { format: '2col', rowCount: 25, headerRows: 1, footerRows: 1, startingMove: 26 }
+            { format: '2col', rowCount: 25, headerRows: 1, footerRows: 1, startingMove: 51 }
         ]
     },
     {

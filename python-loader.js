@@ -40,9 +40,9 @@ async function loadPythonModules(pyodide) {
 
     for (const moduleName of modules) {
         try {
-            const response = await fetch(`/backend-python/${moduleName}`);
+            const response = await fetch(`backend-python/${moduleName}`);
             if (!response.ok) {
-                console.warn(`Module not found: /backend-python/${moduleName}, skipping...`);
+                console.warn(`Module not found: backend-python/${moduleName}, skipping...`);
                 continue;
             }
             let code = await response.text();
