@@ -1,0 +1,67 @@
+.square-light { background-color: #f0d9b5; }
+.square-dark { background-color: #b58863; }
+.square-highlight { background-color: rgba(255, 255, 0, 0.5) !important; }
+.piece { width: 90%; height: 90%; background-size: contain; background-repeat: no-repeat; background-position: center; user-select: none; }
+
+/* Board coordinate labels should never be selectable */
+#board-grid span { user-select: none; -webkit-user-select: none; }
+.move-ok { color: #e5e7eb; }
+.move-error { color: #f87171; background: rgba(239, 68, 68, 0.15); border-radius: 4px; }
+.move-fixed { color: #4ade80; }
+.move-locked { color: #facc15; }
+.move-current { background: rgba(59, 130, 246, 0.3); border-radius: 4px; }
+.move-pending { color: #9ca3af; }
+.move-corrected { border-left: 2px solid #22d3ee; padding-left: 4px; }
+.processing-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; z-index: 50; border-radius: 0.5rem; }
+.spinner { width: 40px; height: 40px; border: 4px solid #374151; border-top-color: #3b82f6; border-radius: 50%; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+.calculating { animation: pulse 1.5s ease-in-out infinite; }
+.board-frame { background: rgba(59, 130, 246, 0.3); padding: 8px; border-radius: 8px; }
+.arrow-overlay { position: absolute; inset: 0; pointer-events: none; z-index: 10; }
+
+/* Click-to-move: selected source square */
+.square-selected { background-color: rgba(20, 85, 180, 0.65) !important; }
+
+/* Click-to-move: legal target (non-capture) - centered dot */
+.square-legal-target { cursor: pointer; }
+.square-legal-target::after {
+  content: '';
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: 28%; height: 28%;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+}
+
+/* Click-to-move: legal target (capture) - ring around square */
+.square-legal-target-capture { cursor: pointer; }
+.square-legal-target-capture::after {
+  content: '';
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: 88%; height: 88%;
+  border-radius: 50%;
+  border: 6px solid rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+}
+
+/* Interactive squares: grab cursor for own pieces */
+.square-interactive { cursor: grab; }
+
+/* During drag: grabbing cursor everywhere and prevent text selection */
+.board-dragging, .board-dragging * { cursor: grabbing !important; user-select: none !important; -webkit-user-select: none !important; }
+
+/* Ghost piece follows cursor during drag */
+.drag-ghost {
+  position: fixed;
+  pointer-events: none;
+  z-index: 9999;
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+  opacity: 0.9;
+}

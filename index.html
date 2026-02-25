@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zugwise - Helping you put the pieces where they belong</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="icon" href="icons/favicon-32.png" sizes="32x32" type="image/png">
+  <link rel="icon" href="icons/zugwise-icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <!-- OpenCV.js for image processing (deskew, perspective correction, grid detection) -->
+  <script async src="https://docs.opencv.org/4.9.0/opencv.js" onload="console.log('OpenCV.js loaded')"></script>
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#1a1a2e">
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col">
+  <div id="offline-status" class="hidden fixed top-0 left-0 right-0 bg-yellow-500 text-white text-center py-2 z-50"></div>
+  <header class="bg-gray-800 border-b border-gray-700 px-6 py-4">
+    <div class="max-w-7xl mx-auto flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <img src="icons/zugwise-icon.svg" alt="Zugwise" class="w-10 h-10">
+        <div>
+          <h1 class="text-2xl font-bold text-white">Zugwise</h1>
+          <p class="text-sm text-gray-400">Helping you put the pieces where they belong - Free. Private. Offline. Forever.</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <select id="piece-style" title="Change chess piece appearance" class="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm">
+          <option value="maestro">maestro</option>
+          <option value="chessnut">chessnut</option>
+          <option value="california">california</option>
+          <option value="fresca">fresca</option>
+          <option value="cardinal">cardinal</option>
+          <option value="gioco">gioco</option>
+          <option value="tatiana">tatiana</option>
+          <option value="dubrovny">dubrovny</option>
+          <option value="icpieces">icpieces</option>
+          <option value="kosal">kosal</option>
+          <option value="staunty">staunty</option>
+          <option value="rhosgfx">rhosgfx</option>
+        </select>
+        <button id="btn-settings" title="Auto-fix settings" class="px-3 py-1.5 rounded text-sm bg-gray-700 hover:bg-gray-600 flex items-center gap-1">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+          </svg>
+          <span>Settings</span>
+        </button>
+        <button id="btn-debug" title="Show debug console" class="px-3 py-1.5 rounded text-sm bg-gray-700 hover:bg-gray-600">Debug</button>
+      </div>
+    </div>
+  </header>
+  <div class="bg-gray-800 border-b border-gray-700">
+    <div id="input-bar" class="max-w-7xl mx-auto px-6 py-3">
+      <div id="input-collapsed" class="hidden items-center justify-between">
+        <div class="flex items-center gap-2">
+          <span id="loaded-info" class="text-sm text-gray-300">📄 Game loaded</span>
+          <button id="btn-download-ocr" class="text-xs px-2 py-1 bg-green-800 hover:bg-green-700 rounded hidden" title="Download OCR data as text">⬇ OCR</button>
+          <button id="btn-download-ocr-sheet1" class="text-xs px-2 py-1 bg-green-800 hover:bg-green-700 rounded hidden" title="Download White's OCR data">⬇ OCR White</button>
+          <button id="btn-download-ocr-sheet2" class="text-xs px-2 py-1 bg-green-800 hover:bg-green-700 rounded hidden" title="Download Black's OCR data">⬇ OCR Black</button>
+          <button id="btn-reocr" class="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded hidden" title="Re-OCR with manual corner selection">🎯 Re-OCR</button>
+          <button id="btn-change-input" class="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded" title="Load different game">🔄 Change</button>
+        </div>
+        <button id="btn-toggle-help" class="text-xs text-gray-400 hover:text-blue-400 flex items-center gap-1" title="Show usage tips">
+          <span>💡</span><span id="help-toggle-text">Tips</span>
+        </button>
+      </div>
+      <div id="quick-help" class="hidden mt-2 p-2 bg-gray-700/50 rounded text-xs text-gray-300 space-y-1">
+        <div><span class="text-blue-400 font-medium">Click</span> move → navigate to position</div>
+        <div><span class="text-yellow-400 font-medium">Double-click</span> move → edit manually</div>
+        <div><span class="text-green-400 font-medium">← →</span> arrow keys to step through</div>
+        <div><span class="text-green-400 font-medium">Enter</span> apply fix · <span class="text-gray-400">Esc</span> cancel</div>
+        <div class="pt-1.5 border-t border-gray-600 mt-1.5 flex items-center gap-3">
+          <span><span class="inline-block w-2 h-2 rounded-full bg-green-400"></span> valid</span>
+          <span><span class="inline-block w-2 h-2 rounded-full bg-yellow-500"></span> fixed</span>
+          <span><span class="inline-block w-2 h-2 rounded-full bg-red-400"></span> error</span>
+          <span><span class="inline-block w-2 h-2 rounded-full bg-gray-500"></span> pending</span>
+        </div>
+      </div>
+      <div id="input-expanded">
+        <div class="flex items-center gap-2 mb-3">
+          <button class="input-tab px-3 py-1.5 rounded text-sm bg-blue-600 text-white" data-mode="upload">📷 Image</button>
+          <button class="input-tab px-3 py-1.5 rounded text-sm bg-gray-700 text-gray-300" data-mode="pgn">📋 PGN</button>
+          <button class="input-tab px-3 py-1.5 rounded text-sm bg-gray-700 text-gray-300" data-mode="ocr">📤 OCR Text</button>
+          <div class="flex-1"></div>
+          <button id="btn-demo" class="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 rounded text-sm font-medium">🎮 Demo</button>
+        </div>
+        <div id="mode-upload" class="input-content">
+          <!-- Simple single-image upload (existing behavior) -->
+          <div id="simple-upload" class="mb-4">
+            <!-- Sheet Profile Selector -->
+            <div id="profile-bar" class="flex items-center gap-2 mb-2 text-sm">
+              <label class="text-gray-400">Profile:</label>
+              <select id="profile-select" class="bg-gray-700 text-white rounded px-2 py-1 text-sm flex-1 max-w-xs"></select>
+              <button id="btn-edit-profile" class="text-gray-400 hover:text-white text-sm" title="Edit profiles">&#9998;</button>
+              <span id="profile-summary" class="text-gray-500 text-xs ml-2"></span>
+            </div>
+            <div id="drop-zone" class="relative border-2 border-dashed border-gray-600 hover:border-gray-500 rounded-lg p-4 text-center cursor-pointer">
+              <input type="file" id="file-input" accept="image/*" multiple class="hidden">
+              <p class="text-gray-300">Drop scoresheet image(s) or <span class="text-blue-400">click to browse</span></p>
+              <p class="text-xs text-gray-500 mt-1">Quick upload for single pages</p>
+              <div id="processing-overlay" class="processing-overlay hidden">
+                <div class="spinner"></div>
+                <span id="processing-text" class="text-blue-300 font-medium">Processing OCR...</span>
+                <p class="text-xs text-gray-500 mt-2">Tip: Open multiple tabs to work on several games at once</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Toggle for advanced multi-sheet mode -->
+          <div class="flex items-center justify-center">
+            <button id="btn-toggle-multisheet" class="text-sm text-blue-400 hover:text-blue-300 flex items-center gap-1">
+              <span id="multisheet-toggle-icon">&#9660;</span>
+              <span id="multisheet-toggle-text">Advanced: Multiple sheets / Both players</span>
+            </button>
+          </div>
+
+          <!-- Multi-sheet uploader (hidden by default) -->
+          <div id="sheets-uploader" class="hidden mt-4">
+            <!-- Content will be rendered by sheets.js -->
+          </div>
+        </div>
+        <div id="mode-pgn" class="input-content hidden">
+          <!-- Single PGN input (default) -->
+          <div id="pgn-single-input">
+            <textarea id="pgn-input" placeholder="1. e4 e5 2. Nf3 Nc6..." class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-3 text-gray-200 font-mono text-sm"></textarea>
+          </div>
+          <!-- Two-player PGN input (hidden by default) -->
+          <div id="pgn-dual-input" class="hidden">
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="text-xs text-gray-400 mb-1 block">&#9812; White's moves:</label>
+                <textarea id="pgn-input-white" placeholder="1. e4&#10;2. Nf3&#10;3. Bc4" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-sm"></textarea>
+              </div>
+              <div>
+                <label class="text-xs text-gray-400 mb-1 block">&#9818; Black's moves:</label>
+                <textarea id="pgn-input-black" placeholder="1... e5&#10;2... Nc6&#10;3... Bc5" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-sm"></textarea>
+              </div>
+            </div>
+            <p class="text-xs text-gray-500 mt-1">Moves are interleaved automatically</p>
+          </div>
+          <!-- Toggle for dual input -->
+          <div class="flex items-center justify-center mt-2">
+            <button id="btn-toggle-pgn-dual" class="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1">
+              <span id="pgn-dual-toggle-icon">&#9660;</span>
+              <span id="pgn-dual-toggle-text">Separate White/Black input</span>
+            </button>
+          </div>
+          <div class="mt-2 flex items-center gap-2">
+            <label class="text-xs text-gray-400">Optional image for context:</label>
+            <input type="file" id="pgn-image-input" accept="image/*" class="text-xs text-gray-400">
+          </div>
+          <button id="btn-load-pgn" class="mt-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm">Load PGN</button>
+        </div>
+        <div id="mode-ocr" class="input-content hidden">
+          <!-- Single OCR input (default) -->
+          <div id="ocr-single-input">
+            <textarea id="ocr-input" placeholder="1.W e4 0.99&#10;1.B e5 0.98&#10;2.W Nf3 0.95 Nc3 0.03" class="w-full h-20 bg-gray-700 border border-gray-600 rounded-lg p-3 text-gray-200 font-mono text-xs"></textarea>
+            <p class="text-xs text-gray-500 mt-1">Format: {num}.{W/B} {move} {confidence} [{alt} {alt_conf}] &mdash; <a href="ocr-prompt.md" target="_blank" class="text-blue-400 hover:text-blue-300 underline">OCR prompt for external tools</a></p>
+          </div>
+          <!-- Two-player OCR input (hidden by default) -->
+          <div id="ocr-dual-input" class="hidden">
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="text-xs text-gray-400 mb-1 block">&#9812; White's moves:</label>
+                <textarea id="ocr-input-white" placeholder="1. e4&#10;2. Nf3&#10;3. Bc4" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-xs"></textarea>
+              </div>
+              <div>
+                <label class="text-xs text-gray-400 mb-1 block">&#9818; Black's moves:</label>
+                <textarea id="ocr-input-black" placeholder="1. e5&#10;2. Nc6&#10;3. Bc5" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-xs"></textarea>
+              </div>
+            </div>
+            <p class="text-xs text-gray-500 mt-1">Format: {num}. {move} (moves are interleaved automatically)</p>
+          </div>
+          <!-- Toggle for dual input -->
+          <div class="flex items-center justify-center mt-2">
+            <button id="btn-toggle-ocr-dual" class="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1">
+              <span id="ocr-dual-toggle-icon">&#9660;</span>
+              <span id="ocr-dual-toggle-text">Separate White/Black input</span>
+            </button>
+          </div>
+          <div class="mt-2 flex items-center gap-2">
+            <label class="text-xs text-gray-400">Optional image for context:</label>
+            <input type="file" id="ocr-image-input" accept="image/*" class="text-xs text-gray-400">
+          </div>
+          <button id="btn-load-ocr" class="mt-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm">Load OCR</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <main id="main-content" class="flex-1 max-w-7xl mx-auto px-6 py-6 w-full">
+    <div id="main-grid" class="grid grid-cols-12 gap-6">
+      <div id="panel-board" class="col-span-4">
+        <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+          <h2 class="text-lg font-semibold mb-3 text-gray-200 flex items-center gap-2">Position<button id="btn-copy-fen" title="Copy FEN to clipboard" class="text-sm text-gray-500 hover:text-gray-300">📋</button><a id="btn-fen-lichess" title="Open position in Lichess board editor" class="text-sm text-gray-500 hover:text-gray-300 cursor-pointer" target="_blank">🔗</a></h2>
+          <div class="w-full max-w-sm mx-auto">
+            <div class="board-frame">
+              <div class="relative w-full" style="padding-bottom: 100%;">
+                <div id="board-grid" class="absolute inset-0 grid grid-cols-8 grid-rows-8 border-2 border-gray-600 rounded overflow-hidden"></div>
+                <svg id="arrow-overlay" class="arrow-overlay" viewBox="0 0 800 800">
+                  <defs>
+                    <marker id="ah-red" markerWidth="4" markerHeight="4" refX="3" refY="2" orient="auto"><polygon points="0 0, 4 2, 0 4" fill="rgba(239,68,68,0.9)"/></marker>
+                    <marker id="ah-yellow" markerWidth="4" markerHeight="4" refX="3" refY="2" orient="auto"><polygon points="0 0, 4 2, 0 4" fill="rgba(250,204,21,0.9)"/></marker>
+                    <marker id="ah-green" markerWidth="4" markerHeight="4" refX="3" refY="2" orient="auto"><polygon points="0 0, 4 2, 0 4" fill="rgba(34,197,94,0.9)"/></marker>
+                  </defs>
+                </svg>
+              </div>
+            </div>
+          </div>
+          <div class="flex justify-center gap-2 mt-3">
+            <button id="btn-first" title="Go to start (Home)" class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm">⏮</button>
+            <button id="btn-prev" title="Previous move (←)" class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm">◀</button>
+            <span id="position-info" class="px-3 py-1 text-sm text-gray-400">Start</span>
+            <button id="btn-next" title="Next move (→)" class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm">▶</button>
+            <button id="btn-last" title="Go to end (End)" class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm">⭮</button>
+          </div>
+          <!-- Full Game Search (under board) -->
+          <div class="mt-4 pt-3 border-t border-gray-700">
+            <div class="text-xs text-gray-500 mb-2">Auto-search:</div>
+            <div id="search-buttons" class="flex gap-2">
+              <button id="btn-greedy-search" title="Fast single-path search: picks the top fix at each stuck point" class="flex-1 px-2 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed">
+                Greedy
+              </button>
+              <button id="btn-beam-search" title="Thorough multi-path exploration: considers multiple fix candidates (slower)" class="flex-1 px-2 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed">
+                Beam
+              </button>
+            </div>
+            <!-- Search Progress - Stacked panels (visible once any search starts) -->
+            <div id="search-progress" class="hidden mt-2 space-y-2">
+              <!-- Greedy panel -->
+              <div class="bg-gray-700 rounded border border-gray-600 flex flex-col">
+                <div class="flex items-center justify-between px-2 py-1 border-b border-gray-600">
+                  <span class="text-xs font-medium text-green-400">Greedy</span>
+                  <div class="flex items-center gap-2">
+                    <span id="greedy-status" class="text-xs text-gray-400">Idle</span>
+                    <button id="btn-cancel-greedy" class="text-xs text-red-400 hover:text-red-300 hidden">&#10005;</button>
+                    <button id="btn-apply-greedy" class="text-xs px-1.5 py-0.5 bg-green-700 hover:bg-green-600 rounded hidden">Apply</button>
+                  </div>
+                </div>
+                <div class="px-2 py-1">
+                  <div class="w-full bg-gray-600 rounded-full h-1">
+                    <div id="greedy-progress-bar" class="bg-green-500 h-1 rounded-full transition-all" style="width: 0%"></div>
+                  </div>
+                </div>
+                <div id="greedy-log" class="px-2 pb-2 overflow-y-auto max-h-32 text-xs font-mono text-gray-300 space-y-0.5"></div>
+              </div>
+              <!-- Beam panel -->
+              <div class="bg-gray-700 rounded border border-gray-600 flex flex-col">
+                <div class="flex items-center justify-between px-2 py-1 border-b border-gray-600">
+                  <span class="text-xs font-medium text-blue-400">Beam</span>
+                  <div class="flex items-center gap-2">
+                    <span id="beam-status" class="text-xs text-gray-400">Idle</span>
+                    <button id="btn-cancel-beam" class="text-xs text-red-400 hover:text-red-300 hidden">&#10005;</button>
+                    <button id="btn-apply-beam" class="text-xs px-1.5 py-0.5 bg-green-700 hover:bg-green-600 rounded hidden">Apply</button>
+                  </div>
+                </div>
+                <div class="px-2 py-1">
+                  <div class="w-full bg-gray-600 rounded-full h-1">
+                    <div id="beam-progress-bar" class="bg-blue-500 h-1 rounded-full transition-all" style="width: 0%"></div>
+                  </div>
+                </div>
+                <div id="beam-log" class="px-2 pb-2 overflow-y-auto max-h-32 text-xs font-mono text-gray-300 space-y-0.5"></div>
+              </div>
+            </div>
+            <!-- Hidden search-output-log for legacy compat -->
+            <div id="search-output" class="hidden">
+              <div id="search-output-log"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="panel-fixes" class="col-span-4">
+        <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 h-full flex flex-col relative">
+          <h2 id="fix-panel-title" class="text-lg font-semibold mb-1 text-gray-200">Fix Suggestions</h2>
+          <div id="stuck-info" class="text-sm text-gray-400 mb-2">No issues detected</div>
+          <button id="btn-apply" title="Apply selected fix (Enter)" disabled class="w-full mb-3 py-3 rounded-lg font-semibold bg-gray-700 text-gray-500 cursor-not-allowed">Select a fix</button>
+          <div id="source-preview" class="hidden mb-3 p-2 bg-gray-700 rounded border border-gray-600">
+            <div class="text-xs text-gray-400">📢 OCR read: <span id="ocr-preview-text" class="text-yellow-300 font-mono"></span></div>
+          </div>
+          <div id="calculating-fixes" class="hidden mb-2 p-2 bg-blue-900/30 rounded border border-blue-700">
+            <span class="calculating text-blue-300 text-sm">🔍 Finding best fixes...</span>
+          </div>
+          <div id="fix-list" class="flex-1 overflow-y-auto space-y-2 min-h-0 max-h-[50vh]">
+            <div class="text-gray-500 text-sm p-4 text-center">Suggestions appear when issues are found</div>
+          </div>
+          <div id="fix-details" class="hidden mt-2 p-2 bg-gray-700/50 rounded border border-gray-600 text-xs">
+            <div id="fix-details-content"></div>
+          </div>
+          <details class="mt-3 pt-3 border-t border-gray-700">
+            <summary class="text-sm text-gray-400 cursor-pointer">▶ All legal moves <span id="legal-position" class="text-gray-500"></span>(<span id="legal-count">0</span>)</summary>
+            <div id="legal-moves" class="mt-2 p-2 bg-gray-700 rounded text-xs font-mono flex flex-wrap gap-1 max-h-24 overflow-y-auto"></div>
+          </details>
+        </div>
+      </div>
+      <div id="panel-moves" class="col-span-4">
+        <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 h-full flex flex-col">
+          <h2 class="text-lg font-semibold mb-3 text-gray-200">Moves</h2>
+          <div id="ocr-context-panel" class="hidden mb-3 p-1 bg-gray-700 rounded border border-gray-600">
+            <div id="ocr-context-content" class="font-mono text-sm overflow-hidden"></div>
+          </div>
+          <div id="move-list-container" class="flex-1 overflow-y-auto font-mono text-sm max-h-[50vh]">
+            <table class="w-full"><thead><tr class="text-gray-500 text-xs"><th class="w-8 text-left">#</th><th class="text-left pl-2">White</th><th class="text-left pl-2">Black</th></tr></thead><tbody id="move-tbody"></tbody></table>
+          </div>
+          <div id="move-status" class="mt-3 pt-3 border-t border-gray-700 text-sm text-gray-400">Load a game to begin</div>
+        </div>
+      </div>
+    </div>
+  </main>
+  <div id="debug-console" class="hidden fixed bottom-0 left-0 right-0 bg-gray-950 border-t border-gray-700 max-h-80">
+    <div class="flex items-center justify-between px-4 py-2 bg-gray-900">
+      <span class="text-sm text-gray-300">🔧 Debug Console</span>
+      <button id="btn-clear-debug" class="text-xs text-gray-500 hover:text-gray-300">Clear</button>
+    </div>
+    <div id="debug-log" class="p-4 overflow-y-auto max-h-64 font-mono text-xs text-gray-400 whitespace-pre-wrap"></div>
+  </div>
+  <footer class="bg-gray-800 border-t border-gray-700 px-6 py-3">
+    <div class="max-w-7xl mx-auto flex items-center justify-between text-sm text-gray-500">
+      <div>Zugwise v0.5</div>
+      <a href="https://buymeacoffee.com/zugwise" target="_blank" rel="noopener noreferrer"
+         class="text-yellow-500 hover:text-yellow-400 flex items-center gap-1"
+         title="Support this project">
+        ☕ <span class="hidden sm:inline">Buy me a coffee</span>
+      </a>
+      <div class="flex gap-4">
+        <button id="btn-download" title="Download game as PGN file" class="hover:text-gray-300">📥 Download PGN</button>
+        <button id="btn-lichess" title="Analyze position on Lichess.org" class="hover:text-gray-300">🔗 Open in Lichess</button>
+      </div>
+    </div>
+  </footer>
+  <!-- Settings Modal -->
+  <div id="settings-modal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center">
+    <div class="bg-gray-800 rounded-lg p-6 max-w-lg w-full max-h-[80vh] overflow-y-auto mx-4">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="text-xl font-bold text-white">Settings</h2>
+        <button id="settings-close" class="text-gray-400 hover:text-white text-2xl">&times;</button>
+      </div>
+
+      <!-- Piece Confusions -->
+      <div class="mb-6">
+        <h3 class="text-lg font-semibold text-blue-400 mb-2">Piece Confusions</h3>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-piece_K_R" class="mr-2"> K / R (King/Rook)
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-piece_B_R" class="mr-2"> B / R (Bishop/Rook)
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-piece_B_K" class="mr-2"> B / K (Bishop/King)
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-piece_N_R" class="mr-2"> N / R (Knight/Rook)
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-piece_Q_O" class="mr-2"> Q / O (Queen/Castling)
+          </label>
+        </div>
+      </div>
+
+      <!-- Piece-File Confusions (captures) -->
+      <div class="mb-6">
+        <h3 class="text-lg font-semibold text-purple-400 mb-2">Piece-File Confusions (captures only)</h3>
+        <p class="text-xs text-gray-400 mb-2">For captures like "Kxg4" vs "hxg4"</p>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-piece_K_h" class="mr-2"> K / h (King/h-pawn)
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-piece_B_b" class="mr-2"> B / b (Bishop/b-pawn)
+          </label>
+        </div>
+      </div>
+
+      <!-- File Confusions -->
+      <div class="mb-6">
+        <h3 class="text-lg font-semibold text-green-400 mb-2">File Confusions</h3>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-file_a_g" class="mr-2"> a / g (common)
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-file_a_d" class="mr-2"> a / d
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-file_b_d" class="mr-2"> b / d
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-file_e_c" class="mr-2"> e / c
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-file_b_h" class="mr-2"> b / h
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-file_f_t" class="mr-2"> f / t
+          </label>
+        </div>
+      </div>
+
+      <!-- Rank Confusions -->
+      <div class="mb-6">
+        <h3 class="text-lg font-semibold text-yellow-400 mb-2">Rank Confusions</h3>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-rank_1_7" class="mr-2"> 1 / 7
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-rank_2_7" class="mr-2"> 2 / 7
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-rank_3_8" class="mr-2"> 3 / 8
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-rank_4_5" class="mr-2"> 4 / 5
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-rank_1_4" class="mr-2"> 1 / 4
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-rank_6_8" class="mr-2"> 6 / 8
+          </label>
+        </div>
+      </div>
+
+      <!-- Other Options -->
+      <div class="mb-6">
+        <h3 class="text-lg font-semibold text-purple-400 mb-2">Other Quick Fixes</h3>
+        <div class="space-y-2">
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-fix_capture_notation" class="mr-2"> Fix capture notation (add/remove x)
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-fix_combined" class="mr-2"> Try combined fixes (piece+file, etc.)
+          </label>
+        </div>
+      </div>
+
+      <!-- Fix-Finding Pipeline -->
+      <div class="mb-6">
+        <h3 class="text-lg font-semibold text-orange-400 mb-2">Fix-Finding Pipeline</h3>
+        <div class="space-y-3">
+          <!-- Layer 1: Quick Fixes -->
+          <div class="bg-gray-700/50 rounded p-2">
+            <label class="flex items-center text-gray-300 text-sm font-medium">
+              <input type="checkbox" id="set-enable_quick_fixes" class="mr-2"> Layer 1: Quick Fixes
+            </label>
+            <p class="text-xs text-gray-500 mt-1 ml-5">
+              Try OCR alternatives and character similarity swaps (R/K, a/g, 3/8, etc.)
+              Auto-applies if exactly ONE fix is legal.
+            </p>
+            <div class="ml-5 mt-2 space-y-2">
+              <label class="flex items-start text-gray-300 text-sm">
+                <input type="checkbox" id="set-ocr_autofix" class="mr-2 mt-0.5">
+                <div>
+                  <span>OCR autofix</span>
+                  <p class="text-xs text-yellow-500/80 mt-0.5">
+                    Auto-applies the OCR alternative if exactly one is legal.
+                    Check moves flagged with &#x27F3; carefully &mdash; OCR may pick a legal but wrong move.
+                  </p>
+                </div>
+              </label>
+              <label class="flex items-start text-gray-300 text-sm">
+                <input type="checkbox" id="set-similarity_autofix" class="mr-2 mt-0.5">
+                <div>
+                  <span>Similarity autofix</span>
+                  <p class="text-xs text-gray-500 mt-0.5">
+                    Auto-applies character similarity swaps (R/K, a/g, 3/8, etc.) if exactly one is legal.
+                  </p>
+                </div>
+              </label>
+            </div>
+          </div>
+          <!-- Layer 2: Deep Search -->
+          <div class="bg-gray-700/50 rounded p-2">
+            <label class="flex items-center text-gray-300 text-sm font-medium">
+              <input type="checkbox" id="set-enable_deep_search" class="mr-2"> Layer 2: Deep Search
+            </label>
+            <p class="text-xs text-gray-500 mt-1 ml-5">
+              Backtrack through earlier moves to find fixes. Results shown for confirmation.
+            </p>
+            <div class="mt-2 ml-5">
+              <label class="flex items-center text-gray-300 text-sm">
+                Search depth:
+                <select id="set-deep_search_depth" class="ml-2 bg-gray-700 text-white rounded px-2 py-1 text-sm">
+                  <option value="0">Phase 1 only (fastest)</option>
+                  <option value="3">3 plies before frontier</option>
+                  <option value="5">5 plies before frontier (recommended)</option>
+                  <option value="10">10 plies before frontier</option>
+                  <option value="20">20 plies before frontier</option>
+                  <option value="999">Full game (slowest)</option>
+                </select>
+              </label>
+              <p class="text-xs text-gray-500 mt-1">
+                Phase 1 searches from frontier to stuck move. Phase 2 extends backward.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Display Options -->
+      <div class="mb-6">
+        <h3 class="text-lg font-semibold text-gray-400 mb-2">Display</h3>
+        <div class="space-y-2">
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-show_debug_output" class="mr-2"> Show debug output
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-show_ocr_confidence" class="mr-2"> Show OCR confidence
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            Alternatives to show:
+            <select id="set-show_alternatives_count" class="ml-2 bg-gray-700 text-white rounded px-2 py-1 text-sm">
+              <option value="1">1</option>
+              <option value="3">3</option>
+              <option value="5">5</option>
+              <option value="10">10</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <!-- Buttons -->
+      <div class="flex justify-between mt-6">
+        <button id="settings-reset" class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded text-sm">
+          Reset to Defaults
+        </button>
+        <button id="settings-save" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm">
+          Save & Close
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Profile Editor Modal -->
+  <div id="profile-modal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center">
+    <div class="bg-gray-800 rounded-lg p-6 max-w-lg w-full max-h-[80vh] overflow-y-auto mx-4">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="text-xl font-bold text-white">Sheet Profile Editor</h2>
+        <button id="profile-modal-close" class="text-gray-400 hover:text-white text-2xl">&times;</button>
+      </div>
+      <div class="mb-4">
+        <label class="text-gray-300 text-sm">Profile Name</label>
+        <input id="profile-name" type="text" class="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm mt-1">
+      </div>
+      <div id="profile-pages" class="space-y-3 mb-4"></div>
+      <button id="btn-add-page" class="text-blue-400 hover:text-blue-300 text-sm mb-4">+ Add page</button>
+      <div class="flex justify-between mt-4">
+        <div class="flex gap-2">
+          <button id="btn-delete-profile" class="px-3 py-2 bg-red-600 hover:bg-red-700 text-white rounded text-sm">Delete</button>
+          <button id="btn-export-profile" class="px-3 py-2 bg-gray-600 hover:bg-gray-500 text-white rounded text-sm">Export</button>
+          <button id="btn-import-profile" class="px-3 py-2 bg-gray-600 hover:bg-gray-500 text-white rounded text-sm">Import</button>
+          <input id="profile-import-file" type="file" accept=".json" class="hidden">
+        </div>
+        <button id="btn-save-profile" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Loading overlay for Pyodide initialization -->
+  <div id="pyodide-loading-overlay" class="fixed inset-0 bg-gray-900 bg-opacity-95 z-[100] flex items-center justify-center">
+    <div class="text-center">
+      <img src="icons/zugwise-icon.svg" alt="Zugwise" class="w-24 h-24 mx-auto mb-4">
+      <h2 class="text-2xl font-bold text-white mb-2">Loading Zugwise</h2>
+      <p id="pyodide-loading-status" class="text-gray-400">Initializing...</p>
+      <div class="mt-4 w-64 mx-auto">
+        <div class="bg-gray-700 rounded-full h-2">
+          <div id="pyodide-loading-bar" class="bg-blue-500 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
+        </div>
+      </div>
+      <p class="text-xs text-gray-500 mt-4">First load may take 10-20 seconds</p>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.12.0/chess.min.js"></script>
+  <script src="js/grid-geometry.js"></script>
+  <script src="js/grid-columns.js"></script>
+  <script src="js/grid-rows.js"></script>
+  <script src="js/grid-detection.js"></script>
+  <script src="js/g-tail-detection.js"></script>
+  <script src="opencv_image_processor.js"></script>
+  <script src="worker-api.js"></script>
+  <script src="js/settings.js"></script>
+  <script src="js/sheet-profiles.js"></script>
+  <script src="js/merge-sheets.js"></script>
+  <script src="js/sheets.js"></script>
+  <script src="js/board.js"></script>
+  <script src="js/navigation.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/fixes.js"></script>
+  <script src="js/ocr.js"></script>
+  <script src="js/validation.js"></script>
+  <script src="search-manager.js"></script>
+  <script src="js/beam.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

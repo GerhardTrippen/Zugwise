@@ -1,0 +1,25 @@
+{
+  "name": "Zugwise - Scoresheet to PGN",
+  "short_name": "Zugwise",
+  "description": "Turn handwritten chess scoresheets into PGN. Free. Private. Offline. Forever.",
+  "start_url": "index.html",
+  "display": "standalone",
+  "background_color": "#1a1a2e",
+  "theme_color": "#4a90d9",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "icons/zugwise-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icons/zugwise-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["utilities", "games"]
+}

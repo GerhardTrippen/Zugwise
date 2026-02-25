@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="knightGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6ab0e8"/>
+      <stop offset="100%" style="stop-color:#3a7bd5"/>
+    </linearGradient>
+    <linearGradient id="beamGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#4a90d9;stop-opacity:0"/>
+      <stop offset="30%" style="stop-color:#6ab0e8;stop-opacity:0.5"/>
+      <stop offset="100%" style="stop-color:#4a90d9;stop-opacity:0"/>
+    </linearGradient>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="512" height="512" rx="64" fill="#1a1a2e"/>
+  
+  <!-- Funnel/comet beam - wide at top edge, narrowing down to landing square -->
+  <polygon points="120,0 392,0 300,450 212,450" fill="#4a90d9" opacity="0.12"/>
+  <polygon points="150,0 362,0 285,450 227,450" fill="#6ab0e8" opacity="0.08"/>
+  
+  <!-- Streaming particles from top - funnel shape -->
+  <!-- Mini chessboards as particles! Easter egg -->
+  
+  <!-- Top wide area - at the very top -->
+  <g opacity="0.4" transform="translate(100,15)">
+    <rect x="0" y="0" width="5" height="5" fill="#6ab0e8"/><rect x="5" y="0" width="5" height="5" fill="#3a7bd5"/>
+    <rect x="0" y="5" width="5" height="5" fill="#3a7bd5"/><rect x="5" y="5" width="5" height="5" fill="#6ab0e8"/>
+  </g>
+  <g opacity="0.5" transform="translate(150,30)">
+    <rect x="0" y="0" width="4" height="4" fill="#3a7bd5"/><rect x="4" y="0" width="4" height="4" fill="#6ab0e8"/>
+    <rect x="0" y="4" width="4" height="4" fill="#6ab0e8"/><rect x="4" y="4" width="4" height="4" fill="#3a7bd5"/>
+  </g>
+  <g opacity="0.35" transform="translate(200,10)">
+    <rect x="0" y="0" width="3" height="3" fill="#6ab0e8"/><rect x="3" y="0" width="3" height="3" fill="#3a7bd5"/>
+    <rect x="0" y="3" width="3" height="3" fill="#3a7bd5"/><rect x="3" y="3" width="3" height="3" fill="#6ab0e8"/>
+  </g>
+  <g opacity="0.5" transform="translate(255,25)">
+    <rect x="0" y="0" width="4" height="4" fill="#fff"/><rect x="4" y="0" width="4" height="4" fill="#6ab0e8"/>
+    <rect x="0" y="4" width="4" height="4" fill="#6ab0e8"/><rect x="4" y="4" width="4" height="4" fill="#fff"/>
+  </g>
+  <g opacity="0.45" transform="translate(310,12)">
+    <rect x="0" y="0" width="3" height="3" fill="#3a7bd5"/><rect x="3" y="0" width="3" height="3" fill="#6ab0e8"/>
+    <rect x="0" y="3" width="3" height="3" fill="#6ab0e8"/><rect x="3" y="3" width="3" height="3" fill="#3a7bd5"/>
+  </g>
+  <g opacity="0.4" transform="translate(355,35)">
+    <rect x="0" y="0" width="4" height="4" fill="#6ab0e8"/><rect x="4" y="0" width="4" height="4" fill="#3a7bd5"/>
+    <rect x="0" y="4" width="4" height="4" fill="#3a7bd5"/><rect x="4" y="4" width="4" height="4" fill="#6ab0e8"/>
+  </g>
+  <g opacity="0.35" transform="translate(395,20)">
+    <rect x="0" y="0" width="5" height="5" fill="#3a7bd5"/><rect x="5" y="0" width="5" height="5" fill="#6ab0e8"/>
+    <rect x="0" y="5" width="5" height="5" fill="#6ab0e8"/><rect x="5" y="5" width="5" height="5" fill="#3a7bd5"/>
+  </g>
+  
+  <!-- Mid-upper area - narrowing -->
+  <g opacity="0.45" transform="translate(125,100)">
+    <rect x="0" y="0" width="4" height="4" fill="#3a7bd5"/><rect x="4" y="0" width="4" height="4" fill="#6ab0e8"/>
+    <rect x="0" y="4" width="4" height="4" fill="#6ab0e8"/><rect x="4" y="4" width="4" height="4" fill="#3a7bd5"/>
+  </g>
+  <g opacity="0.55" transform="translate(165,115)">
+    <rect x="0" y="0" width="5" height="5" fill="#fff"/><rect x="5" y="0" width="5" height="5" fill="#6ab0e8"/>
+    <rect x="0" y="5" width="5" height="5" fill="#6ab0e8"/><rect x="5" y="5" width="5" height="5" fill="#fff"/>
+  </g>
+  <g opacity="0.5" transform="translate(220,95)">
+    <rect x="0" y="0" width="3" height="3" fill="#6ab0e8"/><rect x="3" y="0" width="3" height="3" fill="#3a7bd5"/>
+    <rect x="0" y="3" width="3" height="3" fill="#3a7bd5"/><rect x="3" y="3" width="3" height="3" fill="#6ab0e8"/>
+  </g>
+  <g opacity="0.45" transform="translate(290,105)">
+    <rect x="0" y="0" width="4" height="4" fill="#3a7bd5"/><rect x="4" y="0" width="4" height="4" fill="#6ab0e8"/>
+    <rect x="0" y="4" width="4" height="4" fill="#6ab0e8"/><rect x="4" y="4" width="4" height="4" fill="#3a7bd5"/>
+  </g>
+  <g opacity="0.4" transform="translate(335,90)">
+    <rect x="0" y="0" width="4" height="4" fill="#6ab0e8"/><rect x="4" y="0" width="4" height="4" fill="#3a7bd5"/>
+    <rect x="0" y="4" width="4" height="4" fill="#3a7bd5"/><rect x="4" y="4" width="4" height="4" fill="#6ab0e8"/>
+  </g>
+  <g opacity="0.35" transform="translate(370,110)">
+    <rect x="0" y="0" width="3" height="3" fill="#3a7bd5"/><rect x="3" y="0" width="3" height="3" fill="#6ab0e8"/>
+    <rect x="0" y="3" width="3" height="3" fill="#6ab0e8"/><rect x="3" y="3" width="3" height="3" fill="#3a7bd5"/>
+  </g>
+  
+  <!-- Middle area - converging -->
+  <g opacity="0.5" transform="translate(140,150)">
+    <rect x="0" y="0" width="3" height="3" fill="#6ab0e8"/><rect x="3" y="0" width="3" height="3" fill="#3a7bd5"/>
+    <rect x="0" y="3" width="3" height="3" fill="#3a7bd5"/><rect x="3" y="3" width="3" height="3" fill="#6ab0e8"/>
+  </g>
+  <g opacity="0.6" transform="translate(175,140)">
+    <rect x="0" y="0" width="4" height="4" fill="#fff"/><rect x="4" y="0" width="4" height="4" fill="#6ab0e8"/>
+    <rect x="0" y="4" width="4" height="4" fill="#6ab0e8"/><rect x="4" y="4" width="4" height="4" fill="#fff"/>
+  </g>
+  <g opacity="0.5" transform="translate(305,155)">
+    <rect x="0" y="0" width="3" height="3" fill="#3a7bd5"/><rect x="3" y="0" width="3" height="3" fill="#6ab0e8"/>
+    <rect x="0" y="3" width="3" height="3" fill="#6ab0e8"/><rect x="3" y="3" width="3" height="3" fill="#3a7bd5"/>
+  </g>
+  <g opacity="0.55" transform="translate(340,145)">
+    <rect x="0" y="0" width="4" height="4" fill="#6ab0e8"/><rect x="4" y="0" width="4" height="4" fill="#3a7bd5"/>
+    <rect x="0" y="4" width="4" height="4" fill="#3a7bd5"/><rect x="4" y="4" width="4" height="4" fill="#6ab0e8"/>
+  </g>
+  
+  <!-- Lower area - tight funnel, away from knight -->
+  <g opacity="0.6" transform="translate(150,190)">
+    <rect x="0" y="0" width="4" height="4" fill="#fff"/><rect x="4" y="0" width="4" height="4" fill="#6ab0e8"/>
+    <rect x="0" y="4" width="4" height="4" fill="#6ab0e8"/><rect x="4" y="4" width="4" height="4" fill="#fff"/>
+  </g>
+  <g opacity="0.5" transform="translate(330,195)">
+    <rect x="0" y="0" width="3" height="3" fill="#3a7bd5"/><rect x="3" y="0" width="3" height="3" fill="#6ab0e8"/>
+    <rect x="0" y="3" width="3" height="3" fill="#6ab0e8"/><rect x="3" y="3" width="3" height="3" fill="#3a7bd5"/>
+  </g>
+  <g opacity="0.45" transform="translate(355,185)">
+    <rect x="0" y="0" width="3" height="3" fill="#6ab0e8"/><rect x="3" y="0" width="3" height="3" fill="#3a7bd5"/>
+    <rect x="0" y="3" width="3" height="3" fill="#3a7bd5"/><rect x="3" y="3" width="3" height="3" fill="#6ab0e8"/>
+  </g>
+  
+  <!-- 3D Chess board 3x3 - shifted down, knight hovers above -->
+  
+  <!-- BACK ROW - faded -->
+  <polygon points="148,410 206,410 192,432 120,432" fill="#3a7bd5" opacity="0.2"/>
+  <polygon points="206,410 306,410 320,432 192,432" fill="#6ab0e8" opacity="0.25"/>
+  <polygon points="306,410 364,410 392,432 320,432" fill="#3a7bd5" opacity="0.2"/>
+  
+  <!-- MIDDLE ROW - center square is landing zone -->
+  <polygon points="120,432 192,432 168,470 72,470" fill="#6ab0e8" opacity="0.35"/>
+  <polygon points="192,432 320,432 344,470 168,470" fill="#3a7bd5" opacity="0.55"/>
+  <polygon points="320,432 392,432 440,470 344,470" fill="#6ab0e8" opacity="0.35"/>
+  
+  <!-- FRONT ROW - fading forward -->
+  <polygon points="72,470 168,470 136,512 0,512" fill="#3a7bd5" opacity="0.25"/>
+  <polygon points="168,470 344,470 376,512 136,512" fill="#6ab0e8" opacity="0.35"/>
+  <polygon points="344,470 440,470 512,512 376,512" fill="#3a7bd5" opacity="0.25"/>
+  
+  <!-- Grid lines - horizontal -->
+  <line x1="120" y1="410" x2="392" y2="410" stroke="#6ab0e8" stroke-width="1" opacity="0.2"/>
+  <line x1="80" y1="432" x2="432" y2="432" stroke="#6ab0e8" stroke-width="1.5" opacity="0.4"/>
+  <line x1="40" y1="470" x2="472" y2="470" stroke="#6ab0e8" stroke-width="1.5" opacity="0.5"/>
+  <line x1="0" y1="512" x2="512" y2="512" stroke="#6ab0e8" stroke-width="1" opacity="0.3"/>
+  
+  <!-- Grid lines - vertical (proper perspective from single vanishing point) -->
+  <line x1="148" y1="410" x2="72" y2="470" stroke="#6ab0e8" stroke-width="1" opacity="0.15"/>
+  <line x1="72" y1="470" x2="0" y2="530" stroke="#6ab0e8" stroke-width="1" opacity="0.1"/>
+  
+  <line x1="206" y1="410" x2="168" y2="470" stroke="#6ab0e8" stroke-width="1.5" opacity="0.35"/>
+  <line x1="168" y1="470" x2="136" y2="530" stroke="#6ab0e8" stroke-width="1" opacity="0.2"/>
+  
+  <line x1="306" y1="410" x2="344" y2="470" stroke="#6ab0e8" stroke-width="1.5" opacity="0.35"/>
+  <line x1="344" y1="470" x2="376" y2="530" stroke="#6ab0e8" stroke-width="1" opacity="0.2"/>
+  
+  <line x1="364" y1="410" x2="440" y2="470" stroke="#6ab0e8" stroke-width="1" opacity="0.15"/>
+  <line x1="440" y1="470" x2="512" y2="530" stroke="#6ab0e8" stroke-width="1" opacity="0.1"/>
+  
+  <!-- Glow on center square -->
+  <polygon points="192,432 320,432 344,470 168,470" fill="#fff" opacity="0.08"/>
+  
+  <!-- The Knight - materializing, centered in beam -->
+  <text x="240" y="355" 
+        font-family="serif" 
+        font-size="280" 
+        fill="url(#knightGrad)" 
+        text-anchor="middle">&#9822;</text>
+</svg>
