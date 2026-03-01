@@ -21,7 +21,7 @@ CHAR_SIMILARITIES = {
     ('a', 'g'): 0.8, ('g', 'a'): 0.8,  # g with cut-off tail looks like a - VERY common!
     ('b', 'd'): 0.6, ('b', 'h'): 0.5, ('c', 'e'): 0.7, ('c', 'o'): 0.4,
     ('c', 'd'): 0.5, ('d', 'a'): 0.6, ('d', 'h'): 0.7, ('d', 'c'): 0.5,
-    ('e', 'c'): 0.7, ('e', 'f'): 0.5, ('e', 'a'): 0.4, ('f', 't'): 0.5,
+    ('e', 'c'): 0.7, ('e', 'f'): 0.5, ('e', 'a'): 0.4,
     ('f', 'e'): 0.5, ('g', 'q'): 0.6,
     ('h', 'b'): 0.5, ('h', 'n'): 0.4, ('h', 'd'): 0.7,
     ('c', 'f'): 0.4, ('f', 'c'): 0.4,
@@ -220,8 +220,11 @@ def move_similarity(ocr_move: str, candidate_move: str) -> float:
                            get_char_similarity(ocr_dest[1], cand_dest[1])) / 2
                 best_score = best_score * 0.4 + dest_sim * 0.6
             
-            # Piece mismatch penalty
-            if not piece_match and ocr_piece != 'P' and cand_piece != 'P':
+            # Piece match bonus / mismatch penalty
+            if piece_match and ocr_piece != 'P':
+                # Got the piece right — ensure a minimum floor (e.g., Qa7 vs Qxh3)
+                best_score = max(best_score, 0.35)
+            elif not piece_match and ocr_piece != 'P' and cand_piece != 'P':
                 best_score *= 0.7
 
             best_score = best_score - length_penalty

@@ -265,7 +265,8 @@ async function fetchFixes(){
   var searchMinPly = state.confirmedPly || 0;
   var fixedPliesArray = state.fixedPlies || [];
   var lockedPliesArray = state.lockedPlies || [];
-  log('🔍 Finding fix suggestions (searchGen='+thisSearchGeneration+'):');
+  var isDualSheet = state.inputMode === 'dual-sheets';
+  log('🔍 Finding fix suggestions (searchGen='+thisSearchGeneration+'):'+(isDualSheet ? ' [DUAL-SHEET MODE]' : ''));
   log('   stuck_ply='+state.stuckPly+' ('+Math.floor(state.stuckPly/2+1)+'.'+(state.stuckPly%2===0?'W':'B')+')');
   log('   min_ply='+searchMinPly+' ('+Math.floor(searchMinPly/2+1)+'.'+(searchMinPly%2===0?'W':'B')+')');
   log('   fixed_plies=['+fixedPliesArray.join(',')+']');
@@ -294,12 +295,33 @@ async function fetchFixes(){
     });
 
     // === STREAMING BACKTRACK SEARCH ===
+    // Build ply-to-sheet-info map for dual-sheet debug logging
+    var sheetInfoByPly = {};
+    if(state.ocrCells && state.ocrCells.length > 0 && state.ocrCells[0]._sheetCount !== undefined){
+      state.ocrCells.forEach(function(cell){
+        var num = cell.num || cell.move_number || 1;
+        var color = cell.color;
+        var ply = (num - 1) * 2 + (color === 'w' || color === 'white' ? 0 : 1);
+        var info = '';
+        if(cell._sheetCount === 2){
+          info = cell._agree ? 'S1+S2 agree' : 'S1="'+(cell._sheet1Move||'?')+'" S2="'+(cell._sheet2Move||'?')+'"';
+        } else if(cell._sheet1Move){
+          info = 'S1 only';
+        } else if(cell._sheet2Move){
+          info = 'S2 only';
+        }
+        if(info) sheetInfoByPly[ply] = info;
+      });
+    }
+
     // Create backtrack state
     var phase2Depth = settings?.deep_search_depth ?? currentSettings?.deep_search_depth ?? 5;
     var stateInfo = await window.zugwise.createBacktrackState(flat, state.stuckPly, ocrData, searchMinPly, fixedPliesArray, phase2Depth, lockedPliesArray, reason);
     var stateId = stateInfo.stateId;
     var totalPlies = stateInfo.totalPlies;
-    log('🔍 Streaming backtrack: '+totalPlies+' plies to search');
+    var stuckMove = flat[state.stuckPly] || '?';
+    var sheetDetail = sheetInfoByPly[state.stuckPly] ? ' {'+sheetInfoByPly[state.stuckPly]+'}' : '';
+    log('🔍 PRIMARY SEARCH (OCR top: "'+stuckMove+'"'+sheetDetail+'): '+totalPlies+' plies to search (order: '+(stateInfo.searchOrder||[]).join(', ')+( totalPlies > 5 ? '...' : '') +')');
 
     // Update deep search section with countdown
     var deepSection = document.getElementById('deep-search-section');
@@ -326,7 +348,7 @@ async function fetchFixes(){
     while(!searchComplete){
       // Check if search was superseded
       if(state.searchGeneration !== thisSearchGeneration){
-        log('🔍 Streaming search aborted (superseded by newer search)');
+        log('🔍 Streaming search #'+thisSearchGeneration+' aborted (superseded by search #'+state.searchGeneration+' — fix applied or revalidation triggered)');
         // Cleanup - finalize will delete state vars
         try { await window.zugwise.backtrackFinalize(stateId); } catch(e){}
         return;
@@ -334,6 +356,15 @@ async function fetchFixes(){
 
       // Search next ply
       var stepResult = await window.zugwise.backtrackSearchStep(stateId);
+
+      // Detailed per-ply console logging
+      if(stepResult.ply_str){
+        var sheetTag = sheetInfoByPly[stepResult.ply] ? ' {'+sheetInfoByPly[stepResult.ply]+'}' : '';
+        var plyDetail = '['+( stepResult.phase_label||'PHASE 1')+'] >>> '+stepResult.ply_str+': \''+( stepResult.move_text||'?')+'\' '+( stepResult.range_info||'')+sheetTag;
+        if(stepResult.skipped){ plyDetail += ' [SKIPPED]'; }
+        else { plyDetail += ' => '+stepResult.fixes_at_ply+' fixes'; }
+        console.log(plyDetail);
+      }
 
       // Update progress UI
       updateDeepSearchProgress(stepResult.remaining, stepResult.fixes_found, stepResult.best_score, stepResult.ply_str);
@@ -356,11 +387,21 @@ async function fetchFixes(){
       var phase2Done = false;
       while(!phase2Done){
         if(state.searchGeneration !== thisSearchGeneration){
-          log('🔍 Phase 2 aborted (superseded by newer search)');
+          log('🔍 Phase 2 search #'+thisSearchGeneration+' aborted (superseded by search #'+state.searchGeneration+')');
           try { await window.zugwise.backtrackFinalizeComplete(stateId); } catch(e){}
           return;
         }
         var p2Step = await window.zugwise.backtrackPhase2Step(stateId);
+
+        // Detailed per-ply console logging for Phase 2
+        if(p2Step.ply_str){
+          var p2SheetTag = sheetInfoByPly[p2Step.ply] ? ' {'+sheetInfoByPly[p2Step.ply]+'}' : '';
+          var p2Detail = '['+( p2Step.phase_label||'PHASE 2')+'] >>> '+p2Step.ply_str+': \''+( p2Step.move_text||'?')+'\' '+( p2Step.range_info||'')+p2SheetTag;
+          if(p2Step.skipped){ p2Detail += ' [SKIPPED]'; }
+          else { p2Detail += ' => '+p2Step.fixes_at_ply+' fixes'; }
+          console.log(p2Detail);
+        }
+
         updateDeepSearchProgress(p2Step.remaining, p2Step.fixes_found, p2Step.best_score, p2Step.ply_str, 'Phase 2');
         phase2Done = p2Step.done;
         if(!phase2Done){
@@ -375,7 +416,7 @@ async function fetchFixes(){
 
     // Check if search was superseded (user applied a fix while we were searching)
     if(state.searchGeneration !== thisSearchGeneration){
-      log('🔍 Deep search result ignored (superseded by newer search)');
+      log('🔍 Deep search #'+thisSearchGeneration+' result ignored (superseded by search #'+state.searchGeneration+')');
       showCalculating(false);
       return;
     }
@@ -385,7 +426,7 @@ async function fetchFixes(){
       var dsi = data.dual_search_info;
       var primaryCount = (data.fixes||[]).length;
       var deepSection = document.getElementById('deep-search-section');
-      log('🔍 Dual search: both "'+dsi.primary_move+'" and "'+dsi.secondary_move+'" illegal at '+dsi.stuck_ply_str);
+      log('🔍 DUAL SEARCH (secondary candidate: "'+dsi.secondary_move+'" from S2): primary "'+dsi.primary_move+'" was illegal at '+dsi.stuck_ply_str);
 
       // Step 1: Raw search with secondary candidate
       if(deepSection){

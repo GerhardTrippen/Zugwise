@@ -8,6 +8,7 @@ var DEFAULT_SETTINGS = {
   piece_B_R: true,
   piece_B_K: false,
   piece_N_R: false,
+  piece_N_B: true,
   piece_Q_O: true,
   // Piece-file confusions (for captures only: Kxg4 vs hxg4)
   piece_K_h: true,   // King K vs h-file pawn
@@ -17,7 +18,6 @@ var DEFAULT_SETTINGS = {
   file_a_d: true,
   file_b_d: true,
   file_e_c: true,
-  file_f_t: false,
   file_b_h: false,
   // Rank confusions
   rank_1_7: true,
@@ -36,6 +36,10 @@ var DEFAULT_SETTINGS = {
   // Auto-fix toggles (when off, fixes are shown as clickable quick fixes instead of auto-applying)
   ocr_autofix: false,            // Auto-apply OCR alternatives (one-or-nothing rule)
   similarity_autofix: false,     // Auto-apply character similarity fixes
+  // Auto-run searches on entering interactive mode
+  autorun_greedy: true,
+  autorun_beam: true,
+  autorun_dijkstra: true,
   // Display options
   show_debug_output: false,
   show_ocr_confidence: true,
@@ -127,6 +131,7 @@ function getEnabledPieceConfusions() {
   if (currentSettings.piece_B_R) { pairs.push(['B','R'], ['R','B']); }
   if (currentSettings.piece_B_K) { pairs.push(['B','K'], ['K','B']); }
   if (currentSettings.piece_N_R) { pairs.push(['N','R'], ['R','N']); }
+  if (currentSettings.piece_N_B) { pairs.push(['N','B'], ['B','N']); }
   return pairs;
 }
 

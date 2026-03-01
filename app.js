@@ -162,7 +162,8 @@ document.addEventListener('DOMContentLoaded',async function(){
   currentSettings=loadSettings();
   if(window.SheetProfiles){window.SheetProfiles.loadProfiles();window.SheetProfiles.renderProfileDropdown();window.SheetProfiles.renderProfileSummary();}
   var pieceSelect=document.getElementById('piece-style');if(pieceSelect)pieceSelect.value=CONFIG.pieceStyle;
-  renderBoard();setupEventListeners();setupFileUpload();
+  renderBoard();setupEventListeners();
+  if(typeof initSimpleSheetsUploader==='function')initSimpleSheetsUploader();
 
   // Try to initialize Pyodide worker (non-blocking, falls back to Flask)
   var usePyodide=await initPyodideWorker();
@@ -171,7 +172,7 @@ document.addEventListener('DOMContentLoaded',async function(){
     hidePyodideLoadingOverlay();
   }
 
-  log('Zugwise v0.5 ready'+(CONFIG.usePyodide?' (client-side mode)':' (server mode)'));
+  log('Zugwise v0.6 ready'+(CONFIG.usePyodide?' (client-side mode)':' (server mode)'));
 });
 
 function setupEventListeners(){
@@ -264,15 +265,7 @@ function setupEventListeners(){
   };
 }
 
-function setupFileUpload(){
-  var fileInput=document.getElementById('file-input');
-  var dropZone=document.getElementById('drop-zone');
-  fileInput.onchange=function(e){if(e.target.files&&e.target.files.length>0)handleFiles(Array.from(e.target.files));};
-  dropZone.onclick=function(e){if(e.target.tagName!=='INPUT')fileInput.click();};
-  dropZone.ondragover=function(e){e.preventDefault();dropZone.classList.add('border-blue-400','bg-blue-900/20');};
-  dropZone.ondragleave=function(e){e.preventDefault();dropZone.classList.remove('border-blue-400','bg-blue-900/20');};
-  dropZone.ondrop=function(e){e.preventDefault();dropZone.classList.remove('border-blue-400','bg-blue-900/20');var files=Array.from(e.dataTransfer.files).filter(function(f){return f.type.startsWith('image/');});if(files.length>0)handleFiles(files);};
-}
+// setupFileUpload - legacy drop zone removed in v0.6; simple mode now uses sheet boxes
 
 function loadDemo(){
   log('🎮 Loading demo...');
@@ -306,13 +299,24 @@ function toggleMultisheetMode(){
     uploader.classList.remove('hidden');
     simpleUpload.classList.add('hidden');
     icon.innerHTML='&#9650;';
-    text.textContent='Simple: Single image upload';
+    text.textContent='Simple: Single player upload';
     if(typeof initSheetsUploader==='function')initSheetsUploader();
   }else{
     uploader.classList.add('hidden');
     simpleUpload.classList.remove('hidden');
     icon.innerHTML='&#9660;';
-    text.textContent='Advanced: Multiple sheets / Both players';
+    text.textContent='Advanced: Both players / Multiple sheets';
+    // Clear player 2 data from advanced mode so single-player processing doesn't pick it up
+    if(typeof sheetsState!=='undefined'){
+      sheetsState.player2=[null,null,null];
+      sheetsState.player2Color=null;
+    }
+    state.ocrCellsSheet1=null;
+    state.ocrCellsSheet2=null;
+    state.mergeTierMap=null;
+    state.mergeLockedPlies=null;
+    state._pendingMergeLockedPlies=null;
+    if(typeof refreshSimpleSheetsUI==='function')refreshSimpleSheetsUI();
   }
 }
 

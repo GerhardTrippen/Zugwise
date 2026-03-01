@@ -141,6 +141,8 @@ async function createSearchState(ocrMoves, method, options, lockedPlies) {
     const beamWidth = (options && options.beam_width) || 5;
     const maxIterations = (options && options.max_iterations) || 20;
     const maxFixesPerPath = (options && options.max_fixes_per_path) || 10;
+    const maxQueueSize = (options && options.max_queue_size) || 50;
+    const maxSteps = (options && options.max_steps) || 1000;
 
     const result = await pyodide.runPythonAsync(`
 import json, base64
@@ -200,6 +202,32 @@ if _search_method_${stateId} == 'beam':
         'result': None,
         'start_time': _search_start_time_${stateId}
     }
+elif _search_method_${stateId} == 'dijkstra':
+    import heapq as _heapq_mod
+    _dijk_initial_node_${stateId} = DijkstraNode(
+        cost=0.0,
+        moves=_search_moves_${stateId}.copy(),
+        fixes=[],
+        fixed_plies=set()
+    )
+    _dijk_queue_${stateId} = [_dijk_initial_node_${stateId}]
+    _heapq_mod.heapify(_dijk_queue_${stateId})
+    _search_state_${stateId} = {
+        'method': 'dijkstra',
+        'queue': _dijk_queue_${stateId},
+        'step': 0,
+        'max_steps': ${maxSteps},
+        'max_queue_size': ${maxQueueSize},
+        'max_fixes_per_path': ${maxFixesPerPath},
+        'total_plies': len(_search_moves_${stateId}),
+        'paths_explored': 0,
+        'best_partial': _dijk_initial_node_${stateId},
+        'LAMBDA': 21,
+        'REGRET_THRESHOLD': 42,
+        'done': False,
+        'result': None,
+        'start_time': _search_start_time_${stateId}
+    }
 else:
     _search_state_${stateId} = {
         'method': 'greedy',
@@ -231,6 +259,142 @@ _st = _search_state_${stateId}
 
 if _st['done']:
     _step_result = json.dumps({'done': True, 'status': _st.get('result', {}).get('status', 'DONE'), 'message': 'Already done'})
+elif _st['method'] == 'dijkstra':
+    # === DIJKSTRA: one step (pop cheapest, expand) ===
+    import heapq as _heapq
+    _d_queue = _st['queue']
+    _d_total = _st['total_plies']
+    _d_LAMBDA = _st['LAMBDA']
+    _d_REGRET_THRESHOLD = _st['REGRET_THRESHOLD']
+    _d_elapsed = time.time() - _st['start_time']
+
+    if not _d_queue:
+        _st['done'] = True
+        _d_bp = _st['best_partial']
+        _st['result'] = {'status': 'FAILED' if not _d_bp.fixes else 'PARTIAL', 'moves': _d_bp.moves, 'fixes': _d_bp.fixes}
+        _step_result = json.dumps({
+            'done': True, 'status': _st['result']['status'],
+            'fixes_so_far': len(_d_bp.fixes),
+            'elapsed': round(_d_elapsed, 1),
+            'message': 'Queue empty (' + str(round(_d_elapsed, 1)) + 's)'
+        })
+    elif _st['step'] >= _st['max_steps']:
+        _st['done'] = True
+        _d_bp = _st['best_partial']
+        _st['result'] = {'status': 'PARTIAL', 'moves': _d_bp.moves, 'fixes': _d_bp.fixes}
+        _step_result = json.dumps({
+            'done': True, 'status': 'PARTIAL',
+            'fixes_so_far': len(_d_bp.fixes),
+            'elapsed': round(_d_elapsed, 1),
+            'message': 'Max steps (' + str(_st['max_steps']) + ') reached (' + str(round(_d_elapsed, 1)) + 's)'
+        })
+    else:
+        _d_node = _heapq.heappop(_d_queue)
+        _st['paths_explored'] += 1
+        _st['step'] += 1
+
+        _d_ead_ply, _d_stop_reason, _d_abs_info = play_until_absurd_or_stuck(
+            _d_node.moves, severity_threshold=3, persistence_threshold=2
+        )
+        _d_stuck = _d_ead_ply
+
+        # Check if solved
+        if _d_stuck >= _d_total:
+            _d_absurdities = find_all_absurdities(_d_node.moves)
+            if len(_d_absurdities) <= 2:
+                _st['done'] = True
+                _st['result'] = {'status': 'SOLVED', 'moves': _d_node.moves, 'fixes': _d_node.fixes}
+                _step_result = json.dumps({
+                    'done': True, 'status': 'SOLVED',
+                    'fixes_so_far': len(_d_node.fixes),
+                    'elapsed': round(_d_elapsed, 1),
+                    'message': 'Solved with ' + str(len(_d_node.fixes)) + ' fix(es) in ' + str(round(_d_elapsed, 1)) + 's'
+                })
+            else:
+                # Reached end but absurdities remain — update best partial and continue
+                _d_bp = _st['best_partial']
+                if _d_stuck > play_until_stuck(_d_bp.moves)[0]:
+                    _st['best_partial'] = _d_node
+                _step_result = json.dumps({
+                    'done': False, 'step': _st['step'],
+                    'queue_size': len(_d_queue), 'current_cost': int(_d_node.cost),
+                    'depth': len(_d_node.fixes), 'reach': _d_stuck,
+                    'reach_str': ply_to_str(_d_stuck), 'total_plies': _d_total,
+                    'elapsed': round(_d_elapsed, 1),
+                    'message': 'Reached end but ' + str(len(_d_absurdities)) + ' absurdities, continuing'
+                })
+        else:
+            # Update best partial
+            _d_bp = _st['best_partial']
+            _d_bp_reach = play_until_stuck(_d_bp.moves)[0]
+            if _d_stuck > _d_bp_reach:
+                _st['best_partial'] = _d_node
+
+            # Check max fixes
+            if len(_d_node.fixes) >= _st['max_fixes_per_path']:
+                _step_result = json.dumps({
+                    'done': False, 'step': _st['step'],
+                    'queue_size': len(_d_queue), 'current_cost': int(_d_node.cost),
+                    'depth': len(_d_node.fixes), 'reach': _d_stuck,
+                    'reach_str': ply_to_str(_d_stuck), 'total_plies': _d_total,
+                    'elapsed': round(_d_elapsed, 1),
+                    'message': 'Max fixes reached at depth ' + str(len(_d_node.fixes))
+                })
+            else:
+                # Find fixes
+                _d_fixes = find_deep_backtrack_fixes(
+                    _d_node.moves, _d_stuck, _search_ocr_lookup_${stateId},
+                    verbose=False, fixed_plies=_d_node.fixed_plies
+                )
+                _d_fixes = [f for f in _d_fixes if f['ply'] not in _d_node.fixed_plies]
+                _d_fixes = [f for f in _d_fixes if f['san'].rstrip('+#') != f.get('ocr', '').rstrip('+#')]
+
+                if not _d_fixes:
+                    _step_result = json.dumps({
+                        'done': False, 'step': _st['step'],
+                        'queue_size': len(_d_queue), 'current_cost': int(_d_node.cost),
+                        'depth': len(_d_node.fixes), 'reach': _d_stuck,
+                        'reach_str': ply_to_str(_d_stuck), 'total_plies': _d_total,
+                        'elapsed': round(_d_elapsed, 1),
+                        'message': 'Dead end at ' + ply_to_str(_d_stuck)
+                    })
+                else:
+                    _d_best_score = _d_fixes[0].get('unified_score', 0)
+                    _d_pushed = 0
+                    _d_first_fix = _d_fixes[0]
+
+                    for _d_fix in _d_fixes:
+                        _d_this_score = _d_fix.get('unified_score', 0)
+                        _d_regret = max(0, _d_best_score - _d_this_score)
+                        if _d_regret > _d_REGRET_THRESHOLD:
+                            break
+                        _d_edge_cost = _d_LAMBDA + _d_regret
+                        _d_new_cost = _d_node.cost + _d_edge_cost
+                        _d_new_node = _d_node.copy_with_fix(_d_fix, _d_new_cost)
+                        _heapq.heappush(_d_queue, _d_new_node)
+                        _d_pushed += 1
+
+                    # Prune queue
+                    if len(_d_queue) > _st['max_queue_size']:
+                        _d_pruned = _heapq.nsmallest(_st['max_queue_size'], _d_queue)
+                        _st['queue'] = _d_pruned
+                        _d_queue = _d_pruned
+                        _heapq.heapify(_d_queue)
+
+                    _d_status = 'exploring' if _d_pushed == 1 else 'branching'
+                    _step_result = json.dumps({
+                        'done': False, 'step': _st['step'],
+                        'queue_size': len(_d_queue), 'current_cost': int(_d_node.cost),
+                        'depth': len(_d_node.fixes), 'reach': _d_stuck,
+                        'reach_str': ply_to_str(_d_stuck), 'total_plies': _d_total,
+                        'status': _d_status, 'pushed': _d_pushed,
+                        'elapsed': round(_d_elapsed, 1),
+                        'fix_ply': ply_to_str(_d_first_fix['ply']),
+                        'fix_from': _d_first_fix.get('ocr', ''),
+                        'fix_to': _d_first_fix.get('san', ''),
+                        'message': ('Greedy' if _d_pushed == 1 else 'Branch(' + str(_d_pushed) + ')') + ' at ' + ply_to_str(_d_stuck) + ', cost=' + str(int(_d_node.cost)) + ', depth=' + str(len(_d_node.fixes)) + ', queue=' + str(len(_d_queue))
+                    })
+
 elif _st['method'] == 'greedy':
     # === GREEDY: one fix iteration ===
     _g_moves = _st['moves']
@@ -519,7 +683,8 @@ for _fix in _res.get('fixes', []):
 for _varname in [
     '_search_state_${stateId}', '_search_moves_${stateId}',
     '_search_ocr_lookup_${stateId}', '_search_ocr_data_${stateId}',
-    '_search_method_${stateId}', '_max_ply_${stateId}'
+    '_search_method_${stateId}', '_max_ply_${stateId}',
+    '_dijk_initial_node_${stateId}', '_dijk_queue_${stateId}'
 ]:
     try:
         exec(f'del {_varname}')

@@ -1858,7 +1858,7 @@ function preprocessCellForCTC(cellImage, targetHeight = 64, targetWidth = 256) {
  * @param {Object} gridConfig - Optional {rowCount, format} (default: {20, '2col'})
  * @returns {Promise<{cells: Array, grid: cv.Mat, error?: string}>}
  */
-async function processScoresheet(file, gridConfig, corners) {
+async function processScoresheet(file, gridConfig, corners, method) {
     if (!opencvReady) {
         await initOpenCV();
     }
@@ -1868,23 +1868,120 @@ async function processScoresheet(file, gridConfig, corners) {
         const image = await loadImageToMat(file);
         console.log(`[OpenCV] Image loaded: ${image.cols}x${image.rows}`);
 
-        // Extract grid using v34 detection modules (with optional manual corners)
-        console.log('[OpenCV] Extracting grid (v34)...');
-        const gridResult = corners
-            ? extractGridWithCorners(image, corners, gridConfig)
-            : extractGrid(image, gridConfig);
+        // Branch on detection method
+        var useMethod = method || 'contour';
 
-        // Debug: draw grid overlay on the grid image
-        let gridOverlayUrl = null;
-        if (gridResult.detectionResult.gridRows && gridResult.detectionResult.columnBoundaries) {
-            var hPositions = gridResult.detectionResult.gridRows.map(function(r) { return r.y !== undefined ? r.y : r; });
-            var vPositions = gridResult.detectionResult.columnBoundaries;
-            gridOverlayUrl = debugDrawGrid(gridResult.gridImage, hPositions, vPositions, 'Grid Overlay (' + gridResult.detectionResult.mode + ')');
+        var gridResult, cells, gridOverlayUrl = null;
+
+        if (useMethod === 'anchor' || useMethod === 'manual-anchor') {
+            // === ANCHOR-BASED DETECTION ===
+            if (!window.AnchorGrid) {
+                throw new Error('Anchor grid module not loaded (grid-anchor.js)');
+            }
+
+            console.log('[OpenCV] Extracting grid (anchor)...');
+            var anchorConfig = {
+                format: gridConfig ? gridConfig.format : '2col',
+                rowCount: gridConfig ? gridConfig.rowCount : 20,
+                maxColWidthPct: 7,
+                minDigitH: 0.8,
+                maxDigitH: 4.0,
+                maxDigitW: 2.5,
+                blockSize: 2.0,
+                xWeight: 4,
+                stripColors: false
+            };
+
+            var anchorResult;
+            if (useMethod === 'manual-anchor' && corners) {
+                // Manual corners + anchor column/row detection on warped
+                var cornerObj = {
+                    TL: corners.topLeft || corners[0],
+                    TR: corners.topRight || corners[1],
+                    BR: corners.bottomRight || corners[2],
+                    BL: corners.bottomLeft || corners[3]
+                };
+                var warped = window.AnchorGrid.anchorPerspectiveWarp(image, cornerObj);
+                var wGray = new cv.Mat();
+                cv.cvtColor(warped, wGray, cv.COLOR_RGBA2GRAY);
+
+                var format = anchorConfig.format;
+                var rowCount = anchorConfig.rowCount;
+                var expectedFracs;
+                if(format==='3col') {
+                    var u=1/16.2;
+                    expectedFracs=[0, 1*u, 3.2*u, 5.4*u, 6.4*u, 8.6*u, 10.8*u, 11.8*u, 14*u, 1.0];
+                } else {
+                    expectedFracs=[0, 1/11, 3.3/11, 5.5/11, 6.5/11, 8.8/11, 1.0];
+                }
+                var logFn = function(msg, cls) { console.log('[Anchor] ' + msg); };
+                var colRes = window.AnchorGrid.anchorDetectColumns(wGray, format, logFn, expectedFracs);
+                var rowLines = window.AnchorGrid.anchorDetectRows(wGray, colRes.boundaries, rowCount, logFn, format);
+                wGray.delete();
+
+                var startNums = format==='3col' ? [1,rowCount+1,rowCount*2+1] : [1,rowCount+1];
+                var anchorCells = window.AnchorGrid.anchorExtractCells(warped, colRes.boundaries, rowLines, startNums, rowCount, format);
+
+                anchorResult = {
+                    corners: cornerObj,
+                    warped: warped,
+                    colBounds: colRes.boundaries,
+                    rowLines: rowLines,
+                    cells: anchorCells,
+                    method: 'manual-anchor'
+                };
+            } else {
+                // Full anchor pipeline (auto-find + warp + detect)
+                anchorResult = window.AnchorGrid.anchorProcessScoresheet(image, anchorConfig, function(msg, cls) {
+                    console.log('[Anchor] ' + msg);
+                });
+            }
+
+            if (!anchorResult || !anchorResult.cells || anchorResult.cells.length === 0) {
+                throw new Error('Anchor grid detection failed — no cells extracted. Try Grid method.');
+            }
+
+            // Build gridResult-compatible structure
+            gridResult = {
+                gridImage: anchorResult.warped,
+                detectionResult: {
+                    columnBoundaries: anchorResult.colBounds,
+                    gridRows: anchorResult.rowLines ? (anchorResult.rowLines.left || []) : [],
+                    mode: anchorResult.method || 'anchor',
+                    hasHeader: false  // Anchor has NO header row
+                },
+                config: gridConfig || { rowCount: 20, format: '2col' }
+            };
+
+            // Cells come pre-extracted from anchor — no need for extractCellsFromGrid
+            cells = anchorResult.cells;
+
+            // Draw grid overlay
+            if (anchorResult.colBounds && anchorResult.rowLines) {
+                var hPos = (anchorResult.rowLines.left || []).map(function(r) { return typeof r === 'number' ? r : r; });
+                if (hPos.length > 0) {
+                    gridOverlayUrl = debugDrawGrid(anchorResult.warped, hPos, anchorResult.colBounds, 'Grid Overlay (anchor)');
+                }
+            }
+
+        } else {
+            // === CONTOUR-BASED DETECTION (v34) ===
+            console.log('[OpenCV] Extracting grid (v34)...');
+            gridResult = corners
+                ? extractGridWithCorners(image, corners, gridConfig)
+                : extractGrid(image, gridConfig);
+
+            // Debug: draw grid overlay on the grid image
+            if (gridResult.detectionResult.gridRows && gridResult.detectionResult.columnBoundaries) {
+                var hPositions = gridResult.detectionResult.gridRows.map(function(r) { return r.y !== undefined ? r.y : r; });
+                var vPositions = gridResult.detectionResult.columnBoundaries;
+                gridOverlayUrl = debugDrawGrid(gridResult.gridImage, hPositions, vPositions, 'Grid Overlay (' + gridResult.detectionResult.mode + ')');
+            }
+
+            // Extract cells using detection results
+            console.log('[OpenCV] Extracting cells from grid...');
+            cells = extractCellsFromGrid(gridResult.gridImage, gridResult.detectionResult, gridResult.config);
         }
-
-        // Extract cells using detection results
-        console.log('[OpenCV] Extracting cells from grid...');
-        const cells = extractCellsFromGrid(gridResult.gridImage, gridResult.detectionResult, gridResult.config);
 
         // Validate move numbers - check for gaps and suspicious counts
         const moveNumWarnings = validateMoveNumbers(cells);
@@ -1977,5 +2074,12 @@ if (typeof window !== 'undefined') {
         processScoresheet,
         validateMoveNumbers,
         isReady: () => opencvReady
+    };
+    // Alias for backward compat
+    window.OpenCVImageProcessor.extractGridAnchor = function(image, gridConfig) {
+        return processScoresheet(image, gridConfig, null, 'anchor');
+    };
+    window.OpenCVImageProcessor.extractGridManualAnchor = function(image, corners, gridConfig) {
+        return processScoresheet(image, gridConfig, corners, 'manual-anchor');
     };
 }

@@ -22,6 +22,7 @@ async function loadPythonModules(pyodide) {
         'lenient_normalize.py',
         'fix_finding.py',
         'full_game_search.py',
+        'dijkstra_search.py',
         'validation.py'
     ];
 
@@ -29,7 +30,7 @@ async function loadPythonModules(pyodide) {
     const localModules = [
         'data_structures', 'helpers', 'similarity', 'absurdity',
         'constraints', 'missing_moves', 'lenient_normalize', 'fix_finding', 'play',
-        'chess_quiescence', 'full_game_search', 'validation'
+        'chess_quiescence', 'full_game_search', 'dijkstra_search', 'validation'
     ];
     const singleLinePattern = new RegExp(
         `^from\\s+(${localModules.join('|')})\\s+import\\s+[^(].*$`, 'gm'

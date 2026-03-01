@@ -2157,8 +2157,14 @@ def _precompute_backtrack_context(
 
     if verbose:
         label = f"[{phase_label}]" if phase_label else "[BACKTRACK]"
+        stuck_move_text = moves[effective_stuck_ply] if effective_stuck_ply < len(moves) else '?'
+        search_type = ""
+        if phase_label == "DUAL":
+            search_type = f" (DUAL SEARCH — using secondary candidate: '{stuck_move_text}')"
+        elif phase_label == "PHASE 1":
+            search_type = f" (PRIMARY SEARCH — OCR top: '{stuck_move_text}')"
         print(f"\n   {'='*60}")
-        print(f"   {label} SEARCHING BACKWARDS: {ply_to_str(effective_stuck_ply)} down to {ply_to_str(min_ply)}")
+        print(f"   {label} SEARCHING BACKWARDS: {ply_to_str(effective_stuck_ply)} down to {ply_to_str(min_ply)}{search_type}")
         print(f"   {'='*60}")
         print(f"   - stuck_ply={effective_stuck_ply} ({ply_to_str(effective_stuck_ply)}), search_limit={search_limit} ({ply_to_str(search_limit)})")
         print(f"   - min_ply={min_ply} ({ply_to_str(min_ply)}), total plies to search: {len(all_search_plies)}")
@@ -2570,10 +2576,8 @@ def _search_single_ply_for_fixes(
                             fix_ply in duplicate_pawn_plies or
                             fix_ply in extended_search_plies)
 
-        # Only skip moves with very low similarity (completely unrelated)
-        # Let the scoring system rank everything else - don't filter based on reach
-        if char_sim < 0.15:
-            continue
+        # No similarity filter — let the scoring system rank all legal moves.
+        # Low-similarity moves will naturally get low scores and sort to the bottom.
 
         completes = test_reach >= total_moves
         # Note: absurdities_result and absurdity_count already calculated above
@@ -2676,7 +2680,14 @@ def _search_single_ply_for_fixes(
         hanging_penalty = hanging_value * 10 if is_hanging else 0
 
         # Pawn hanging penalty: -10 per undefended pawn (modest demerit)
+        # But offset by captured material — if we capture a pawn and leave one
+        # hanging, it's roughly a wash (e.g. Bxd5 captures d5 pawn but f5 hangs)
         pawn_hanging_penalty = pawn_hang_count * 10
+        if pawn_hanging_penalty > 0 and board.is_capture(legal_move):
+            captured_piece = board.piece_at(legal_move.to_square)
+            if captured_piece:
+                capture_offset = piece_value(captured_piece) * 10
+                pawn_hanging_penalty = max(0, pawn_hanging_penalty - capture_offset)
 
         # Missed capture penalty: if there's a clearly winning capture available
         # and this move doesn't take it, penalize proportionally
@@ -3148,6 +3159,11 @@ def find_deep_backtrack_fixes(
 
             hanging_penalty = hanging_value * 10 if is_hanging else 0
             pawn_hanging_penalty = pawn_hang_count * 10
+            # Offset pawn hanging penalty by captured material (same as main path)
+            if pawn_hanging_penalty > 0 and swap_move and board_for_hang.is_capture(swap_move):
+                cap_p = board_for_hang.piece_at(swap_move.to_square)
+                if cap_p:
+                    pawn_hanging_penalty = max(0, pawn_hanging_penalty - piece_value(cap_p) * 10)
 
             # Missed capture penalty for piece confusion path
             # Skip when in check — can't freely capture when responding to check
@@ -3418,6 +3434,13 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
             if valid:
                 candidate_move = try_move(verify_board, f['san'])
                 if candidate_move:
+                    # Track what the candidate move captures (for trade detection)
+                    candidate_captured_val = 0
+                    if verify_board.is_capture(candidate_move):
+                        cap_piece = verify_board.piece_at(candidate_move.to_square)
+                        if cap_piece:
+                            candidate_captured_val = piece_value(cap_piece)
+                    candidate_to_sq = candidate_move.to_square
                     verify_board.push(candidate_move)
 
                     # Check 1: Does opponent have mate-in-1?
@@ -3511,6 +3534,10 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
 
                             # Net loss = what they captured minus what we recover
                             net_loss = opp_capture_val - our_best_recovery
+                            # If opponent recaptures on the square we just captured on,
+                            # it's a trade — offset by what our candidate move captured
+                            if opp_move.to_square == candidate_to_sq and candidate_captured_val > 0:
+                                net_loss = max(0, net_loss - candidate_captured_val)
                             if net_loss > worst_net_loss:
                                 worst_net_loss = net_loss
 
@@ -3701,38 +3728,42 @@ class BacktrackSearchState:
         """
         if self.is_done or self.current_index >= len(self.search_order):
             self.is_done = True
-            return {'done': True, 'remaining': 0, 'fixes_found': len(self.fixes), 'best_score': self.best_score}
+            return {'done': True, 'remaining': 0, 'fixes_found': len(self.fixes), 'best_score': self.best_score,
+                    'phase_label': self.ctx.get('phase_label', 'BACKTRACK')}
 
         fix_ply = self.search_order[self.current_index]
         self.current_index += 1
 
+        # Compute range_info for both printing and return value
+        phase_tag = f"[{self.ctx.get('phase_label', 'BACKTRACK')}]" if self.ctx.get('phase_label') else "[BACKTRACK]"
+        search_limit = self.ctx.get('search_limit', self.effective_stuck_ply)
+        min_ply_val = self.ctx.get('min_ply', 0)
+        in_normal_range = min_ply_val <= fix_ply <= search_limit
+        move_text = self.moves[fix_ply] if fix_ply < len(self.moves) else '?'
+        if in_normal_range:
+            if fix_ply == self.effective_stuck_ply:
+                why = "stuck point (illegal/absurd move)"
+            elif fix_ply in self.ctx.get('suspicious_plies', set()):
+                why = "suspicious (check mismatch / duplicate pawn / absurdity)"
+            else:
+                why = "normal backtrack range"
+            range_info = f"[{why}]"
+        else:
+            reasons = []
+            if fix_ply in self.ctx.get('check_mismatch_plies', set()):
+                reasons.append("check mismatch")
+            if fix_ply in self.ctx.get('duplicate_pawn_plies', set()):
+                reasons.append("duplicate pawn")
+            if fix_ply in self.ctx.get('duplicate_suspect_plies', set()):
+                reasons.append("duplicate pawn partner")
+            if fix_ply in self.ctx.get('absurdity_plies', set()):
+                reasons.append("absurdity detected")
+            reason_str = ", ".join(reasons) if reasons else "extended search"
+            range_info = f"[HEURISTIC: {reason_str}]"
+
         # Print per-ply header (same as find_deep_backtrack_fixes)
         if self.verbose:
-            phase_tag = f"[{self.ctx.get('phase_label', 'BACKTRACK')}]" if self.ctx.get('phase_label') else "[BACKTRACK]"
-            search_limit = self.ctx.get('search_limit', self.effective_stuck_ply)
-            min_ply = self.ctx.get('min_ply', 0)
-            in_normal_range = min_ply <= fix_ply <= search_limit
-            if in_normal_range:
-                if fix_ply == self.effective_stuck_ply:
-                    why = "stuck point (illegal/absurd move)"
-                elif fix_ply in self.ctx.get('suspicious_plies', set()):
-                    why = "suspicious (check mismatch / duplicate pawn / absurdity)"
-                else:
-                    why = "normal backtrack range"
-                range_info = f"[{why}]"
-            else:
-                reasons = []
-                if fix_ply in self.ctx.get('check_mismatch_plies', set()):
-                    reasons.append("check mismatch")
-                if fix_ply in self.ctx.get('duplicate_pawn_plies', set()):
-                    reasons.append("duplicate pawn")
-                if fix_ply in self.ctx.get('duplicate_suspect_plies', set()):
-                    reasons.append("duplicate pawn partner")
-                if fix_ply in self.ctx.get('absurdity_plies', set()):
-                    reasons.append("absurdity detected")
-                reason_str = ", ".join(reasons) if reasons else "extended search"
-                range_info = f"[HEURISTIC: {reason_str}]"
-            print(f"\n   {phase_tag} >>> Searching {ply_to_str(fix_ply)} (ply {fix_ply}): '{self.moves[fix_ply] if fix_ply < len(self.moves) else '?'}' {range_info}")
+            print(f"\n   {phase_tag} >>> Searching {ply_to_str(fix_ply)} (ply {fix_ply}): '{move_text}' {range_info}")
 
         # Skip locked plies (sacred — user confirmed OCR is correct) and fixed plies
         if fix_ply in self.locked_plies or fix_ply in self.fixed_plies or fix_ply >= len(self.moves):
@@ -3748,7 +3779,10 @@ class BacktrackSearchState:
                 'fixes_found': len(self.fixes),
                 'best_score': self.best_score,
                 'fixes_at_ply': 0,
-                'skipped': True
+                'skipped': True,
+                'move_text': move_text,
+                'range_info': range_info,
+                'phase_label': self.ctx.get('phase_label', 'BACKTRACK'),
             }
 
         # Build position at fix_ply — start from cached board at min_ply when possible
@@ -3786,7 +3820,10 @@ class BacktrackSearchState:
                 'fixes_found': len(self.fixes),
                 'best_score': self.best_score,
                 'fixes_at_ply': 0,
-                'skipped': True
+                'skipped': True,
+                'move_text': move_text,
+                'range_info': range_info,
+                'phase_label': self.ctx.get('phase_label', 'BACKTRACK'),
             }
 
         # Call the SINGLE SOURCE OF TRUTH for fix scoring
@@ -3818,7 +3855,10 @@ class BacktrackSearchState:
             'fixes_found': len(self.fixes),
             'best_score': self.best_score,
             'fixes_at_ply': len(fixes_at_ply),
-            'early_exit': self.early_exit
+            'early_exit': self.early_exit,
+            'move_text': move_text,
+            'range_info': range_info,
+            'phase_label': self.ctx.get('phase_label', 'BACKTRACK'),
         }
 
     def finalize(self) -> List[dict]:

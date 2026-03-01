@@ -12,8 +12,9 @@
 // =============================================================================
 
 var DEFAULT_PROFILES = [
+    // --- Generic defaults ---
     {
-        name: "MCC 40-Move (2 pages)",
+        name: "20 rows x 2 cols Default (2 pages)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -21,10 +22,68 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Mississauga 60-Move (1 page)",
+        name: "20 rows x 3 cols Default (2 pages)",
         builtin: true,
         pages: [
-            { format: '3col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 }
+            { format: '3col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '3col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 61 }
+        ]
+    },
+    {
+        name: "25 rows x 2 cols Default (2 pages)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 51 }
+        ]
+    },
+    {
+        name: "25 rows x 3 cols Default (2 pages)",
+        builtin: true,
+        pages: [
+            { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 76 }
+        ]
+    },
+    {
+        name: "30 rows x 2 cols Default (2 pages)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 61 }
+        ]
+    },
+    {
+        name: "35 rows x 2 cols Default (2 pages)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 71 }
+        ]
+    },
+    // --- Club-specific profiles (alphabetical) ---
+    {
+        name: "Annex Chess Club 50-Move Carbon Copy (1 page)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
+        name: "Aurora Chess Club 50-Move (1 page)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
+        name: "Bob & Gord's Milton Rapid (2 pages)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 41 }
         ]
     },
     {
@@ -36,10 +95,107 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Standard 20-Row (1 page)",
+        name: "Chess Federation of Canada (2 pages)",
         builtin: true,
         pages: [
-            { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 }
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 15, headerRows: 0, footerRows: 0, startingMove: 51 }
+        ]
+    },
+    {
+        name: "Chess'n Math Association 75-Move Carbon Copy (1 page)",
+        builtin: true,
+        pages: [
+            { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
+        name: "Collingwood-Somborac Chess Festival 50-Move Carbon Copy (1 page)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
+        name: "Excelsior Chess Club (1 page)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 24, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 24, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
+        name: "Federation Quebecoise Des Echecs 75-Move Carbon Copy (1 page)",
+        builtin: true,
+        pages: [
+            { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
+        name: "Forcing Moves First (2 pages)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 51 }
+        ]
+    },
+    {
+        name: "Hart House Chess Club 75-Move Carbon Copy (1 page)",
+        builtin: true,
+        pages: [
+            { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
+        name: "Kitchener Waterloo Chess Club (2 pages)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 61 }
+        ]
+    },
+    {
+        name: "Mississauga Chess Club (2 pages)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 41 }
+        ]
+    },
+    {
+        name: "Mississauga Chess Club 60-Move Carbon Copy (1 page)",
+        builtin: true,
+        pages: [
+            { format: '3col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '3col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
+        name: "Niagara Chess (1 page)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
+        name: "Silent Storm Chess Academy Brampton Carbon Copy (1 page)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
+        name: "Vancity Chess Carbon Copy (1 page)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 }
         ]
     }
 ];
@@ -365,8 +521,10 @@ function renderProfilePageRows(pages) {
                     <select class="profile-pg-rows w-full bg-gray-600 text-white rounded px-2 py-1 mt-0.5">
                         <option value="15" ${pg.rowCount == 15 ? 'selected' : ''}>15</option>
                         <option value="20" ${pg.rowCount == 20 ? 'selected' : ''}>20</option>
+                        <option value="24" ${pg.rowCount == 24 ? 'selected' : ''}>24</option>
                         <option value="25" ${pg.rowCount == 25 ? 'selected' : ''}>25</option>
                         <option value="30" ${pg.rowCount == 30 ? 'selected' : ''}>30</option>
+                        <option value="35" ${pg.rowCount == 35 ? 'selected' : ''}>35</option>
                     </select>
                 </label>
                 <label class="text-gray-400">

@@ -52,6 +52,207 @@ function initSheetsUploader() {
 }
 
 // =============================================================================
+// SIMPLE MODE (single player, 3 page boxes)
+// =============================================================================
+
+function initSimpleSheetsUploader() {
+  var container = document.getElementById('simple-sheets');
+  if (!container) {
+    console.warn('simple-sheets container not found');
+    return;
+  }
+
+  container.innerHTML = renderSimpleSheetsUploader();
+  attachSimpleSheetEventListeners();
+}
+
+function renderSimpleSheetsUploader() {
+  return `
+    <div class="simple-sheets-container">
+      <div class="flex gap-4 items-start mb-3">
+        <div class="flex gap-3 flex-shrink-0">
+          ${renderSheetBox(1, 0)}
+          ${renderSheetBox(1, 1)}
+          ${renderSheetBox(1, 2)}
+        </div>
+        ${renderSheetsInfoPanel()}
+      </div>
+      <!-- Status Legend -->
+      <div class="flex items-center justify-center gap-4 text-xs text-gray-400 mb-3">
+        <span><span class="inline-block w-2 h-2 rounded-full bg-green-500"></span> Grid OK</span>
+        <span><span class="inline-block w-2 h-2 rounded-full bg-yellow-500"></span> Needs corners</span>
+        <span><span class="inline-block w-2 h-2 rounded-full bg-blue-500"></span> OCR running</span>
+        <span><span class="inline-block w-2 h-2 rounded-full bg-purple-500"></span> Done</span>
+      </div>
+      <div class="flex justify-center">
+        <button id="btn-process-simple" class="px-6 py-2 bg-green-600 hover:bg-green-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded font-medium" disabled>
+          Process Sheets →
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+function attachSimpleSheetEventListeners() {
+  var container = document.getElementById('simple-sheets');
+  if (!container) return;
+
+  // Sheet box clicks
+  container.querySelectorAll('.sheet-box').forEach(function(box) {
+    box.addEventListener('click', handleSheetBoxClick);
+  });
+
+  // File input changes
+  container.querySelectorAll('.sheet-file-input').forEach(function(input) {
+    input.addEventListener('change', handleSheetFileChange);
+  });
+
+  // Drag & drop
+  container.querySelectorAll('.sheet-box').forEach(function(box) {
+    box.addEventListener('dragover', function(e) { e.preventDefault(); box.classList.add('ring-2', 'ring-blue-400'); });
+    box.addEventListener('dragleave', function(e) { e.preventDefault(); box.classList.remove('ring-2', 'ring-blue-400'); });
+    box.addEventListener('drop', handleSheetDrop);
+  });
+
+  // Per-sheet format/rowCount override dropdowns
+  container.querySelectorAll('.sheet-format-select').forEach(function(sel) {
+    sel.addEventListener('click', function(e) { e.stopPropagation(); });
+    sel.addEventListener('change', function(e) {
+      e.stopPropagation();
+      var player = parseInt(sel.dataset.player);
+      var sheetIdx = parseInt(sel.dataset.sheet);
+      var sheet = sheetsState['player' + player][sheetIdx];
+      if (sheet) {
+        sheet.format = sel.value;
+        redetectGrid(player, sheetIdx);
+      }
+    });
+  });
+  container.querySelectorAll('.sheet-rows-select').forEach(function(sel) {
+    sel.addEventListener('click', function(e) { e.stopPropagation(); });
+    sel.addEventListener('change', function(e) {
+      e.stopPropagation();
+      var player = parseInt(sel.dataset.player);
+      var sheetIdx = parseInt(sel.dataset.sheet);
+      var sheet = sheetsState['player' + player][sheetIdx];
+      if (sheet) {
+        sheet.rowCount = parseInt(sel.value) || 20;
+        redetectGrid(player, sheetIdx);
+      }
+    });
+  });
+  container.querySelectorAll('.sheet-method-select').forEach(function(sel) {
+    sel.addEventListener('click', function(e) { e.stopPropagation(); });
+    sel.addEventListener('change', function(e) {
+      e.stopPropagation();
+      var player = parseInt(sel.dataset.player);
+      var sheetIdx = parseInt(sel.dataset.sheet);
+      var sheet = sheetsState['player' + player][sheetIdx];
+      if (sheet) {
+        sheet.method = sel.value;
+        redetectGrid(player, sheetIdx);
+      }
+    });
+  });
+
+  // "Try Contour" buttons
+  container.querySelectorAll('.sheet-try-contour').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var player = parseInt(btn.dataset.player);
+      var sheetIdx = parseInt(btn.dataset.sheet);
+      var sheet = sheetsState['player' + player][sheetIdx];
+      if (sheet) {
+        sheet.method = 'contour';
+        redetectGrid(player, sheetIdx);
+      }
+    });
+  });
+
+  // Process button
+  var processBtn = document.getElementById('btn-process-simple');
+  if (processBtn) processBtn.addEventListener('click', handleProcessSheets);
+}
+
+function refreshSimpleSheetsUI() {
+  var container = document.getElementById('simple-sheets');
+  if (!container) return;
+
+  container.innerHTML = renderSimpleSheetsUploader();
+  attachSimpleSheetEventListeners();
+  updateSimpleProcessButton();
+}
+
+function updateSimpleProcessButton() {
+  var btn = document.getElementById('btn-process-simple');
+  if (!btn) return;
+
+  var hasReady = false;
+  var hasNeedsCorners = false;
+  var hasProcessing = false;
+
+  for (var s = 0; s < 3; s++) {
+    var sheet = sheetsState.player1[s];
+    if (sheet) {
+      if (sheet.status === SHEET_STATUS.GRID_OK || sheet.status === SHEET_STATUS.OCR_DONE) {
+        hasReady = true;
+      }
+      if (sheet.status === SHEET_STATUS.NEEDS_CORNERS) {
+        hasNeedsCorners = true;
+      }
+      if (sheet.status === SHEET_STATUS.LOADING || sheet.status === SHEET_STATUS.OCR_RUNNING) {
+        hasProcessing = true;
+      }
+    }
+  }
+
+  var canProcess = hasReady && !hasNeedsCorners && !hasProcessing && !sheetsState.isProcessing;
+  btn.disabled = !canProcess;
+
+  if (sheetsState.isProcessing) {
+    btn.textContent = 'Processing...';
+  } else if (hasNeedsCorners) {
+    btn.textContent = 'Fix corners first \u26A0\uFE0F';
+  } else if (hasProcessing) {
+    var progressParts = [];
+    for (var ss = 0; ss < 3; ss++) {
+      var sh = sheetsState.player1[ss];
+      if (sh && sh.status === SHEET_STATUS.OCR_RUNNING && sh.ocrProgress) {
+        progressParts.push('Page ' + (ss + 1) + ': ' + sh.ocrProgress);
+      }
+    }
+    btn.textContent = progressParts.length > 0 ? progressParts.join(' | ') : 'Please wait...';
+  } else {
+    btn.textContent = 'Process Sheets \u2192';
+  }
+}
+
+// =============================================================================
+// INFO PANEL (shared between simple and advanced modes)
+// =============================================================================
+
+function renderSheetsInfoPanel() {
+  return `
+    <div class="text-xs text-gray-300 space-y-2 pl-2 border-l border-gray-700">
+      <div>
+        <span class="text-gray-200 font-medium">Built-in OCR</span><br>
+        ~80% move recognition accuracy (MRA) using the offline BiLSTM model.
+        Zugwise's auto-fix engine corrects most remaining errors.
+      </div>
+      <div>
+        <span class="text-gray-200 font-medium">Want higher accuracy?</span><br>
+        Use an LLM (Claude, GPT) for OCR to achieve 90%+ MRA.
+        Paste the result under the
+        <a href="ocr-prompt.md" target="_blank" class="text-blue-400 hover:text-blue-300 underline">OCR Text</a> tab.
+      </div>
+      <div class="text-gray-400">
+        Tip: Open multiple browser tabs to process several games at once.
+      </div>
+    </div>
+  `;
+}
+
+// =============================================================================
 // RENDERING
 // =============================================================================
 
@@ -70,38 +271,45 @@ function renderSheetsUploader() {
         </div>
       </div>
       
-      <!-- Player 1 Row -->
-      <div class="player-row mb-4">
-        <div class="flex items-center gap-2 mb-2">
-          <span class="text-sm font-medium text-gray-300">Player 1:</span>
-          <button class="color-toggle px-2 py-0.5 text-xs rounded ${sheetsState.player1Color === 'white' ? 'bg-white text-black' : 'bg-gray-700 text-gray-300'}" 
-                  data-player="1" data-color="white">White</button>
-          <button class="color-toggle px-2 py-0.5 text-xs rounded ${sheetsState.player1Color === 'black' ? 'bg-gray-900 text-white border border-gray-500' : 'bg-gray-700 text-gray-300'}" 
-                  data-player="1" data-color="black">Black</button>
-          <span class="text-xs text-gray-500 ml-2">(auto-detected if possible)</span>
+      <div class="flex gap-4 items-start">
+        <!-- Player Rows -->
+        <div class="flex-shrink-0">
+          <!-- Player 1 Row -->
+          <div class="player-row mb-4">
+            <div class="flex items-center gap-2 mb-2">
+              <span class="text-sm font-medium text-gray-300">Player 1:</span>
+              <button class="color-toggle px-2 py-0.5 text-xs rounded ${sheetsState.player1Color === 'white' ? 'bg-white text-black' : 'bg-gray-700 text-gray-300'}"
+                      data-player="1" data-color="white">White</button>
+              <button class="color-toggle px-2 py-0.5 text-xs rounded ${sheetsState.player1Color === 'black' ? 'bg-gray-900 text-white border border-gray-500' : 'bg-gray-700 text-gray-300'}"
+                      data-player="1" data-color="black">Black</button>
+              <span class="text-xs text-gray-500 ml-2">(auto-detected if possible)</span>
+            </div>
+            <div class="flex gap-3">
+              ${renderSheetBox(1, 0)}
+              ${renderSheetBox(1, 1)}
+              ${renderSheetBox(1, 2)}
+            </div>
+          </div>
+
+          <!-- Player 2 Row -->
+          <div class="player-row mb-4">
+            <div class="flex items-center gap-2 mb-2">
+              <span class="text-sm font-medium text-gray-300">Player 2:</span>
+              <button class="color-toggle px-2 py-0.5 text-xs rounded ${sheetsState.player2Color === 'white' ? 'bg-white text-black' : 'bg-gray-700 text-gray-300'}"
+                      data-player="2" data-color="white">White</button>
+              <button class="color-toggle px-2 py-0.5 text-xs rounded ${sheetsState.player2Color === 'black' ? 'bg-gray-900 text-white border border-gray-500' : 'bg-gray-700 text-gray-300'}"
+                      data-player="2" data-color="black">Black</button>
+              <span class="text-xs text-gray-500 ml-2">(optional - improves accuracy)</span>
+            </div>
+            <div class="flex gap-3">
+              ${renderSheetBox(2, 0)}
+              ${renderSheetBox(2, 1)}
+              ${renderSheetBox(2, 2)}
+            </div>
+          </div>
         </div>
-        <div class="flex gap-3">
-          ${renderSheetBox(1, 0)}
-          ${renderSheetBox(1, 1)}
-          ${renderSheetBox(1, 2)}
-        </div>
-      </div>
-      
-      <!-- Player 2 Row -->
-      <div class="player-row mb-4">
-        <div class="flex items-center gap-2 mb-2">
-          <span class="text-sm font-medium text-gray-300">Player 2:</span>
-          <button class="color-toggle px-2 py-0.5 text-xs rounded ${sheetsState.player2Color === 'white' ? 'bg-white text-black' : 'bg-gray-700 text-gray-300'}" 
-                  data-player="2" data-color="white">White</button>
-          <button class="color-toggle px-2 py-0.5 text-xs rounded ${sheetsState.player2Color === 'black' ? 'bg-gray-900 text-white border border-gray-500' : 'bg-gray-700 text-gray-300'}" 
-                  data-player="2" data-color="black">Black</button>
-          <span class="text-xs text-gray-500 ml-2">(optional - improves accuracy)</span>
-        </div>
-        <div class="flex gap-3">
-          ${renderSheetBox(2, 0)}
-          ${renderSheetBox(2, 1)}
-          ${renderSheetBox(2, 2)}
-        </div>
+
+        ${renderSheetsInfoPanel()}
       </div>
       
       <!-- Status Legend -->
@@ -136,7 +344,7 @@ function renderSheetBox(player, sheetIndex) {
     case SHEET_STATUS.EMPTY:
       statusClass = 'border-dashed border-gray-600 hover:border-gray-500';
       content = `
-        <div class="flex flex-col items-center justify-center h-full text-gray-500">
+        <div class="flex flex-col items-center justify-center h-full text-gray-400">
           <span class="text-2xl mb-1">+</span>
           <span class="text-xs">Page ${pageNum}</span>
         </div>
@@ -158,7 +366,12 @@ function renderSheetBox(player, sheetIndex) {
     case SHEET_STATUS.NEEDS_CORNERS:
       statusClass = 'border-yellow-500 cursor-pointer';
       statusIndicator = '<span class="absolute top-1 right-1 w-2 h-2 rounded-full bg-yellow-500"></span>';
-      content = renderSheetThumbnail(sheet, pageNum, '⚠️ Click to adjust');
+      if (sheet && sheet.method === 'anchor') {
+        content = renderSheetThumbnail(sheet, pageNum, '⚠️ Click to adjust') +
+          '<button class="sheet-try-contour absolute top-7 left-1/2 -translate-x-1/2 bg-blue-600 hover:bg-blue-500 text-white text-xs px-2 py-0.5 rounded z-20 whitespace-nowrap" data-player="' + player + '" data-sheet="' + sheetIndex + '">Try Contour</button>';
+      } else {
+        content = renderSheetThumbnail(sheet, pageNum, '⚠️ Click to adjust');
+      }
       break;
       
     case SHEET_STATUS.OCR_RUNNING:
@@ -174,9 +387,14 @@ function renderSheetBox(player, sheetIndex) {
       break;
       
     case SHEET_STATUS.ERROR:
-      statusClass = 'border-red-500';
+      statusClass = 'border-red-500 cursor-pointer';
       statusIndicator = '<span class="absolute top-1 right-1 w-2 h-2 rounded-full bg-red-500"></span>';
-      content = renderSheetThumbnail(sheet, pageNum, '❌ Error');
+      if (sheet && sheet.method === 'anchor') {
+        content = renderSheetThumbnail(sheet, pageNum, '❌ Failed') +
+          '<button class="sheet-try-contour absolute top-7 left-1/2 -translate-x-1/2 bg-blue-600 hover:bg-blue-500 text-white text-xs px-2 py-0.5 rounded z-20 whitespace-nowrap" data-player="' + player + '" data-sheet="' + sheetIndex + '">Try Contour</button>';
+      } else {
+        content = renderSheetThumbnail(sheet, pageNum, '❌ Failed — adjust corners');
+      }
       break;
   }
   
@@ -187,6 +405,11 @@ function renderSheetBox(player, sheetIndex) {
                 status === SHEET_STATUS.ERROR)) {
     sheetOverrides = `
       <div class="absolute bottom-0 left-0 right-0 bg-black/80 p-0.5 text-xs flex gap-1 z-10 sheet-overrides">
+        <select class="sheet-method-select bg-gray-700 text-white rounded px-1 text-xs"
+                data-player="${player}" data-sheet="${sheetIndex}" title="Grid detection method: Anchor (new) or Contour (old)">
+          <option value="anchor" ${(sheet.method||'anchor')==='anchor'?'selected':''}>Anchor</option>
+          <option value="contour" ${sheet.method==='contour'?'selected':''}>Contour</option>
+        </select>
         <select class="sheet-format-select bg-gray-700 text-white rounded px-1 text-xs flex-1"
                 data-player="${player}" data-sheet="${sheetIndex}">
           <option value="2col" ${sheet.format==='2col'?'selected':''}>2col</option>
@@ -297,6 +520,32 @@ function attachSheetEventListeners() {
       }
     });
   });
+  document.querySelectorAll('.sheet-method-select').forEach(function(sel) {
+    sel.addEventListener('click', function(e) { e.stopPropagation(); });
+    sel.addEventListener('change', function(e) {
+      e.stopPropagation();
+      var player = parseInt(sel.dataset.player);
+      var sheetIdx = parseInt(sel.dataset.sheet);
+      var sheet = sheetsState['player' + player][sheetIdx];
+      if (sheet) {
+        sheet.method = sel.value;
+        redetectGrid(player, sheetIdx);
+      }
+    });
+  });
+  // "Try Contour" buttons
+  document.querySelectorAll('.sheet-try-contour').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var player = parseInt(btn.dataset.player);
+      var sheetIdx = parseInt(btn.dataset.sheet);
+      var sheet = sheetsState['player' + player][sheetIdx];
+      if (sheet) {
+        sheet.method = 'contour';
+        redetectGrid(player, sheetIdx);
+      }
+    });
+  });
 }
 
 function handleSheetBoxClick(e) {
@@ -312,7 +561,8 @@ function handleSheetBoxClick(e) {
   } else if (sheet.status === SHEET_STATUS.NEEDS_CORNERS) {
     // Show corner picker
     showCornerPicker(player, sheetIndex);
-  } else if (sheet.status === SHEET_STATUS.OCR_DONE || sheet.status === SHEET_STATUS.GRID_OK) {
+  } else if (sheet.status === SHEET_STATUS.OCR_DONE || sheet.status === SHEET_STATUS.GRID_OK ||
+             sheet.status === SHEET_STATUS.ERROR) {
     // Re-OCR: show corner picker to adjust and re-run OCR
     showCornerPicker(player, sheetIndex);
   }
@@ -439,7 +689,8 @@ async function loadSheetImage(player, sheetIndex, file) {
     moveCount: null,
     detectedColor: null,
     format: (window.SheetProfiles ? window.SheetProfiles.getProfileGridConfig(sheetIndex + 1).format : '2col'),
-    rowCount: (window.SheetProfiles ? window.SheetProfiles.getProfileGridConfig(sheetIndex + 1).rowCount : 20)
+    rowCount: (window.SheetProfiles ? window.SheetProfiles.getProfileGridConfig(sheetIndex + 1).rowCount : 20),
+    method: 'anchor'
   };
   
   sheetsState['player' + player][sheetIndex] = sheet;
@@ -461,25 +712,25 @@ async function loadSheetImage(player, sheetIndex, file) {
     } else {
       gridConfig = getGridConfig(sheet.rowCount, sheet.format);
     }
-    var gridResult = await detectGrid(imageData, gridConfig);
-    
+    var gridResult = await detectGrid(imageData, gridConfig, sheet.method);
+
     if (gridResult.success) {
       sheet.corners = gridResult.corners;
       sheet.status = SHEET_STATUS.GRID_OK;
       sheet.detectedColor = gridResult.detectedColor || null;
-      
+
       // Auto-set player color if detected
       if (sheet.detectedColor && !sheetsState['player' + player + 'Color']) {
         sheetsState['player' + player + 'Color'] = sheet.detectedColor;
       }
-      
+
       log('✓ Grid detected for Player ' + player + ' Page ' + (sheetIndex + 1));
-      
+
       // Start OCR in background
       startBackgroundOCR(player, sheetIndex);
     } else {
       sheet.status = SHEET_STATUS.NEEDS_CORNERS;
-      log('⚠️ Grid detection failed - manual corners needed');
+      log('⚠️ Grid detection failed' + (sheet.method === 'anchor' ? ' — try Contour method or adjust corners' : ' — adjust corners manually'));
     }
     
   } catch (err) {
@@ -500,9 +751,9 @@ function readFileAsDataURL(file) {
   });
 }
 
-async function detectGrid(imageDataURL, sheetConfig) {
-  // Client-side grid detection using v34 modules
-  log('🔍 Running client-side grid detection...');
+async function detectGrid(imageDataURL, sheetConfig, method) {
+  var useMethod = method || 'contour';
+  log('🔍 Running client-side grid detection (' + useMethod + ')...');
 
   try {
     // Wait for OpenCV
@@ -539,35 +790,84 @@ async function detectGrid(imageDataURL, sheetConfig) {
     var srcMat = cv.imread(canvas);
 
     var config = sheetConfig || getGridConfig(20, '2col');
-    var result = runDetection(srcMat, config, function(msg) {
-      log('  [Grid] ' + msg);
-    });
 
-    var success = (
-      result.columnBoundaries.length === config.expectedCols &&
-      result.gridRows && result.gridRows.length >= config.rowCount
-    );
-
-    var corners = null;
-    if (result.contourCorners) {
-      var ordered = orderPoints(result.contourCorners);
-      corners = {
-        topLeft: ordered[0],
-        topRight: ordered[1],
-        bottomRight: ordered[2],
-        bottomLeft: ordered[3]
+    if (useMethod === 'anchor' && window.AnchorGrid) {
+      // === ANCHOR-BASED DETECTION ===
+      var anchorConfig = {
+        format: config.format || '2col',
+        rowCount: config.rowCount || 20,
+        maxColWidthPct: 7,
+        minDigitH: 0.8,
+        maxDigitH: 4.0,
+        maxDigitW: 2.5,
+        blockSize: 2.0,
+        xWeight: 4,
+        stripColors: false
       };
+
+      var anchorResult = window.AnchorGrid.anchorProcessScoresheet(srcMat, anchorConfig, function(msg) {
+        log('  [Anchor] ' + msg);
+      });
+
+      srcMat.delete();
+
+      var success = anchorResult && anchorResult.cells && anchorResult.cells.length > 0;
+
+      // Build corners in the format sheets.js expects
+      var corners = null;
+      if (anchorResult && anchorResult.corners) {
+        corners = {
+          topLeft: anchorResult.corners.TL,
+          topRight: anchorResult.corners.TR,
+          bottomRight: anchorResult.corners.BR,
+          bottomLeft: anchorResult.corners.BL
+        };
+      }
+
+      // Cleanup warped Mat from anchor result
+      if (anchorResult && anchorResult.warped) anchorResult.warped.delete();
+      // Cleanup cell images from anchor result
+      if (anchorResult && anchorResult.cells) {
+        anchorResult.cells.forEach(function(c) { if (c.image && c.image.delete) c.image.delete(); });
+      }
+
+      log('  Anchor detection: ' + (success ? 'SUCCESS' : 'FAILED') +
+          ' (' + (anchorResult ? anchorResult.cells.length : 0) + ' cells)');
+
+      return { success: success, corners: corners, detectedColor: null };
+
+    } else {
+      // === CONTOUR-BASED DETECTION (v34) ===
+      var result = runDetection(srcMat, config, function(msg) {
+        log('  [Grid] ' + msg);
+      });
+
+      var success = (
+        result.columnBoundaries.length === config.expectedCols &&
+        result.gridRows && result.gridRows.length >= config.rowCount
+      );
+
+      var corners = null;
+      if (result.contourCorners) {
+        var ordered = orderPoints(result.contourCorners);
+        corners = {
+          topLeft: ordered[0],
+          topRight: ordered[1],
+          bottomRight: ordered[2],
+          bottomLeft: ordered[3]
+        };
+      }
+
+      log('  Grid detection: ' + (success ? 'SUCCESS' : 'FAILED') +
+          ' (cols=' + result.columnBoundaries.length + '/' + config.expectedCols +
+          ', rows=' + (result.gridRows ? result.gridRows.length : 0) + ')');
+
+      // Cleanup
+      srcMat.delete();
+      if (result.warped) result.warped.delete();
+
+      return { success: success, corners: corners, detectedColor: null };
     }
-
-    log('  Grid detection: ' + (success ? 'SUCCESS' : 'FAILED') +
-        ' (cols=' + result.columnBoundaries.length + '/' + config.expectedCols +
-        ', rows=' + (result.gridRows ? result.gridRows.length : 0) + ')');
-
-    // Cleanup
-    srcMat.delete();
-    if (result.warped) result.warped.delete();
-
-    return { success: success, corners: corners, detectedColor: null };
 
   } catch (err) {
     log('❌ Grid detection error: ' + err.message);
@@ -599,7 +899,7 @@ async function redetectGrid(player, sheetIndex) {
     gridConfig = getGridConfig(sheet.rowCount, sheet.format);
   }
 
-  var gridResult = await detectGrid(sheet.image, gridConfig);
+  var gridResult = await detectGrid(sheet.image, gridConfig, sheet.method);
 
   if (gridResult.success) {
     sheet.corners = gridResult.corners;
@@ -608,7 +908,7 @@ async function redetectGrid(player, sheetIndex) {
     startBackgroundOCR(player, sheetIndex);
   } else {
     sheet.status = SHEET_STATUS.NEEDS_CORNERS;
-    log('⚠️ Grid re-detection failed, manual corners needed');
+    log('⚠️ Grid re-detection failed' + (sheet.method === 'anchor' ? ' — try Contour method' : ' — adjust corners manually'));
   }
 
   refreshSheetsUI();
@@ -681,14 +981,19 @@ function showCornerPicker(player, sheetIndex) {
   var modal = ensureCornerPickerModal();
   var content = document.getElementById('corner-picker-content');
 
+  var currentMethod = sheet.method || 'anchor';
   content.innerHTML = `
     <div class="relative inline-block">
       <canvas id="corner-picker-canvas" class="max-w-full max-h-[60vh]"></canvas>
       <svg id="corner-picker-svg" class="absolute inset-0 w-full h-full" style="pointer-events: none;"></svg>
     </div>
     <div class="mt-4 flex items-center justify-between">
-      <div class="text-sm text-gray-400">
+      <div class="text-sm text-gray-400 flex items-center gap-3">
         Drag the corners to match the grid boundaries
+        <select id="corner-picker-method" class="bg-gray-700 text-white rounded px-2 py-1 text-xs" title="Grid detection method">
+          <option value="anchor" ${currentMethod==='anchor'?'selected':''}>Anchor</option>
+          <option value="contour" ${currentMethod==='contour'?'selected':''}>Contour</option>
+        </select>
       </div>
       <div class="flex gap-2">
         <button id="btn-reset-corners" class="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded">Reset</button>
@@ -708,6 +1013,18 @@ function showCornerPicker(player, sheetIndex) {
   // Attach button handlers
   document.getElementById('btn-reset-corners').addEventListener('click', resetCornerPicker);
   document.getElementById('btn-apply-corners').addEventListener('click', applyCornerPicker);
+
+  // Method selector in corner picker — updates the sheet's method
+  var methodSel = document.getElementById('corner-picker-method');
+  if (methodSel) {
+    methodSel.addEventListener('change', function() {
+      var active = sheetsState.activeCornerPicker;
+      if (active) {
+        var s = sheetsState['player' + active.player][active.sheet];
+        if (s) s.method = methodSel.value;
+      }
+    });
+  }
 }
 
 function hideCornerPicker() {
@@ -795,8 +1112,14 @@ function initCornerPickerCanvas(sheetOrImageURL, existingCorners) {
     cornerPickerState.originalHeight = img.height;
 
     // Initialize corners (default to 10% padding or use existing)
+    // Existing corners are in original image coordinates — scale to canvas
     if (corners) {
-      cornerPickerState.corners = JSON.parse(JSON.stringify(corners));
+      cornerPickerState.corners = {
+        topLeft: { x: corners.topLeft.x * scale, y: corners.topLeft.y * scale },
+        topRight: { x: corners.topRight.x * scale, y: corners.topRight.y * scale },
+        bottomRight: { x: corners.bottomRight.x * scale, y: corners.bottomRight.y * scale },
+        bottomLeft: { x: corners.bottomLeft.x * scale, y: corners.bottomLeft.y * scale }
+      };
     } else {
       var pad = 0.1;
       cornerPickerState.corners = {
@@ -976,7 +1299,18 @@ function applyCornerPicker() {
 
   var sheet = sheetsState['player' + active.player][active.sheet];
   if (sheet) {
-    sheet.corners = JSON.parse(JSON.stringify(cornerPickerState.corners));
+    // Scale corners from canvas coordinates back to original image coordinates
+    var scale = cornerPickerState.imageScale || 1;
+    var keys = ['topLeft', 'topRight', 'bottomRight', 'bottomLeft'];
+    var scaledCorners = {};
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      scaledCorners[k] = {
+        x: Math.round(cornerPickerState.corners[k].x / scale),
+        y: Math.round(cornerPickerState.corners[k].y / scale)
+      };
+    }
+    sheet.corners = scaledCorners;
     sheet.status = SHEET_STATUS.GRID_OK;
 
     log('✓ Corners applied for Player ' + active.player + ' Page ' + (active.sheet + 1));
@@ -1023,14 +1357,22 @@ async function startBackgroundOCR(player, sheetIndex) {
       var corners = sheet.corners || null;
 
       var sheetId = player;  // Use player number as sheet ID for dual logit storage
+      var sheetMethod = sheet.method || 'anchor';
+      // For manual corners with anchor method, use manual-anchor variant
+      var ocrMethod = (sheetMethod === 'anchor' && corners) ? 'manual-anchor' : sheetMethod;
       var result = await window.zugwise.processScoresheet(file, function(msg) {
         sheet.ocrProgress = msg;
         updateProcessButton();
-      }, gridConfig, corners, sheetId);
+      }, gridConfig, corners, sheetId, ocrMethod);
 
       sheet.ocrResult = { moves: result.moves || [] };
       sheet.moveCount = result.moves ? result.moves.length : 0;
       sheet.status = SHEET_STATUS.OCR_DONE;
+
+      // Show grid overlay in debug panel
+      if (result.gridOverlayUrl && window.logImage) {
+        window.logImage(result.gridOverlayUrl, 'Grid overlay — P' + player + ' Page ' + (sheetIndex + 1) + ' (' + ocrMethod + ')');
+      }
 
       log('✓ OCR done: ' + sheet.moveCount + ' moves for Player ' + player + ' Page ' + (sheetIndex + 1));
     } else {
@@ -1040,11 +1382,17 @@ async function startBackgroundOCR(player, sheetIndex) {
       sheet.moveCount = ocrResult.moves ? ocrResult.moves.length : 0;
       sheet.status = SHEET_STATUS.OCR_DONE;
 
+      // Show grid overlay in debug panel
+      if (ocrResult.gridOverlayUrl && window.logImage) {
+        window.logImage(ocrResult.gridOverlayUrl, 'Grid overlay — P' + player + ' Page ' + (sheetIndex + 1));
+      }
+
       log('✓ OCR done: ' + sheet.moveCount + ' moves for Player ' + player + ' Page ' + (sheetIndex + 1));
     }
   } catch (err) {
     sheet.status = SHEET_STATUS.ERROR;
-    log('✗ OCR error: ' + err.message);
+    var methodHint = (sheet.method === 'anchor') ? ' — try switching to Contour method' : '';
+    log('✗ OCR error: ' + err.message + methodHint);
   }
 
   refreshSheetsUI();
@@ -1102,20 +1450,56 @@ async function runOCR(imageDataURL) {
 
 async function processAllSheets() {
   log('🚀 Processing all sheets...');
-  
+
+  // Detect whether files changed since last process
+  var fingerprint = '';
+  for (var fp = 1; fp <= 2; fp++) {
+    for (var fs = 0; fs < 3; fs++) {
+      var fsheet = sheetsState['player' + fp][fs];
+      if (fsheet && fsheet.file) {
+        fingerprint += fsheet.file.name + ':' + fsheet.file.size + ':' + fsheet.file.lastModified + ';';
+      }
+    }
+  }
+  var filesChanged = (fingerprint !== sheetsState._lastProcessedFingerprint);
+  sheetsState._lastProcessedFingerprint = fingerprint;
+
+  if (filesChanged) {
+    // New files uploaded — cancel running searches and fully reset
+    if (window.searchManager && window.searchManager.isRunning) {
+      cancelSearch();
+      log('⏹ Cancelled previous searches');
+    }
+  }
+  // Board, move list, and algorithm output are reset by showOcrResults() below
+
   var allMoves = [];
-  
+
   // Collect moves in order: P1-1, P1-2, P1-3, P2-1, P2-2, P2-3
   // But actually we want: White sheets first, then Black sheets
   // Or: interleaved by move number if we have both players
   
-  // For now, simple concatenation by player order
+  // Concatenate by player order, renumbering page 2+ moves to avoid collisions
   for (var p = 1; p <= 2; p++) {
     var playerMoves = [];
+    var moveNumOffset = 0;
     for (var s = 0; s < 3; s++) {
       var sheet = sheetsState['player' + p][s];
-      if (sheet && sheet.ocrResult && sheet.ocrResult.moves) {
-        playerMoves = playerMoves.concat(sheet.ocrResult.moves);
+      if (sheet && sheet.ocrResult && sheet.ocrResult.moves && sheet.ocrResult.moves.length > 0) {
+        var sheetMoves = sheet.ocrResult.moves;
+        if (moveNumOffset > 0) {
+          // Renumber moves for page 2+ so they don't collide with page 1
+          log('📄 Page ' + (s + 1) + ': renumbering moves +' + moveNumOffset + ' (moves ' + sheetMoves[0].num + '-' + sheetMoves[sheetMoves.length - 1].num + ' → ' + (sheetMoves[0].num + moveNumOffset) + '-' + (sheetMoves[sheetMoves.length - 1].num + moveNumOffset) + ')');
+          sheetMoves = sheetMoves.map(function(m) {
+            var copy = Object.assign({}, m);
+            copy.num = m.num + moveNumOffset;
+            return copy;
+          });
+        }
+        playerMoves = playerMoves.concat(sheetMoves);
+        // Calculate offset for next page: max move number from this sheet's format
+        var sheetCols = (sheet.format === '3col') ? 3 : 2;
+        moveNumOffset += sheet.rowCount * sheetCols;
       }
     }
     
@@ -1172,6 +1556,7 @@ async function processAllSheets() {
     showOcrResults(paired, 'Dual scoresheets');
     if (!state.pendingNoiseReview) {
       await validateAndDisplay(paired, 'Dual scoresheets');
+      if (filesChanged) launchBackgroundSearches(paired);
     }
   } else {
     // Single player
@@ -1186,6 +1571,7 @@ async function processAllSheets() {
     showOcrResults(paired, 'Single scoresheet');
     if (!state.pendingNoiseReview) {
       await validateAndDisplay(paired, 'Single scoresheet');
+      if (filesChanged) launchBackgroundSearches(paired);
     }
   }
 }
@@ -1259,22 +1645,30 @@ function pairMoves(ocrMoves) {
 
 function refreshSheetsUI() {
   var container = document.getElementById('sheets-uploader');
-  if (container) {
+  if (container && !container.classList.contains('hidden')) {
     container.innerHTML = renderSheetsUploader();
     attachSheetEventListeners();
+  }
+  // Also refresh simple mode if visible
+  var simpleContainer = document.getElementById('simple-sheets');
+  if (simpleContainer) {
+    refreshSimpleSheetsUI();
   }
 }
 
 function updateProcessButton() {
+  // Always update simple mode button (may be the only one visible)
+  updateSimpleProcessButton();
+
   var btn = document.getElementById('btn-process-sheets');
   if (!btn) return;
-  
+
   // Enable if at least one sheet is ready (GRID_OK or OCR_DONE)
   // and no sheets are in NEEDS_CORNERS state
   var hasReady = false;
   var hasNeedsCorners = false;
   var hasProcessing = false;
-  
+
   for (var p = 1; p <= 2; p++) {
     for (var s = 0; s < 3; s++) {
       var sheet = sheetsState['player' + p][s];
@@ -1291,10 +1685,10 @@ function updateProcessButton() {
       }
     }
   }
-  
+
   var canProcess = hasReady && !hasNeedsCorners && !hasProcessing && !sheetsState.isProcessing;
   btn.disabled = !canProcess;
-  
+
   if (sheetsState.isProcessing) {
     btn.textContent = 'Processing...';
   } else if (hasNeedsCorners) {

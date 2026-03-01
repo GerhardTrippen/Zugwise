@@ -130,7 +130,7 @@ def run_dijkstra_search(
     moves: List[str],
     ocr_lookup: Dict[int, OCRMove] = None,
     max_queue_size: int = 50,
-    max_steps: int = 100,
+    max_steps: int = 1000,
     max_fixes_per_path: int = 15,
     regret_threshold: float = REGRET_THRESHOLD,
     lam: float = LAMBDA,

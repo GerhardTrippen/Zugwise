@@ -14,7 +14,7 @@
   <meta name="theme-color" content="#1a1a2e">
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col">
-  <div id="offline-status" class="hidden fixed top-0 left-0 right-0 bg-yellow-500 text-white text-center py-2 z-50"></div>
+  <div id="offline-status" class="hidden bg-yellow-500 text-white text-center py-2"></div>
   <header class="bg-gray-800 border-b border-gray-700 px-6 py-4">
     <div class="max-w-7xl mx-auto flex items-center justify-between">
       <div class="flex items-center gap-3">
@@ -92,26 +92,18 @@
             <div id="profile-bar" class="flex items-center gap-2 mb-2 text-sm">
               <label class="text-gray-400">Profile:</label>
               <select id="profile-select" class="bg-gray-700 text-white rounded px-2 py-1 text-sm flex-1 max-w-xs"></select>
-              <button id="btn-edit-profile" class="text-gray-400 hover:text-white text-sm" title="Edit profiles">&#9998;</button>
-              <span id="profile-summary" class="text-gray-500 text-xs ml-2"></span>
+              <button id="btn-edit-profile" class="text-gray-300 hover:text-white text-sm" title="Edit profiles">&#9998;</button>
+              <span id="profile-summary" class="text-gray-400 text-xs ml-2"></span>
             </div>
-            <div id="drop-zone" class="relative border-2 border-dashed border-gray-600 hover:border-gray-500 rounded-lg p-4 text-center cursor-pointer">
-              <input type="file" id="file-input" accept="image/*" multiple class="hidden">
-              <p class="text-gray-300">Drop scoresheet image(s) or <span class="text-blue-400">click to browse</span></p>
-              <p class="text-xs text-gray-500 mt-1">Quick upload for single pages</p>
-              <div id="processing-overlay" class="processing-overlay hidden">
-                <div class="spinner"></div>
-                <span id="processing-text" class="text-blue-300 font-medium">Processing OCR...</span>
-                <p class="text-xs text-gray-500 mt-2">Tip: Open multiple tabs to work on several games at once</p>
-              </div>
-            </div>
+            <!-- Simple mode: single player row of 3 page boxes (rendered by sheets.js) -->
+            <div id="simple-sheets"></div>
           </div>
 
           <!-- Toggle for advanced multi-sheet mode -->
           <div class="flex items-center justify-center">
             <button id="btn-toggle-multisheet" class="text-sm text-blue-400 hover:text-blue-300 flex items-center gap-1">
               <span id="multisheet-toggle-icon">&#9660;</span>
-              <span id="multisheet-toggle-text">Advanced: Multiple sheets / Both players</span>
+              <span id="multisheet-toggle-text">Advanced: Both players / Multiple sheets</span>
             </button>
           </div>
 
@@ -216,21 +208,16 @@
           </div>
           <!-- Full Game Search (under board) -->
           <div class="mt-4 pt-3 border-t border-gray-700">
-            <div class="text-xs text-gray-500 mb-2">Auto-search:</div>
-            <div id="search-buttons" class="flex gap-2">
-              <button id="btn-greedy-search" title="Fast single-path search: picks the top fix at each stuck point" class="flex-1 px-2 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed">
-                Greedy
-              </button>
-              <button id="btn-beam-search" title="Thorough multi-path exploration: considers multiple fix candidates (slower)" class="flex-1 px-2 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed">
-                Beam
-              </button>
-            </div>
+            <div class="text-xs text-gray-500 mb-2">Algorithm Lab:</div>
             <!-- Search Progress - Stacked panels (visible once any search starts) -->
-            <div id="search-progress" class="hidden mt-2 space-y-2">
+            <div id="search-progress" class="hidden space-y-2">
               <!-- Greedy panel -->
               <div class="bg-gray-700 rounded border border-gray-600 flex flex-col">
                 <div class="flex items-center justify-between px-2 py-1 border-b border-gray-600">
-                  <span class="text-xs font-medium text-green-400">Greedy</span>
+                  <div class="flex items-center gap-1.5">
+                    <span class="text-xs font-medium text-green-400">Greedy</span>
+                    <button id="btn-greedy-search" title="Rerun greedy search" class="text-gray-500 hover:text-green-400 disabled:opacity-30 disabled:cursor-not-allowed" disabled>&#8635;</button>
+                  </div>
                   <div class="flex items-center gap-2">
                     <span id="greedy-status" class="text-xs text-gray-400">Idle</span>
                     <button id="btn-cancel-greedy" class="text-xs text-red-400 hover:text-red-300 hidden">&#10005;</button>
@@ -247,7 +234,10 @@
               <!-- Beam panel -->
               <div class="bg-gray-700 rounded border border-gray-600 flex flex-col">
                 <div class="flex items-center justify-between px-2 py-1 border-b border-gray-600">
-                  <span class="text-xs font-medium text-blue-400">Beam</span>
+                  <div class="flex items-center gap-1.5">
+                    <span class="text-xs font-medium text-blue-400">Beam</span>
+                    <button id="btn-beam-search" title="Rerun beam search" class="text-gray-500 hover:text-blue-400 disabled:opacity-30 disabled:cursor-not-allowed" disabled>&#8635;</button>
+                  </div>
                   <div class="flex items-center gap-2">
                     <span id="beam-status" class="text-xs text-gray-400">Idle</span>
                     <button id="btn-cancel-beam" class="text-xs text-red-400 hover:text-red-300 hidden">&#10005;</button>
@@ -260,6 +250,26 @@
                   </div>
                 </div>
                 <div id="beam-log" class="px-2 pb-2 overflow-y-auto max-h-32 text-xs font-mono text-gray-300 space-y-0.5"></div>
+              </div>
+              <!-- Dijkstra panel -->
+              <div class="bg-gray-700 rounded border border-gray-600 flex flex-col">
+                <div class="flex items-center justify-between px-2 py-1 border-b border-gray-600">
+                  <div class="flex items-center gap-1.5">
+                    <span class="text-xs font-medium text-purple-400">Dijkstra</span>
+                    <button id="btn-dijkstra-search" title="Rerun Dijkstra search" class="text-gray-500 hover:text-purple-400 disabled:opacity-30 disabled:cursor-not-allowed" disabled>&#8635;</button>
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <span id="dijkstra-status" class="text-xs text-gray-400">Idle</span>
+                    <button id="btn-cancel-dijkstra" class="text-xs text-red-400 hover:text-red-300 hidden">&#10005;</button>
+                    <button id="btn-apply-dijkstra" class="text-xs px-1.5 py-0.5 bg-purple-700 hover:bg-purple-600 rounded hidden">Apply</button>
+                  </div>
+                </div>
+                <div class="px-2 py-1">
+                  <div class="w-full bg-gray-600 rounded-full h-1">
+                    <div id="dijkstra-progress-bar" class="bg-purple-500 h-1 rounded-full transition-all" style="width: 0%"></div>
+                  </div>
+                </div>
+                <div id="dijkstra-log" class="px-2 pb-2 overflow-y-auto max-h-32 text-xs font-mono text-gray-300 space-y-0.5"></div>
               </div>
             </div>
             <!-- Hidden search-output-log for legacy compat -->
@@ -315,12 +325,19 @@
   </div>
   <footer class="bg-gray-800 border-t border-gray-700 px-6 py-3">
     <div class="max-w-7xl mx-auto flex items-center justify-between text-sm text-gray-500">
-      <div>Zugwise v0.5</div>
-      <a href="https://buymeacoffee.com/zugwise" target="_blank" rel="noopener noreferrer"
-         class="text-yellow-500 hover:text-yellow-400 flex items-center gap-1"
-         title="Support this project">
-        ☕ <span class="hidden sm:inline">Buy me a coffee</span>
-      </a>
+      <div>Zugwise v0.6</div>
+      <div class="flex items-center gap-4">
+        <a href="https://buymeacoffee.com/zugwise" target="_blank" rel="noopener noreferrer"
+           class="text-yellow-500 hover:text-yellow-400 flex items-center gap-1"
+           title="Support this project">
+          ☕ <span class="hidden sm:inline">Buy me a coffee</span>
+        </a>
+        <a href="https://github.com/GerhardTrippen/Zugwise/issues" target="_blank" rel="noopener noreferrer"
+           class="text-gray-400 hover:text-gray-300 flex items-center gap-1"
+           title="Report a bug or request a feature">
+          🐛 <span class="hidden sm:inline">Report issue</span>
+        </a>
+      </div>
       <div class="flex gap-4">
         <button id="btn-download" title="Download game as PGN file" class="hover:text-gray-300">📥 Download PGN</button>
         <button id="btn-lichess" title="Analyze position on Lichess.org" class="hover:text-gray-300">🔗 Open in Lichess</button>
@@ -350,6 +367,9 @@
           </label>
           <label class="flex items-center text-gray-300 text-sm">
             <input type="checkbox" id="set-piece_N_R" class="mr-2"> N / R (Knight/Rook)
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-piece_N_B" class="mr-2"> N / B (Knight/Bishop)
           </label>
           <label class="flex items-center text-gray-300 text-sm">
             <input type="checkbox" id="set-piece_Q_O" class="mr-2"> Q / O (Queen/Castling)
@@ -389,9 +409,6 @@
           </label>
           <label class="flex items-center text-gray-300 text-sm">
             <input type="checkbox" id="set-file_b_h" class="mr-2"> b / h
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-file_f_t" class="mr-2"> f / t
           </label>
         </div>
       </div>
@@ -519,6 +536,23 @@
         </div>
       </div>
 
+      <!-- Auto-Run Searches -->
+      <div class="mb-6">
+        <h3 class="text-lg font-semibold text-teal-400 mb-2">Auto-Run Searches</h3>
+        <p class="text-xs text-gray-400 mb-2">Launch these searches automatically when entering interactive mode</p>
+        <div class="space-y-2">
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-autorun_greedy" class="mr-2"> Greedy search
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-autorun_beam" class="mr-2"> Beam search
+          </label>
+          <label class="flex items-center text-gray-300 text-sm">
+            <input type="checkbox" id="set-autorun_dijkstra" class="mr-2"> Dijkstra search
+          </label>
+        </div>
+      </div>
+
       <!-- Buttons -->
       <div class="flex justify-between mt-6">
         <button id="settings-reset" class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded text-sm">
@@ -576,6 +610,7 @@
   <script src="js/grid-columns.js"></script>
   <script src="js/grid-rows.js"></script>
   <script src="js/grid-detection.js"></script>
+  <script src="js/grid-anchor.js"></script>
   <script src="js/g-tail-detection.js"></script>
   <script src="opencv_image_processor.js"></script>
   <script src="worker-api.js"></script>

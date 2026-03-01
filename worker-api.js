@@ -375,7 +375,7 @@ class ZugwiseAPI {
      * @param {function} onProgress - Progress callback (optional)
      * @returns {Promise<{moves: Array, has_grid_image: boolean, error?: string}>}
      */
-    async processScoresheet(file, onProgress, gridConfig, corners, sheetId) {
+    async processScoresheet(file, onProgress, gridConfig, corners, sheetId, method) {
         // Use OpenCV.js - NO FLASK FALLBACK
         if (!window.OpenCVImageProcessor) {
             throw new Error('OpenCV.js image processor not loaded');
@@ -389,7 +389,7 @@ class ZugwiseAPI {
         if (onProgress) onProgress('Extracting grid...');
 
         // Use OpenCV for grid extraction (deskew, perspective transform, cell extraction)
-        const result = await window.OpenCVImageProcessor.processScoresheet(file, gridConfig, corners);
+        const result = await window.OpenCVImageProcessor.processScoresheet(file, gridConfig, corners, method);
 
         if (!result.gridDetected || result.cells.length === 0) {
             return {
@@ -466,9 +466,9 @@ class ZugwiseAPI {
             result.grid.delete();
         }
 
-        // Filter noise tail (repeated garbage moves at end of game)
-        if (onProgress) onProgress('Filtering noise...');
-        const filteredMoves = filterNoiseTail(moves);
+        // Skip silent noise filtering — let showOcrResults() detectSuspiciousTail()
+        // present noise to the user for review instead of auto-truncating
+        const filteredMoves = moves;
 
         return {
             moves: filteredMoves,

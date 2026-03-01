@@ -197,11 +197,14 @@ async function updateOcrContextPanel(overridePly){
                     state.ocrCellsSheet2 && state.ocrCellsSheet2.length > 0;
 
   if(isDualSheet){
-    // Side-by-side with flex-wrap: wraps to stacked on narrow screens
-    var html = '<div style="display:flex;gap:6px;flex-wrap:wrap">';
+    // Layout: [move numbers] [panel1] [panel2] — move numbers separate so both grids are equal width
+    var html = '<div style="display:flex;gap:0;align-items:stretch">';
+    // Build move number column from sheet1 row range
+    html += _buildMoveNumberColumn(state.ocrCellsSheet1, highlightMoveNum);
+    html += '<div style="display:flex;flex:1;gap:4px">';
     html += _buildOcrContextGrid(state.ocrCellsSheet1, highlightMoveNum, highlightColor, 'white');
     html += _buildOcrContextGrid(state.ocrCellsSheet2, highlightMoveNum, highlightColor, 'black');
-    html += '</div>';
+    html += '</div></div>';
     content.innerHTML = html;
     panel.classList.remove('hidden');
   } else if(state.ocrCells&&state.ocrCells.length>0){
@@ -211,6 +214,28 @@ async function updateOcrContextPanel(overridePly){
   }else{
     panel.classList.add('hidden');
   }
+}
+
+// Helper: build standalone move number column for dual mode
+function _buildMoveNumberColumn(cells, highlightMoveNum){
+    var maxRow=0;
+    cells.forEach(function(c){if(c.num>maxRow)maxRow=c.num;});
+    var rpc = state.rowsPerColumn || 0;
+    var highlightCol = rpc > 0 ? Math.floor((highlightMoveNum - 1) / rpc) : 0;
+    var colStart = rpc > 0 ? highlightCol * rpc + 1 : 1;
+    var colEnd = rpc > 0 ? (highlightCol + 1) * rpc : maxRow;
+    colEnd = Math.min(colEnd, maxRow);
+    var startRow=Math.max(colStart,highlightMoveNum-1);
+    var endRow=startRow+2;
+    if(endRow>colEnd){endRow=colEnd;startRow=Math.max(colStart,endRow-2);}
+
+    var html='<div style="display:flex;flex-direction:column;justify-content:space-around;flex-shrink:0;padding-right:4px">';
+    for(var row=startRow;row<=endRow;row++){
+      var numClass = (row === highlightMoveNum) ? 'text-yellow-300 font-bold' : 'text-gray-500';
+      html+='<div class="text-xs '+numClass+'" style="text-align:right">'+row+'.</div>';
+    }
+    html+='</div>';
+    return html;
 }
 
 // Helper: build one OCR context grid for a set of cells
@@ -250,23 +275,20 @@ function _buildOcrContextGrid(cells, highlightMoveNum, highlightColor, label){
 
     var rowCount = endRow - startRow + 1 + (showGTailRow ? 1 : 0);
 
-    // Wrapper: color-coded left border in dual mode (white=light, black=dark)
-    // min-width:140px ensures wrapping to stacked on narrow screens
-    var borderStyle = '';
-    if(label === 'white') borderStyle = 'border-left:3px solid #e5e7eb;padding-left:4px;';
-    else if(label === 'black') borderStyle = 'border-left:3px solid #4b5563;padding-left:4px;';
-    var html='<div style="flex:1;min-width:140px;'+borderStyle+'">';
+    // Wrapper
+    var isDual = (label === 'white' || label === 'black');
+    var html='<div style="flex:1;' + (isDual ? '' : 'min-width:140px;') + '">';
 
-    // Two-container layout: move numbers outside, image grid inside
-    html+='<div style="display:flex;align-items:stretch;gap:4px">';
-
-    // Move numbers column
-    html+='<div style="display:flex;flex-direction:column;justify-content:space-around;flex-shrink:0">';
-    for(var row=startRow;row<=endRow;row++){
-      var numClass = (row === highlightMoveNum) ? 'text-yellow-300 font-bold' : 'text-gray-500';
-      html+='<div class="text-xs '+numClass+'" style="text-align:right;padding-right:4px">'+row+'.</div>';
+    // In single-sheet mode, wrap with flex for move numbers + grid side by side
+    if(!isDual){
+      html+='<div style="display:flex;align-items:stretch;gap:4px">';
+      html+='<div style="display:flex;flex-direction:column;justify-content:space-around;flex-shrink:0">';
+      for(var row=startRow;row<=endRow;row++){
+        var numClass = (row === highlightMoveNum) ? 'text-yellow-300 font-bold' : 'text-gray-500';
+        html+='<div class="text-xs '+numClass+'" style="text-align:right;padding-right:4px">'+row+'.</div>';
+      }
+      html+='</div>';
     }
-    html+='</div>';
 
     // Image grid - NO gaps, looks like one continuous scoresheet crop
     html+='<div style="display:grid;grid-template-columns:1fr 1fr;grid-template-rows:repeat('+rowCount+',auto);gap:0;line-height:0;overflow:hidden;border-radius:4px">';
@@ -329,6 +351,8 @@ function _buildOcrContextGrid(cells, highlightMoveNum, highlightColor, label){
       }
       html+='</div>';
     }
-    html+='</div></div></div>';
+    html+='</div>';  // close image grid
+    if(!isDual) html+='</div>';  // close flex wrapper (single-sheet only)
+    html+='</div>';  // close outer wrapper
     return html;
 }

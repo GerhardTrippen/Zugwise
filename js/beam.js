@@ -13,6 +13,7 @@
 // Store results for Apply buttons (don't auto-apply)
 var greedyResult = null;
 var beamResult = null;
+var dijkstraResult = null;
 
 // Legacy compat flags
 var searchInProgress = false;
@@ -84,8 +85,10 @@ function showSearchFixLog() {}
 function setSearchButtonsEnabled(enabled) {
   var greedy = document.getElementById('btn-greedy-search');
   var beam = document.getElementById('btn-beam-search');
+  var dijkstra = document.getElementById('btn-dijkstra-search');
   if (greedy) greedy.disabled = !enabled;
   if (beam) beam.disabled = !enabled;
+  if (dijkstra) dijkstra.disabled = !enabled;
 }
 
 // =============================================================================
@@ -160,6 +163,22 @@ function handleSearchStep(method, step) {
         (step.paths_in_beam || '?') + ' paths, best at ' + (step.best_reach_str || '?') +
         '</span>' + elapsed
       );
+    } else if (method === 'dijkstra' && step.fix_to) {
+      if (step.pushed && step.pushed > 1) {
+        appendPanelLogHtml(panel,
+          '<span class="text-purple-400">[branch] ' + (step.fix_ply || '') + ': ' +
+          step.pushed + ' candidates</span>' +
+          ' <span class="text-gray-500">cost=' + Math.round(step.current_cost || 0) + '</span>' +
+          elapsed
+        );
+      } else {
+        appendPanelLogHtml(panel,
+          '<span class="text-purple-400">[fix] ' + (step.fix_ply || '') + ': ' +
+          (step.fix_from || '') + ' \u2192 ' + (step.fix_to || '') + '</span>' +
+          ' <span class="text-gray-500">cost=' + Math.round(step.current_cost || 0) + '</span>' +
+          elapsed
+        );
+      }
     } else {
       appendPanelLogHtml(panel, step.message + elapsed);
     }
@@ -188,6 +207,12 @@ function handleSearchStep(method, step) {
       var bStatus = 'Iter ' + (step.iteration || 0);
       if (step.elapsed) bStatus += ' (' + step.elapsed + 's)';
       updateSearchPanel(panel, bStatus, bPct);
+    } else if (method === 'dijkstra') {
+      var dPct = step.reach && totalPlies ? (step.reach / totalPlies) * 100 : 0;
+      var dStatus = 'Step ' + (step.step || 0);
+      if (step.queue_size) dStatus += ' Q:' + step.queue_size;
+      if (step.elapsed) dStatus += ' (' + step.elapsed + 's)';
+      updateSearchPanel(panel, dStatus, dPct);
     }
   }
 }
@@ -239,6 +264,7 @@ function handleSearchComplete(method, result) {
   // Store result
   if (method === 'greedy') greedyResult = result;
   else if (method === 'beam') beamResult = result;
+  else if (method === 'dijkstra') dijkstraResult = result;
 
   // Show Apply button if there are usable results
   if (result.status === 'SOLVED' || result.status === 'VALID' ||
@@ -246,24 +272,30 @@ function handleSearchComplete(method, result) {
     showApplyButton(panel, true);
   }
 
-  // Hide cancel
+  // Hide cancel, enable rerun
   var cancelBtn = document.getElementById('btn-cancel-' + panel);
   if (cancelBtn) cancelBtn.classList.add('hidden');
+  var rerunBtn = document.getElementById('btn-' + panel + '-search');
+  if (rerunBtn) rerunBtn.disabled = false;
 
   log(method + ': ' + result.status + ' (' + fixes.length + ' fixes' + elapsed + ')');
 }
 
 function handleSearchStatusChange(method, status) {
   var panel = method;
+  var rerunBtn = document.getElementById('btn-' + panel + '-search');
   if (status === 'loading') {
     updateSearchPanel(panel, 'Loading...', 0);
+    if (rerunBtn) rerunBtn.disabled = true;
   } else if (status === 'running') {
     updateSearchPanel(panel, 'Running...', 0);
+    if (rerunBtn) rerunBtn.disabled = true;
     var cancelBtn = document.getElementById('btn-cancel-' + panel);
     if (cancelBtn) cancelBtn.classList.remove('hidden');
   } else if (status === 'error') {
     appendPanelLog(panel, 'Error', 'text-red-400');
     updateSearchPanel(panel, 'Error', 0);
+    if (rerunBtn) rerunBtn.disabled = false;
     var cancelBtn = document.getElementById('btn-cancel-' + panel);
     if (cancelBtn) cancelBtn.classList.add('hidden');
   }
@@ -292,15 +324,35 @@ function launchBackgroundSearches(paired) {
   showSearchPanels(true);
   clearPanelLog('greedy');
   clearPanelLog('beam');
+  clearPanelLog('dijkstra');
 
   greedyResult = null;
   beamResult = null;
+  dijkstraResult = null;
 
-  log('Launching background searches (greedy + beam)...');
-  window.searchManager.launchSearches(ocrMoves, ['greedy', 'beam'], {
-    greedy: { max_fixes: 15 },
-    beam: { beam_width: 5, max_iterations: 20, max_fixes_per_path: 10 }
-  });
+  // Check which searches are enabled for auto-run
+  var methods = [];
+  var methodOptions = {};
+  if (!currentSettings || currentSettings.autorun_greedy) {
+    methods.push('greedy');
+    methodOptions.greedy = { max_fixes: 15 };
+  }
+  if (!currentSettings || currentSettings.autorun_beam) {
+    methods.push('beam');
+    methodOptions.beam = { beam_width: 5, max_iterations: 20, max_fixes_per_path: 10 };
+  }
+  if (!currentSettings || currentSettings.autorun_dijkstra) {
+    methods.push('dijkstra');
+    methodOptions.dijkstra = { max_queue_size: 50, max_steps: 1000, max_fixes_per_path: 15 };
+  }
+
+  if (methods.length === 0) {
+    log('All background searches disabled in settings.');
+    return;
+  }
+
+  log('Launching background searches (' + methods.join(' + ') + ')...');
+  window.searchManager.launchSearches(ocrMoves, methods, methodOptions);
 }
 
 /**
@@ -349,6 +401,29 @@ function runBeamSearch() {
   });
 }
 
+/**
+ * Manual dijkstra button click.
+ */
+function runDijkstraSearch() {
+  if (window.searchManager && window.searchManager.isRunning) {
+    log('Search already in progress');
+    return;
+  }
+  if (!state.moves || state.moves.length === 0) {
+    log('No moves to search');
+    return;
+  }
+
+  showSearchPanels(true);
+  clearPanelLog('dijkstra');
+  dijkstraResult = null;
+
+  var ocrMoves = buildSearchOcrMoves();
+  window.searchManager.launchSearches(ocrMoves, ['dijkstra'], {
+    dijkstra: { max_queue_size: 50, max_steps: 1000, max_fixes_per_path: 15 }
+  });
+}
+
 // =============================================================================
 // CANCEL
 // =============================================================================
@@ -365,6 +440,10 @@ function cancelBeamSearch() {
   if (window.searchManager) window.searchManager.cancelMethod('beam');
 }
 
+function cancelDijkstraSearch() {
+  if (window.searchManager) window.searchManager.cancelMethod('dijkstra');
+}
+
 // =============================================================================
 // APPLY SEARCH RESULT (user clicks Apply button)
 // =============================================================================
@@ -375,6 +454,10 @@ function applyGreedyResult() {
 
 function applyBeamResult() {
   if (beamResult) applySearchResult(beamResult, 'beam');
+}
+
+function applyDijkstraResult() {
+  if (dijkstraResult) applySearchResult(dijkstraResult, 'dijkstra');
 }
 
 function applySearchResult(data, method) {
@@ -462,20 +545,26 @@ document.addEventListener('DOMContentLoaded', function() {
   // Search buttons
   var greedyBtn = document.getElementById('btn-greedy-search');
   var beamBtn = document.getElementById('btn-beam-search');
+  var dijkstraBtn = document.getElementById('btn-dijkstra-search');
   if (greedyBtn) greedyBtn.addEventListener('click', runGreedySearch);
   if (beamBtn) beamBtn.addEventListener('click', runBeamSearch);
+  if (dijkstraBtn) dijkstraBtn.addEventListener('click', runDijkstraSearch);
 
   // Per-panel cancel buttons
   var cancelGreedyBtn = document.getElementById('btn-cancel-greedy');
   var cancelBeamBtn = document.getElementById('btn-cancel-beam');
+  var cancelDijkstraBtn = document.getElementById('btn-cancel-dijkstra');
   if (cancelGreedyBtn) cancelGreedyBtn.addEventListener('click', cancelGreedySearch);
   if (cancelBeamBtn) cancelBeamBtn.addEventListener('click', cancelBeamSearch);
+  if (cancelDijkstraBtn) cancelDijkstraBtn.addEventListener('click', cancelDijkstraSearch);
 
   // Per-panel apply buttons
   var applyGreedyBtn = document.getElementById('btn-apply-greedy');
   var applyBeamBtn = document.getElementById('btn-apply-beam');
+  var applyDijkstraBtn = document.getElementById('btn-apply-dijkstra');
   if (applyGreedyBtn) applyGreedyBtn.addEventListener('click', applyGreedyResult);
   if (applyBeamBtn) applyBeamBtn.addEventListener('click', applyBeamResult);
+  if (applyDijkstraBtn) applyDijkstraBtn.addEventListener('click', applyDijkstraResult);
 
   // Wire up search-manager callbacks
   if (window.searchManager) {

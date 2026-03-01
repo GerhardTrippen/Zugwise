@@ -180,6 +180,10 @@ var SearchManager = (function() {
                 opts.beam_width = (options && options.beam_width) || 5;
                 opts.max_iterations = (options && options.max_iterations) || 20;
                 opts.max_fixes_per_path = (options && options.max_fixes_per_path) || 10;
+            } else if (method === 'dijkstra') {
+                opts.max_queue_size = (options && options.max_queue_size) || 50;
+                opts.max_steps = (options && options.max_steps) || 1000;
+                opts.max_fixes_per_path = (options && options.max_fixes_per_path) || 15;
             }
 
             // Create search state

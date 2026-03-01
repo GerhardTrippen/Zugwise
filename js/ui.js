@@ -3,8 +3,10 @@
 // =============================================================================
 
 function showProcessing(show, text){
-  document.getElementById('processing-overlay').classList.toggle('hidden', !show);
-  if(text) document.getElementById('processing-text').textContent = text;
+  var overlay = document.getElementById('processing-overlay');
+  if(overlay) overlay.classList.toggle('hidden', !show);
+  var textEl = document.getElementById('processing-text');
+  if(text && textEl) textEl.textContent = text;
 }
 
 function showCalculating(show){
