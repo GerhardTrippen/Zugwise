@@ -25,13 +25,15 @@ function getPieceUrl(p){
 function renderBoard(){
   var grid=document.getElementById('board-grid');
   grid.innerHTML='';
+  var flip=state.boardFlipped;
   for(var r=0;r<8;r++){
     for(var c=0;c<8;c++){
-      var isLight=(r+c)%2===0,sqName='abcdefgh'[c]+(8-r);
+      var br=flip?7-r:r, bc=flip?7-c:c;
+      var isLight=(br+bc)%2===0,sqName='abcdefgh'[bc]+(8-br);
       var sq=document.createElement('div');
       sq.className='relative flex items-center justify-center '+(isLight?'square-light':'square-dark');
       sq.dataset.square=sqName;
-      var piece=state.board[r]?state.board[r][c]:'';
+      var piece=state.board[br]?state.board[br][bc]:'';
       if(piece){
         var pd=document.createElement('div');
         pd.className='piece';
@@ -41,13 +43,13 @@ function renderBoard(){
       if(c===0){
         var cr=document.createElement('span');
         cr.className='absolute left-0.5 top-0 text-xs font-bold '+(isLight?'text-amber-800':'text-amber-200');
-        cr.textContent=8-r;
+        cr.textContent=8-br;
         sq.appendChild(cr);
       }
       if(r===7){
         var cf=document.createElement('span');
         cf.className='absolute right-0.5 bottom-0 text-xs font-bold '+(isLight?'text-amber-800':'text-amber-200');
-        cf.textContent='abcdefgh'[c];
+        cf.textContent='abcdefgh'[bc];
         sq.appendChild(cf);
       }
       grid.appendChild(sq);
@@ -60,6 +62,9 @@ function renderBoard(){
 function squareToCoords(sq){
   if(!sq||sq.length!==2)return null;
   var f=sq.charCodeAt(0)-97,rk=parseInt(sq[1])-1;
+  if(state.boardFlipped){
+    return{x:(7-f)*100+50,y:rk*100+50};
+  }
   return{x:f*100+50,y:(7-rk)*100+50};
 }
 
@@ -491,8 +496,9 @@ function showPromotionPicker(from,to,promoMoves){
   var left=toRect.left-gridRect.left;
   var sqSize=toRect.width;
 
-  // Stack vertically from destination square: white promotes to rank 8 (top), black to rank 1 (bottom)
-  if(turn==='w'){
+  // Stack vertically from destination square: promotion row is at top or bottom depending on flip
+  var promoAtTop=(turn==='w')!==state.boardFlipped;
+  if(promoAtTop){
     picker.style.top='0px';
     picker.style.left=left+'px';
   }else{

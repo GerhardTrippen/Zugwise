@@ -169,6 +169,14 @@ function showOcrResults(paired, filename){
   if (reocrBtn) reocrBtn.classList.toggle('hidden', !state.ocrOriginalFiles || state.ocrOriginalFiles.length === 0);
   resetApplyButton();
 
+  // Auto-truncate very obvious garbage tail (all below 25% confidence)
+  if(typeof autoTruncateObviousTail === 'function'){
+    var autoTrunc = autoTruncateObviousTail();
+    if(autoTrunc !== null){
+      state.noiseCleanupDone = false; // Allow further detection after auto-truncation
+    }
+  }
+
   // Check for suspicious tail BEFORE validation
   var suspiciousTailStart = detectSuspiciousTail();
   if(suspiciousTailStart === null) suspiciousTailStart = detectTrailingNoise();

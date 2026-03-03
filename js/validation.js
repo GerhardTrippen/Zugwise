@@ -543,7 +543,7 @@ async function revalidate(){
       var origW=m.white,origB=m.black;
       var wOcrAlt=ocrAltInfo[ply];
       var bOcrAlt=ocrAltInfo[ply+(m.white?1:0)];
-      if(m.white&&correctedSans[ply]&&correctedSans[ply]!==m.white){
+      if(m.white&&correctedSans[ply]&&correctedSans[ply]!==m.white&&m.wStatus!=='fixed'&&m.wStatus!=='locked'){
         if(!m.wOriginal)m.wOriginal=m.white;
         m.white=correctedSans[ply];
         m.wOcrAlt=!!wOcrAlt;
@@ -555,7 +555,7 @@ async function revalidate(){
           showAutoFixFlash(origW,m.white);
         }
       }
-      if(m.black&&correctedSans[ply+(m.white?1:0)]&&correctedSans[ply+(m.white?1:0)]!==m.black){
+      if(m.black&&correctedSans[ply+(m.white?1:0)]&&correctedSans[ply+(m.white?1:0)]!==m.black&&m.bStatus!=='fixed'&&m.bStatus!=='locked'){
         if(!m.bOriginal)m.bOriginal=m.black;
         m.black=correctedSans[ply+(m.white?1:0)];
         m.bOcrAlt=!!bOcrAlt;

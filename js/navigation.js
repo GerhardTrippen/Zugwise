@@ -82,7 +82,9 @@ function scrollCurrentMoveIntoView(){
     var containerRect=container.getBoundingClientRect();
     var rowRect=row.getBoundingClientRect();
     if(rowRect.top<containerRect.top||rowRect.bottom>containerRect.bottom){
-      row.scrollIntoView({block:'center',behavior:'smooth'});
+      // Scroll within the container only — never scroll the page
+      var rowTop=row.offsetTop-container.offsetTop;
+      container.scrollTop=rowTop-container.clientHeight/2+row.offsetHeight/2;
     }
   }
 }

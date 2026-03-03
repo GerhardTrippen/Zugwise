@@ -29,6 +29,45 @@ function toggleInputArea(collapsed){
   if (btn1) btn1.classList.toggle('hidden', !collapsed || !isDual);
   if (btn2) btn2.classList.toggle('hidden', !collapsed || !isDual);
 
+  // Populate scoresheet image links next to "Moves" header
+  var linksEl = document.getElementById('scoresheet-links');
+  if (linksEl) {
+    linksEl.innerHTML = '';
+    if (collapsed && typeof sheetsState !== 'undefined') {
+      var players = ['player1', 'player2'];
+      var labels = ['P1', 'P2'];
+      for (var p = 0; p < players.length; p++) {
+        var sheets = sheetsState[players[p]];
+        if (!sheets) continue;
+        for (var s = 0; s < sheets.length; s++) {
+          if (sheets[s] && sheets[s].image) {
+            var label = labels[p] + '.' + (s + 1);
+            var link = document.createElement('a');
+            link.className = 'text-xs text-gray-500 hover:text-blue-400 cursor-pointer';
+            link.title = 'View scoresheet ' + label;
+            link.textContent = '📄' + label;
+            link.dataset.player = p + 1;
+            link.dataset.sheet = s;
+            link.onclick = function() {
+              var pl = this.dataset.player;
+              var sh = this.dataset.sheet;
+              var sheet = sheetsState['player' + pl][sh];
+              if (sheet && sheet.image) {
+                var w = window.open('', '_blank');
+                w.document.write('<html><head><title>Scoresheet P' + pl + '.' + (parseInt(sh)+1) + '</title>' +
+                  '<style>body{margin:0;background:#111;display:flex;justify-content:center;align-items:start}' +
+                  'img{max-width:100%;height:auto}</style></head>' +
+                  '<body><img src="' + sheet.image + '"></body></html>');
+                w.document.close();
+              }
+            };
+            linksEl.appendChild(link);
+          }
+        }
+      }
+    }
+  }
+
   // Reset panel layout when switching away from dual-sheet mode
   var mainEl = document.getElementById('main-content');
   var panelBoard = document.getElementById('panel-board');
@@ -340,19 +379,21 @@ function renderMoveList(){
     var wClass = 'py-1 pl-2 cursor-pointer ' + cls(m.wStatus) + (m.wOriginal ? ' move-corrected' : '');
     if(wSuspicious) wClass += ' bg-red-900/20';
     wTd.className = wClass;
-    wTd.title = m.wOriginal ? 'was: ' + m.wOriginal + (m.wStatus === 'fixed' ? ' — double-click ✓ to revert' : '') : 'Click to view • Double-click to edit';
+    wTd.title = m.wOriginal ? 'was: ' + m.wOriginal + (m.wStatus === 'fixed' ? ' — double-click ✓ to revert' : '') : 'Click to view • Double-click to edit • Right-click for insert/delete';
     wTd.innerHTML = tierInd(wPly) + (m.white || '') + corrInd(m.wOriginal, m.wOcrAlt, m.wStatus) + confInd(m.wConf) + icon(m.wStatus, m.wOriginal, m.num, 'w') + (wSuspicious ? deleteBtn(wPly, 'w') : '');
     wTd.onclick = function(e){ if(!e.target.classList.contains('delete-from-here')) goToPly(idx*2 + 1); };
     wTd.ondblclick = function(e){ if(e.target.classList.contains('delete-from-here')) return; if(e.target.classList.contains('revert-fix')){ e.stopPropagation(); revertToOriginalOcr(parseInt(e.target.dataset.num), e.target.dataset.color); return; } e.stopPropagation(); enterEditMode(m.num, 'w'); };
+    wTd.oncontextmenu = function(e){ e.preventDefault(); showMoveContextMenu(e, idx*2, m.num, 'w'); };
 
     var bTd = document.createElement('td');
     var bClass = 'py-1 pl-2 cursor-pointer ' + cls(m.bStatus) + (m.bOriginal ? ' move-corrected' : '');
     if(bSuspicious) bClass += ' bg-red-900/20';
     bTd.className = bClass;
-    bTd.title = m.bOriginal ? 'was: ' + m.bOriginal + (m.bStatus === 'fixed' ? ' — double-click ✓ to revert' : '') : 'Click to view • Double-click to edit';
+    bTd.title = m.bOriginal ? 'was: ' + m.bOriginal + (m.bStatus === 'fixed' ? ' — double-click ✓ to revert' : '') : 'Click to view • Double-click to edit • Right-click for insert/delete';
     bTd.innerHTML = tierInd(bPly) + (m.black || '') + corrInd(m.bOriginal, m.bOcrAlt, m.bStatus) + confInd(m.bConf) + icon(m.bStatus, m.bOriginal, m.num, 'b') + (bSuspicious && m.black ? deleteBtn(bPly, 'b') : '');
     bTd.onclick = function(e){ if(!e.target.classList.contains('delete-from-here')) goToPly(idx*2 + 2); };
     bTd.ondblclick = function(e){ if(e.target.classList.contains('delete-from-here')) return; if(e.target.classList.contains('revert-fix')){ e.stopPropagation(); revertToOriginalOcr(parseInt(e.target.dataset.num), e.target.dataset.color); return; } e.stopPropagation(); enterEditMode(m.num, 'b'); };
+    bTd.oncontextmenu = function(e){ e.preventDefault(); showMoveContextMenu(e, idx*2+1, m.num, 'b'); };
 
     var numTd = document.createElement('td');
     numTd.className = 'text-gray-500 py-1';
@@ -534,6 +575,52 @@ function detectTrailingNoise(){
 }
 
 /**
+ * Auto-truncate very obvious tail noise without user confirmation.
+ * Only fires when ALL trailing moves are below 25% confidence and there are
+ * at least 4 consecutive such moves. Returns the ply where truncation happened,
+ * or null if no auto-truncation was done.
+ *
+ * This is intentionally extremely conservative — only fires for unmistakable
+ * garbage (scribbles, blank cells, game results written on scoresheet).
+ */
+function autoTruncateObviousTail(){
+  if(!state.moves || state.moves.length < 4) return null;
+  if(state.noiseCleanupDone) return null;
+
+  var CONFIDENCE_FLOOR = 0.25;  // Below this = almost certainly garbage
+  var MIN_CONSECUTIVE = 4;      // Need 4+ in a row to be sure
+
+  // Build flat list
+  var moves = [];
+  state.moves.forEach(function(m){
+    if(m.white) moves.push({conf: m.wConf || 0.9, san: m.white});
+    if(m.black) moves.push({conf: m.bConf || 0.9, san: m.black});
+  });
+
+  if(moves.length < MIN_CONSECUTIVE + 4) return null; // Don't truncate very short games
+
+  // Scan backward: find how many consecutive trailing moves are below floor
+  var trailingGarbage = 0;
+  for(var i = moves.length - 1; i >= 0; i--){
+    if(moves[i].conf < CONFIDENCE_FLOOR){
+      trailingGarbage++;
+    } else {
+      break;
+    }
+  }
+
+  if(trailingGarbage < MIN_CONSECUTIVE) return null;
+
+  var truncPly = moves.length - trailingGarbage;
+  log('🗑️ Auto-truncating ' + trailingGarbage + ' obvious noise moves from ply ' + truncPly + ' (all below ' + (CONFIDENCE_FLOOR * 100) + '% confidence)');
+
+  // Truncate (deleteMovesFromPly now also truncates ocrCells + per-sheet arrays)
+  deleteMovesFromPly(truncPly);
+
+  return truncPly;
+}
+
+/**
  * Show inline delete confirmation instead of browser confirm() dialog.
  */
 function showDeleteConfirmation(ply){
@@ -602,6 +689,24 @@ function deleteMovesFromPly(ply){
 
   // Truncate state.sans
   state.sans = state.sans.slice(0, ply);
+
+  // Truncate OCR cell arrays so remerge doesn't resurrect deleted moves
+  if(state.ocrCells && state.ocrCells.length > ply){
+    state.ocrCells = state.ocrCells.slice(0, ply);
+  }
+  // Also truncate per-sheet arrays (dual mode) by (moveNum, color) boundary
+  var truncMoveNum = Math.floor(ply / 2) + 1;
+  var truncIsBlack = ply % 2 === 1;
+  function _truncateSheet(cells){
+    if(!cells) return cells;
+    return cells.filter(function(c){
+      if(c.num < truncMoveNum) return true;
+      if(c.num === truncMoveNum && truncIsBlack && c.color === 'w') return true;
+      return false;
+    });
+  }
+  if(state.ocrCellsSheet1) state.ocrCellsSheet1 = _truncateSheet(state.ocrCellsSheet1);
+  if(state.ocrCellsSheet2) state.ocrCellsSheet2 = _truncateSheet(state.ocrCellsSheet2);
 
   // Clear stuck info if it was after the truncation point
   if(state.stuckPly !== null && state.stuckPly >= ply){

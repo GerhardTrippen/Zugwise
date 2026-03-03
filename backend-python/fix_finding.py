@@ -1184,6 +1184,78 @@ def find_best_capture_gain(board: chess.Board) -> int:
     return best_gain
 
 
+def see_capture_value(board: chess.Board, capture_move: chess.Move) -> int:
+    """Static Exchange Evaluation for a specific capture move.
+
+    Evaluates the full exchange sequence on the target square, starting with
+    the given move, then alternating sides always using the cheapest attacker.
+    Returns the net material gain for the side making the initial capture.
+
+    This is O(number of attackers on the square) — typically microseconds.
+    Unlike quiescence search, no tree exploration is needed.
+
+    Example: Qxc4 (capturing knight), Qxc4, Bxc4 → net = +3 (knight) - 9 (queen) + 9 (queen) = +3
+    """
+    target_sq = capture_move.to_square
+    captured_piece = board.piece_at(target_sq)
+    if not captured_piece:
+        return 0
+
+    # Build the sequence of piece values involved in the exchange
+    # gain[i] = material balance from the perspective of side making move i
+    # We use the "negamax" style: gain[i] = captured_value - gain[i+1]
+    attacker_piece = board.piece_at(capture_move.from_square)
+    if not attacker_piece:
+        return 0
+
+    # Work on a copy to avoid mutating the board
+    b = board.copy()
+
+    # Track the exchange: alternating captures on target_sq
+    gain = []
+    gain.append(piece_value(captured_piece))  # Initial capture value
+
+    current_attacker_val = piece_value(attacker_piece)
+    b.push(capture_move)
+
+    while True:
+        # Find cheapest attacker for the side to move
+        side = b.turn
+        attackers = b.attackers(side, target_sq)
+        if not attackers:
+            break
+
+        # Find cheapest legal attacker
+        min_val = 99
+        best_att_move = None
+        for att_sq in attackers:
+            att_piece = b.piece_at(att_sq)
+            if att_piece:
+                att_move = chess.Move(att_sq, target_sq)
+                # Handle pawn promotion captures
+                if att_piece.piece_type == chess.PAWN and chess.square_rank(target_sq) in (0, 7):
+                    att_move = chess.Move(att_sq, target_sq, promotion=chess.QUEEN)
+                if att_move in b.legal_moves and piece_value(att_piece) < min_val:
+                    min_val = piece_value(att_piece)
+                    best_att_move = att_move
+
+        if best_att_move is None:
+            break  # No legal recapture (all pinned, etc.)
+
+        # This recapture gains the previous attacker's value
+        gain.append(current_attacker_val)
+        current_attacker_val = min_val
+        b.push(best_att_move)
+
+    # Evaluate from the end: each side can choose to stop the exchange
+    # gain[i] = captured_value - max(0, gain[i+1])  (can choose not to recapture)
+    while len(gain) > 1:
+        gain[-2] = gain[-2] - max(0, gain[-1])
+        gain.pop()
+
+    return gain[0]
+
+
 # =============================================================================
 # FUTURE PIECE MOVE SCANNING
 # =============================================================================
@@ -2693,18 +2765,27 @@ def _search_single_ply_for_fixes(
         # and this move doesn't take it, penalize proportionally
         missed_capture_penalty = 0
         winning_capture_bonus = 0
+        our_capture_val = 0
+        if board.is_capture(legal_move):
+            captured = board.piece_at(legal_move.to_square)
+            if captured:
+                our_capture_val = piece_value(captured)
         if best_capture_gain >= 2:
-            our_capture_val = 0
-            if board.is_capture(legal_move):
-                captured = board.piece_at(legal_move.to_square)
-                if captured:
-                    our_capture_val = piece_value(captured)
             missed = best_capture_gain - our_capture_val
             if missed >= 2:
                 missed_capture_penalty = missed * 10
             # Winning capture bonus: reward moves that TAKE the best available capture
             if our_capture_val >= 3 and missed <= 0:
                 winning_capture_bonus = our_capture_val * 5
+        # SEE bonus: if capturing a piece worth >= 3 and simple analysis missed it,
+        # use Static Exchange Evaluation to check if the exchange actually wins material
+        # (e.g., Qxc4 where queen gets recaptured but bishop takes back)
+        if winning_capture_bonus == 0 and our_capture_val >= 3 and board.is_capture(legal_move):
+            see_val = see_capture_value(board, legal_move)
+            if see_val >= 2:
+                winning_capture_bonus = see_val * 5
+                if verbose:
+                    print(f"      [SEE] {candidate_san} wins {see_val} material by exchange (bonus=+{winning_capture_bonus})")
 
         # Absurdity penalty scaled by piece values at risk
         absurdity_penalty = calculate_absurdity_penalty(absurdities_result)

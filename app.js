@@ -1,6 +1,6 @@
 var CONFIG={pieceStyle:localStorage.getItem('zugwise_pieceStyle')||'maestro',apiUrl:'http://localhost:5000',usePyodide:false};
 var chess=null;
-var state={board:null,moves:[],sans:[],currentPly:0,stuckPly:null,stuckInfo:null,legalMoves:[],selectedFix:null,debugVisible:false,errorArrow:null,fixArrow:null,ocrArrow:null,missingMoveCandidates:[],editMode:null,editSortMode:'similarity',confirmedPly:0,fixedPlies:[],hasGridImage:false,ocrCells:[],inputMode:null,previewPly:null,pendingConfirmation:null,approvedPlies:[],lockedPlies:[],boardSelection:null,mergeTierMap:null,mergeLockedPlies:null,mergeSettings:{lockMode:'tier1'}};
+var state={board:null,moves:[],sans:[],currentPly:0,stuckPly:null,stuckInfo:null,legalMoves:[],selectedFix:null,debugVisible:false,errorArrow:null,fixArrow:null,ocrArrow:null,missingMoveCandidates:[],editMode:null,editSortMode:'similarity',confirmedPly:0,fixedPlies:[],hasGridImage:false,ocrCells:[],inputMode:null,previewPly:null,pendingConfirmation:null,approvedPlies:[],lockedPlies:[],boardSelection:null,boardFlipped:false,mergeTierMap:null,mergeLockedPlies:null,mergeSettings:{lockMode:'tier1'}};
 var INITIAL_FEN='rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
 // ============================================
@@ -163,6 +163,7 @@ document.addEventListener('DOMContentLoaded',async function(){
   if(window.SheetProfiles){window.SheetProfiles.loadProfiles();window.SheetProfiles.renderProfileDropdown();window.SheetProfiles.renderProfileSummary();}
   var pieceSelect=document.getElementById('piece-style');if(pieceSelect)pieceSelect.value=CONFIG.pieceStyle;
   renderBoard();setupEventListeners();
+  if(typeof initContextMenu==='function')initContextMenu();
   if(typeof initSimpleSheetsUploader==='function')initSimpleSheetsUploader();
 
   // Try to initialize Pyodide worker (non-blocking, falls back to Flask)
@@ -172,7 +173,7 @@ document.addEventListener('DOMContentLoaded',async function(){
     hidePyodideLoadingOverlay();
   }
 
-  log('Zugwise v0.6 ready'+(CONFIG.usePyodide?' (client-side mode)':' (server mode)'));
+  log('Zugwise v0.7 ready'+(CONFIG.usePyodide?' (client-side mode)':' (server mode)'));
 });
 
 function setupEventListeners(){
@@ -181,6 +182,7 @@ function setupEventListeners(){
   document.getElementById('btn-prev').onclick=function(){goToPly(state.currentPly-1);};
   document.getElementById('btn-next').onclick=function(){goToPly(state.currentPly+1);};
   document.getElementById('btn-last').onclick=function(){goToPly(state.sans.length);};
+  document.getElementById('btn-flip').onclick=function(){state.boardFlipped=!state.boardFlipped;renderBoard();};
   document.getElementById('btn-debug').onclick=function(){state.debugVisible=!state.debugVisible;document.getElementById('debug-console').classList.toggle('hidden',!state.debugVisible);};
   document.getElementById('btn-clear-debug').onclick=function(){document.getElementById('debug-log').innerHTML='';};
   // Settings modal (with null checks for safety)
@@ -233,6 +235,9 @@ function setupEventListeners(){
   document.getElementById('btn-reocr').onclick=handleReOCR;
   document.getElementById('btn-copy-fen').onclick=function(){
     if(!chess)return;var fen=chess.fen();navigator.clipboard.writeText(fen);log('📋 FEN copied: '+fen);
+    var btn=document.getElementById('btn-copy-fen');
+    var orig=btn.textContent;btn.textContent='✓';btn.classList.add('text-green-400');
+    setTimeout(function(){btn.textContent=orig;btn.classList.remove('text-green-400');},1500);
   };
   document.getElementById('btn-fen-lichess').onclick=function(){
     if(!chess)return;var fen=chess.fen();window.open('https://lichess.org/editor/'+encodeURIComponent(fen),'_blank');
@@ -257,11 +262,14 @@ function setupEventListeners(){
   document.getElementById('piece-style').onchange=function(e){CONFIG.pieceStyle=e.target.value;localStorage.setItem('zugwise_pieceStyle',e.target.value);renderBoard();};
   document.onkeydown=function(e){
     if(e.target.tagName==='TEXTAREA'||e.target.tagName==='INPUT')return;
-    if(e.key==='ArrowLeft')goToPly(state.currentPly-1);
-    if(e.key==='ArrowRight')goToPly(state.currentPly+1);
+    if(e.key==='ArrowLeft'){e.preventDefault();goToPly(state.currentPly-1);}
+    if(e.key==='ArrowRight'){e.preventDefault();goToPly(state.currentPly+1);}
+    if(e.key==='Home'){e.preventDefault();goToPly(0);}
+    if(e.key==='End'){e.preventDefault();goToPly(state.sans.length);}
     if(e.key==='Enter'&&state.selectedFix)applyFix();
     if(e.key==='Escape'&&state.boardSelection){clearBoardSelection();return;}
     if(e.key==='Escape'&&state.editMode)exitEditMode();
+    if(e.key==='f'||e.key==='F'){state.boardFlipped=!state.boardFlipped;renderBoard();}
   };
 }
 

@@ -524,24 +524,30 @@ function applyMissingMoveFix(){
   var mc = state.selectedFix;
   var insertPly = mc.insert_at_ply;
 
-  // Insert the move into state.sans
-  state.sans.splice(insertPly, 0, mc.inserted_move);
-
-  // If there's a correction for the next move, apply it
-  if(mc.corrected_stuck_move && insertPly + 1 < state.sans.length){
-    state.sans[insertPly + 1] = mc.corrected_stuck_move;
-  }
-
   log('✓ Inserted missing move: ' + mc.inserted_move + ' at ply ' + insertPly);
-  if(mc.corrected_stuck_move){
-    log('✓ Also corrected: ' + mc.original_stuck_move + ' → ' + mc.corrected_stuck_move);
+
+  if(state.ocrCells && state.ocrCells.length > 0 && typeof insertSingleMove === 'function'){
+    // Use metadata-preserving insert (handles ocrCells + tracking arrays)
+    insertSingleMove(insertPly, mc.inserted_move);
+    // Apply correction to the next move if needed (now shifted by +1)
+    if(mc.corrected_stuck_move && insertPly + 1 < state.ocrCells.length){
+      state.ocrCells[insertPly + 1].move = mc.corrected_stuck_move;
+      log('✓ Also corrected: ' + mc.original_stuck_move + ' → ' + mc.corrected_stuck_move);
+      rebuildFromOcrCells();
+      revalidate();
+    }
+  } else {
+    // Non-OCR fallback: operate on sans directly
+    state.sans.splice(insertPly, 0, mc.inserted_move);
+    if(mc.corrected_stuck_move && insertPly + 1 < state.sans.length){
+      state.sans[insertPly + 1] = mc.corrected_stuck_move;
+    }
+    if(mc.corrected_stuck_move){
+      log('✓ Also corrected: ' + mc.original_stuck_move + ' → ' + mc.corrected_stuck_move);
+    }
+    rebuildMovesFromSans();
+    revalidate();
   }
-
-  // Rebuild state.moves from state.sans
-  rebuildMovesFromSans();
-
-  // Revalidate
-  revalidate();
 }
 
 function rebuildMovesFromSans(){
@@ -885,15 +891,92 @@ async function renderEditModeMoves(num, color, currentMove, ply){
     selectFix(firstSelectable.fix, firstSelectable.btn);
   }
 
-  // --- Delete section ---
-  var deleteSep = document.createElement('div');
-  deleteSep.className = 'text-xs text-gray-500 my-2 border-t border-gray-600 pt-2';
-  deleteSep.textContent = 'Or remove:';
-  container.appendChild(deleteSep);
+  // --- Insert/Delete section ---
+  var structSep = document.createElement('div');
+  structSep.className = 'text-xs text-gray-500 my-2 border-t border-gray-600 pt-2';
+  structSep.textContent = 'Structural edits:';
+  container.appendChild(structSep);
+
+  if (typeof insertSingleMove === 'function') {
+    var isDual = state.inputMode === 'dual-sheets';
+
+    if (isDual) {
+      // Dual-mode: show operations for BOTH sheets since each sheet
+      // records the full game and shifts can affect either sheet
+      var moveNumForSheet = num;
+
+      // --- White's sheet ---
+      var wLabel = document.createElement('div');
+      wLabel.className = 'text-xs text-gray-500 mt-1 mb-1';
+      wLabel.textContent = "White's sheet:";
+      container.appendChild(wLabel);
+
+      var wInsB = document.createElement('button');
+      wInsB.className = 'w-full text-left p-2 rounded-lg border bg-purple-900/30 hover:bg-purple-800/40 border-purple-600/50 text-purple-400 mb-1 text-sm';
+      wInsB.innerHTML = "⬆ Insert before on White's sheet";
+      wInsB.onclick = function(){ insertDualMove(moveNumForSheet, 'w', 'before'); };
+      container.appendChild(wInsB);
+
+      var wInsA = document.createElement('button');
+      wInsA.className = 'w-full text-left p-2 rounded-lg border bg-purple-900/30 hover:bg-purple-800/40 border-purple-600/50 text-purple-400 mb-1 text-sm';
+      wInsA.innerHTML = "⬇ Insert after on White's sheet";
+      wInsA.onclick = function(){ insertDualMove(moveNumForSheet, 'w', 'after'); };
+      container.appendChild(wInsA);
+
+      var wDel = document.createElement('button');
+      wDel.className = 'w-full text-left p-2 rounded-lg border bg-orange-900/30 hover:bg-orange-800/40 border-orange-600/50 text-orange-400 mb-1.5 text-sm';
+      wDel.innerHTML = "🗑️ Delete from White's sheet (shift up)";
+      wDel.onclick = function(){ showDualDeleteConfirmation(moveNumForSheet, 'w'); };
+      container.appendChild(wDel);
+
+      // --- Black's sheet ---
+      var bLabel = document.createElement('div');
+      bLabel.className = 'text-xs text-gray-500 mt-1 mb-1';
+      bLabel.textContent = "Black's sheet:";
+      container.appendChild(bLabel);
+
+      var bInsB = document.createElement('button');
+      bInsB.className = 'w-full text-left p-2 rounded-lg border bg-purple-900/30 hover:bg-purple-800/40 border-purple-600/50 text-purple-400 mb-1 text-sm';
+      bInsB.innerHTML = "⬆ Insert before on Black's sheet";
+      bInsB.onclick = function(){ insertDualMove(moveNumForSheet, 'b', 'before'); };
+      container.appendChild(bInsB);
+
+      var bInsA = document.createElement('button');
+      bInsA.className = 'w-full text-left p-2 rounded-lg border bg-purple-900/30 hover:bg-purple-800/40 border-purple-600/50 text-purple-400 mb-1 text-sm';
+      bInsA.innerHTML = "⬇ Insert after on Black's sheet";
+      bInsA.onclick = function(){ insertDualMove(moveNumForSheet, 'b', 'after'); };
+      container.appendChild(bInsA);
+
+      var bDel = document.createElement('button');
+      bDel.className = 'w-full text-left p-2 rounded-lg border bg-orange-900/30 hover:bg-orange-800/40 border-orange-600/50 text-orange-400 mb-1.5 text-sm';
+      bDel.innerHTML = "🗑️ Delete from Black's sheet (shift up)";
+      bDel.onclick = function(){ showDualDeleteConfirmation(moveNumForSheet, 'b'); };
+      container.appendChild(bDel);
+    } else {
+      // Single-player: insert/delete shifting all subsequent moves
+      var insertBeforeBtn = document.createElement('button');
+      insertBeforeBtn.className = 'w-full text-left p-2.5 rounded-lg border bg-purple-900/30 hover:bg-purple-800/40 border-purple-600/50 text-purple-400 mb-1.5';
+      insertBeforeBtn.innerHTML = '⬆ Insert move before this one';
+      insertBeforeBtn.onclick = function(){ insertSingleMove(ply); };
+      container.appendChild(insertBeforeBtn);
+
+      var insertAfterBtn = document.createElement('button');
+      insertAfterBtn.className = 'w-full text-left p-2.5 rounded-lg border bg-purple-900/30 hover:bg-purple-800/40 border-purple-600/50 text-purple-400 mb-1.5';
+      insertAfterBtn.innerHTML = '⬇ Insert move after this one';
+      insertAfterBtn.onclick = function(){ insertSingleMove(ply + 1); };
+      container.appendChild(insertAfterBtn);
+
+      var delSingleBtn = document.createElement('button');
+      delSingleBtn.className = 'w-full text-left p-2.5 rounded-lg border bg-orange-900/30 hover:bg-orange-800/40 border-orange-600/50 text-orange-400 mb-1.5';
+      delSingleBtn.innerHTML = '🗑️ Delete this move (shift up)';
+      delSingleBtn.onclick = function(){ showDeleteSingleConfirmation(ply); };
+      container.appendChild(delSingleBtn);
+    }
+  }
 
   var deleteBtn = document.createElement('button');
   deleteBtn.className = 'w-full text-left p-2.5 rounded-lg border bg-red-900/30 hover:bg-red-800/40 border-red-600/50 text-red-400';
-  deleteBtn.innerHTML = '🗑️ Delete from here (remove this move and all after)';
+  deleteBtn.innerHTML = '✂ Delete from here onward';
   deleteBtn.onclick = function(){
     exitEditMode();
     showDeleteConfirmation(ply);
@@ -914,6 +997,27 @@ function exitEditMode(){
 
   // Restore panel title
   document.getElementById('fix-panel-title').textContent = 'Fix Suggestions';
+
+  // If in noise review mode, restore the noise review UI
+  if(state.pendingNoiseReview){
+    document.getElementById('stuck-info').innerHTML =
+      '<div class="text-yellow-400">⚠️ Potential OCR noise at end</div>' +
+      '<div class="text-xs text-gray-400 mt-1">Review highlighted moves and delete noise before continuing</div>';
+    document.getElementById('fix-list').innerHTML =
+      '<div class="p-3 bg-yellow-900/30 rounded border border-yellow-700 mb-3">' +
+        '<div class="text-yellow-300 text-sm font-medium mb-2">🗑️ Low-confidence moves detected</div>' +
+        '<div class="text-xs text-gray-300 mb-3">Click 🗑️ next to any move to delete it and all moves after.</div>' +
+        '<button id="btn-continue-validation" class="w-full py-2 bg-green-600 hover:bg-green-500 rounded text-sm font-medium">✓ Continue to Validation</button>' +
+      '</div>';
+    document.getElementById('btn-continue-validation').onclick = function(){
+      state.pendingNoiseReview = false;
+      document.getElementById('stuck-info').innerHTML = '<span class="text-blue-300">🔍 Validating...</span>';
+      document.getElementById('fix-list').innerHTML = '<div class="text-gray-400 text-sm p-4 text-center">Checking moves...</div>';
+      revalidate();
+    };
+    renderArrows();
+    return;
+  }
 
   // If we have a stuck position, go back to showing fixes
   if(state.stuckInfo){
