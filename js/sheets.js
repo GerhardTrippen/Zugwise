@@ -366,7 +366,7 @@ function renderSheetBox(player, sheetIndex) {
     case SHEET_STATUS.NEEDS_CORNERS:
       statusClass = 'border-yellow-500 cursor-pointer';
       statusIndicator = '<span class="absolute top-1 right-1 w-2 h-2 rounded-full bg-yellow-500"></span>';
-      if (sheet && sheet.method === 'anchor') {
+      if (sheet && sheet.method !== 'contour') {
         content = renderSheetThumbnail(sheet, pageNum, '⚠️ Click to adjust') +
           '<button class="sheet-try-contour absolute top-7 left-1/2 -translate-x-1/2 bg-blue-600 hover:bg-blue-500 text-white text-xs px-2 py-0.5 rounded z-20 whitespace-nowrap" data-player="' + player + '" data-sheet="' + sheetIndex + '">Try Contour</button>';
       } else {
@@ -389,7 +389,7 @@ function renderSheetBox(player, sheetIndex) {
     case SHEET_STATUS.ERROR:
       statusClass = 'border-red-500 cursor-pointer';
       statusIndicator = '<span class="absolute top-1 right-1 w-2 h-2 rounded-full bg-red-500"></span>';
-      if (sheet && sheet.method === 'anchor') {
+      if (sheet && sheet.method !== 'contour') {
         content = renderSheetThumbnail(sheet, pageNum, '❌ Failed') +
           '<button class="sheet-try-contour absolute top-7 left-1/2 -translate-x-1/2 bg-blue-600 hover:bg-blue-500 text-white text-xs px-2 py-0.5 rounded z-20 whitespace-nowrap" data-player="' + player + '" data-sheet="' + sheetIndex + '">Try Contour</button>';
       } else {
@@ -406,8 +406,9 @@ function renderSheetBox(player, sheetIndex) {
     sheetOverrides = `
       <div class="absolute bottom-0 left-0 right-0 bg-black/80 p-0.5 text-xs flex gap-1 z-10 sheet-overrides">
         <select class="sheet-method-select bg-gray-700 text-white rounded px-1 text-xs"
-                data-player="${player}" data-sheet="${sheetIndex}" title="Grid detection method: Anchor (new) or Contour (old)">
-          <option value="anchor" ${(sheet.method||'anchor')==='anchor'?'selected':''}>Anchor</option>
+                data-player="${player}" data-sheet="${sheetIndex}" title="Grid detection method">
+          <option value="slide" ${(sheet.method||'slide')==='slide'?'selected':''}>Slide</option>
+          <option value="anchor" ${sheet.method==='anchor'?'selected':''}>Anchor</option>
           <option value="contour" ${sheet.method==='contour'?'selected':''}>Contour</option>
         </select>
         <select class="sheet-format-select bg-gray-700 text-white rounded px-1 text-xs flex-1"
@@ -690,7 +691,7 @@ async function loadSheetImage(player, sheetIndex, file) {
     detectedColor: null,
     format: (window.SheetProfiles ? window.SheetProfiles.getProfileGridConfig(sheetIndex + 1).format : '2col'),
     rowCount: (window.SheetProfiles ? window.SheetProfiles.getProfileGridConfig(sheetIndex + 1).rowCount : 20),
-    method: 'anchor'
+    method: 'slide'  // default method for new uploads
   };
   
   sheetsState['player' + player][sheetIndex] = sheet;
@@ -730,7 +731,7 @@ async function loadSheetImage(player, sheetIndex, file) {
       startBackgroundOCR(player, sheetIndex);
     } else {
       sheet.status = SHEET_STATUS.NEEDS_CORNERS;
-      log('⚠️ Grid detection failed' + (sheet.method === 'anchor' ? ' — try Contour method or adjust corners' : ' — adjust corners manually'));
+      log('⚠️ Grid detection failed' + (sheet.method !== 'contour' ? ' — try Contour method or adjust corners' : ' — adjust corners manually'));
     }
     
   } catch (err) {
@@ -752,7 +753,7 @@ function readFileAsDataURL(file) {
 }
 
 async function detectGrid(imageDataURL, sheetConfig, method) {
-  var useMethod = method || 'contour';
+  var useMethod = method || 'slide';
   log('🔍 Running client-side grid detection (' + useMethod + ')...');
 
   try {
@@ -836,6 +837,33 @@ async function detectGrid(imageDataURL, sheetConfig, method) {
 
       return { success: success, corners: corners, detectedColor: null };
 
+    } else if (useMethod === 'slide' && window.SlideGrid) {
+      // === SLIDE-BASED DETECTION (hole-aligned anchors, no global warp) ===
+      var slideConfig = {
+        format: config.format || '2col',
+        rowCount: config.rowCount || 20,
+        maxColWidthPct: 7,
+        pageType: 'front'
+      };
+
+      var slideResult = window.SlideGrid.processScoresheet(srcMat, slideConfig, function(msg) {
+        log('  [Slide] ' + msg);
+      });
+
+      srcMat.delete();
+
+      var success = slideResult && slideResult.cells && slideResult.cells.length > 0;
+
+      // Cleanup slide cell images (detectGrid only checks success, doesn't keep cells)
+      if (slideResult && slideResult.cells) {
+        slideResult.cells.forEach(function(c) { if (c.image && c.image.delete) c.image.delete(); });
+      }
+
+      log('  Slide detection: ' + (success ? 'SUCCESS' : 'FAILED') +
+          ' (' + (slideResult ? slideResult.cells.length : 0) + ' cells)');
+
+      return { success: success, corners: null, detectedColor: null };
+
     } else {
       // === CONTOUR-BASED DETECTION (v34) ===
       var result = runDetection(srcMat, config, function(msg) {
@@ -908,7 +936,7 @@ async function redetectGrid(player, sheetIndex) {
     startBackgroundOCR(player, sheetIndex);
   } else {
     sheet.status = SHEET_STATUS.NEEDS_CORNERS;
-    log('⚠️ Grid re-detection failed' + (sheet.method === 'anchor' ? ' — try Contour method' : ' — adjust corners manually'));
+    log('⚠️ Grid re-detection failed' + (sheet.method !== 'contour' ? ' — try Contour method' : ' — adjust corners manually'));
   }
 
   refreshSheetsUI();
@@ -981,7 +1009,7 @@ function showCornerPicker(player, sheetIndex) {
   var modal = ensureCornerPickerModal();
   var content = document.getElementById('corner-picker-content');
 
-  var currentMethod = sheet.method || 'anchor';
+  var currentMethod = sheet.method || 'slide';
   content.innerHTML = `
     <div class="relative inline-block">
       <canvas id="corner-picker-canvas" class="max-w-full max-h-[60vh]"></canvas>
@@ -991,6 +1019,7 @@ function showCornerPicker(player, sheetIndex) {
       <div class="text-sm text-gray-400 flex items-center gap-3">
         Drag the corners to match the grid boundaries
         <select id="corner-picker-method" class="bg-gray-700 text-white rounded px-2 py-1 text-xs" title="Grid detection method">
+          <option value="slide" ${currentMethod==='slide'?'selected':''}>Slide</option>
           <option value="anchor" ${currentMethod==='anchor'?'selected':''}>Anchor</option>
           <option value="contour" ${currentMethod==='contour'?'selected':''}>Contour</option>
         </select>
@@ -1357,7 +1386,7 @@ async function startBackgroundOCR(player, sheetIndex) {
       var corners = sheet.corners || null;
 
       var sheetId = player;  // Use player number as sheet ID for dual logit storage
-      var sheetMethod = sheet.method || 'anchor';
+      var sheetMethod = sheet.method || 'slide';
       // For manual corners with anchor method, use manual-anchor variant
       var ocrMethod = (sheetMethod === 'anchor' && corners) ? 'manual-anchor' : sheetMethod;
       var result = await window.zugwise.processScoresheet(file, function(msg) {
@@ -1391,7 +1420,7 @@ async function startBackgroundOCR(player, sheetIndex) {
     }
   } catch (err) {
     sheet.status = SHEET_STATUS.ERROR;
-    var methodHint = (sheet.method === 'anchor') ? ' — try switching to Contour method' : '';
+    var methodHint = (sheet.method !== 'contour') ? ' — try switching to Contour method' : '';
     log('✗ OCR error: ' + err.message + methodHint);
   }
 

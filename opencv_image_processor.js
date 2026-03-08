@@ -1869,7 +1869,7 @@ async function processScoresheet(file, gridConfig, corners, method) {
         console.log(`[OpenCV] Image loaded: ${image.cols}x${image.rows}`);
 
         // Branch on detection method
-        var useMethod = method || 'contour';
+        var useMethod = method || 'slide';
 
         var gridResult, cells, gridOverlayUrl = null;
 
@@ -1963,6 +1963,44 @@ async function processScoresheet(file, gridConfig, corners, method) {
                     gridOverlayUrl = debugDrawGrid(anchorResult.warped, hPos, anchorResult.colBounds, 'Grid Overlay (anchor)');
                 }
             }
+
+        } else if (useMethod === 'slide') {
+            // === SLIDE-BASED DETECTION (hole-aligned anchors, no global warp) ===
+            if (!window.SlideGrid) {
+                throw new Error('Slide grid module not loaded (grid-slide.js)');
+            }
+
+            console.log('[OpenCV] Extracting grid (slide)...');
+            var slideConfig = {
+                format: gridConfig ? gridConfig.format : '2col',
+                rowCount: gridConfig ? gridConfig.rowCount : 20,
+                maxColWidthPct: 7,
+                pageType: (gridConfig && gridConfig.pageType) || 'front'
+            };
+
+            var slideResult = window.SlideGrid.processScoresheet(image, slideConfig, function(msg) {
+                console.log('[Slide] ' + msg);
+            });
+
+            if (!slideResult || !slideResult.cells || slideResult.cells.length === 0) {
+                throw new Error('Slide grid detection failed - no cells extracted. Try Grid or Anchor method.');
+            }
+
+            console.log('[Slide] Success: ' + slideResult.cells.length + ' cells');
+
+            // Build gridResult-compatible structure
+            gridResult = {
+                gridImage: null,  // No warped image - cells extracted directly
+                detectionResult: {
+                    columnBoundaries: [],
+                    gridRows: [],
+                    mode: 'slide',
+                    hasHeader: false  // Slide has NO header row
+                },
+                config: gridConfig || { rowCount: 20, format: '2col' }
+            };
+
+            cells = slideResult.cells;
 
         } else {
             // === CONTOUR-BASED DETECTION (v34) ===
