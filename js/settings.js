@@ -9,26 +9,9 @@ var DEFAULT_SETTINGS = {
   piece_B_K: false,
   piece_N_R: false,
   piece_N_B: true,
-  piece_Q_O: true,
   // Piece-file confusions (for captures only: Kxg4 vs hxg4)
   piece_K_h: true,   // King K vs h-file pawn
   piece_B_b: true,   // Bishop B vs b-file pawn
-  // File confusions
-  file_a_g: true,
-  file_a_d: true,
-  file_b_d: true,
-  file_e_c: true,
-  file_b_h: false,
-  // Rank confusions
-  rank_1_7: true,
-  rank_2_7: true,
-  rank_3_8: true,
-  rank_4_5: true,
-  rank_1_4: false,
-  rank_6_8: false,
-  // Other quick fixes
-  fix_capture_notation: true,
-  fix_combined: true,
   // Quick fix pipeline settings
   enable_quick_fixes: true,      // Layer 1: Try OCR alternatives and similarity swaps
   enable_deep_search: true,      // Layer 2: Backtrack search for fixes (shown for confirmation)
@@ -39,11 +22,7 @@ var DEFAULT_SETTINGS = {
   // Auto-run searches on entering interactive mode
   autorun_greedy: true,
   autorun_beam: true,
-  autorun_dijkstra: true,
-  // Display options
-  show_debug_output: false,
-  show_ocr_confidence: true,
-  show_alternatives_count: 3
+  autorun_dijkstra: true
 };
 
 var currentSettings = null;
@@ -143,35 +122,10 @@ function getEnabledPieceFileConfusions() {
   return pairs;
 }
 
-function getEnabledFileConfusions() {
-  var pairs = [];
-  if (currentSettings.file_a_g) { pairs.push(['a','g'], ['g','a']); }
-  if (currentSettings.file_a_d) { pairs.push(['a','d'], ['d','a']); }
-  if (currentSettings.file_b_d) { pairs.push(['b','d'], ['d','b']); }
-  if (currentSettings.file_e_c) { pairs.push(['e','c'], ['c','e']); }
-  if (currentSettings.file_b_h) { pairs.push(['b','h'], ['h','b']); }
-  return pairs;
-}
-
-function getEnabledRankConfusions() {
-  var pairs = [];
-  if (currentSettings.rank_1_7) { pairs.push(['1','7'], ['7','1']); }
-  if (currentSettings.rank_2_7) { pairs.push(['2','7'], ['7','2']); }
-  if (currentSettings.rank_3_8) { pairs.push(['3','8'], ['8','3']); }
-  if (currentSettings.rank_4_5) { pairs.push(['4','5'], ['5','4']); }
-  if (currentSettings.rank_1_4) { pairs.push(['1','4'], ['4','1']); }
-  if (currentSettings.rank_6_8) { pairs.push(['6','8'], ['8','6']); }
-  return pairs;
-}
-
 function getAutoFixSettings() {
   return {
     piece_confusions: getEnabledPieceConfusions(),
     piece_file_confusions: getEnabledPieceFileConfusions(),
-    file_confusions: getEnabledFileConfusions(),
-    rank_confusions: getEnabledRankConfusions(),
-    fix_capture: currentSettings.fix_capture_notation,
-    fix_combined: currentSettings.fix_combined,
     // Quick fix pipeline settings
     enable_quick_fixes: currentSettings.enable_quick_fixes,
     enable_deep_search: currentSettings.enable_deep_search,

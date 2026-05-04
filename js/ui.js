@@ -28,6 +28,13 @@ function toggleInputArea(collapsed){
   var btn2 = document.getElementById('btn-download-ocr-sheet2');
   if (btn1) btn1.classList.toggle('hidden', !collapsed || !isDual);
   if (btn2) btn2.classList.toggle('hidden', !collapsed || !isDual);
+  // Reset button: visible whenever a game is loaded with OCR data, in either
+  // single-game or batch mode (batch delegates to its own reset path).
+  var btnReset = document.getElementById('btn-reset-reconstruct');
+  if (btnReset) {
+    var batchActive = !!(window.BatchGameList && window.BatchGameList.batchState && window.BatchGameList.batchState.active);
+    btnReset.classList.toggle('hidden', !collapsed || (!hasOcr && !batchActive));
+  }
 
   // Populate scoresheet image links next to "Moves" header
   var linksEl = document.getElementById('scoresheet-links');
@@ -150,6 +157,72 @@ function logImage(dataUrl, label) {
 }
 
 window.logImage = logImage;
+
+// =============================================================================
+// Tournament / pairing header above the move list
+// =============================================================================
+// Populated in batch mode when a tournament file has been loaded AND the open
+// game matched a pairing. Hidden otherwise (single-game uploads, or batch games
+// with no pairing match). See #game-header in index.html.
+
+function renderGameHeader(game, tournamentData) {
+  var hostEl = document.getElementById('game-header');
+  if (!hostEl) return;
+
+  var pairing = game && game.pairing;
+  // Panel is strictly a pairing surface — no pairing, nothing to show. The
+  // tournament name already lives in the Step-1 status line of the Batch
+  // panel and doesn't need to be repeated here.
+  if (!pairing) {
+    hostEl.classList.add('hidden');
+    return;
+  }
+
+  // Round / Board / Date / Section line.
+  var parts = [];
+  if (game.round != null) parts.push('Round ' + game.round);
+  if (game.board != null) parts.push('Board ' + game.board);
+  if (pairing.date) parts.push(pairing.date);
+  else if (tournamentData && tournamentData.startDate)
+    parts.push(tournamentData.startDate);
+  if (game.section) parts.push(game.section);
+  var roundInfoEl = document.getElementById('game-header-roundinfo');
+  if (roundInfoEl) roundInfoEl.textContent = parts.join(' · ');
+
+  // Player lines: "Title Name (Rating)" for each colour.
+  function _formatPlayerLine(title, name, rating) {
+    if (!name) return '';
+    var out = '';
+    if (title) out += title + ' ';
+    out += name;
+    if (rating) out += ' (' + rating + ')';
+    return out;
+  }
+  var whiteEl = document.getElementById('game-header-white');
+  var blackEl = document.getElementById('game-header-black');
+  if (whiteEl) whiteEl.textContent = _formatPlayerLine(pairing.whiteTitle,
+                                                       pairing.whiteName,
+                                                       pairing.whiteRtg);
+  if (blackEl) blackEl.textContent = _formatPlayerLine(pairing.blackTitle,
+                                                       pairing.blackName,
+                                                       pairing.blackRtg);
+
+  var resultEl = document.getElementById('game-header-result');
+  if (resultEl) {
+    var res = pairing.result || '';
+    resultEl.textContent = (res && res !== '*') ? res : '';
+  }
+
+  hostEl.classList.remove('hidden');
+}
+
+function clearGameHeader() {
+  var hostEl = document.getElementById('game-header');
+  if (hostEl) hostEl.classList.add('hidden');
+}
+
+window.renderGameHeader = renderGameHeader;
+window.clearGameHeader = clearGameHeader;
 
 function resetApplyButton(){
   var applyBtn = document.getElementById('btn-apply');
@@ -306,11 +379,23 @@ function flashCorrectionsSequentially(corrections, callback) {
 
 function renderMoveList(){
   var tbody = document.getElementById('move-tbody');
+  // Preserve the user's scroll position across the rebuild. innerHTML='' wipes
+  // all rows, which can reset container.scrollTop to 0 in some browsers. If
+  // the user had scrolled down to look at a region, this would snap them back
+  // to the top. We restore inside requestAnimationFrame so the new rows have
+  // had a layout pass and scrollTop can actually take effect.
+  // If scrollTop was already 0 (e.g., initial load), the restore is a no-op.
+  // Anything that genuinely needs to move the viewport (a new stuck point,
+  // explicit goToPly navigation) calls scrollCurrentMoveIntoView AFTER
+  // renderMoveList returns and overrides this restore.
+  var _msContainer = document.getElementById('move-list-container');
+  var _msSavedScrollTop = _msContainer ? _msContainer.scrollTop : 0;
   tbody.innerHTML = '';
   var valid = 0, total = 0;
 
-  // Detect suspicious tail (low confidence moves at end)
+  // Detect suspicious tail (low confidence moves at end + repetition run)
   var suspiciousTailStart = detectSuspiciousTail();
+  if(suspiciousTailStart === null) suspiciousTailStart = detectRepeatingTail();
   if(suspiciousTailStart === null) suspiciousTailStart = detectTrailingNoise();
 
   state.moves.forEach(function(m, idx){
@@ -337,11 +422,17 @@ function renderMoveList(){
       if(!c || c >= 0.7) return '';
       return ' <span class="text-red-400 text-xs">(' + Math.round(c*100) + '%)</span>';
     };
-    // Correction indicator: 🔄 for OCR candidate, ⚡ for similarity fix
-    // Hidden when status is fixed/locked (the ✓/🔒 icon already conveys "corrected")
-    var corrInd = function(orig, isOcrAlt, status){
+    // Correction indicator: 🔄 for OCR candidate, ⚡ for similarity fix.
+    // Hidden when status is fixed/locked (the ✓/🔒 icon already conveys
+    // "corrected") OR when the cell is an algorithm proposal — those have
+    // their own review affordance (the strike-through <s>old</s>→new in
+    // review mode) and shouldn't flash ⚡ too, which is reserved for
+    // validate_moves quick-fixes and misleads the user into thinking the
+    // algorithm's choice was a similarity-fix swap.
+    var corrInd = function(orig, isOcrAlt, status, isAlgoProposed){
       if(!orig) return '';
       if(status === 'fixed' || status === 'locked') return '';
+      if(isAlgoProposed) return '';
       if(isOcrAlt){
         return ' <span class="text-cyan-400 text-xs cursor-help" title="Auto-corrected from: ' + orig + '">🔄</span>';
       }
@@ -380,8 +471,8 @@ function renderMoveList(){
     if(wSuspicious) wClass += ' bg-red-900/20';
     wTd.className = wClass;
     wTd.title = m.wOriginal ? 'was: ' + m.wOriginal + (m.wStatus === 'fixed' ? ' — double-click ✓ to revert' : '') : 'Click to view • Double-click to edit • Right-click for insert/delete';
-    wTd.innerHTML = tierInd(wPly) + (m.white || '') + corrInd(m.wOriginal, m.wOcrAlt, m.wStatus) + confInd(m.wConf) + icon(m.wStatus, m.wOriginal, m.num, 'w') + (wSuspicious ? deleteBtn(wPly, 'w') : '');
-    wTd.onclick = function(e){ if(!e.target.classList.contains('delete-from-here')) goToPly(idx*2 + 1); };
+    wTd.innerHTML = tierInd(wPly) + (m.white || '') + corrInd(m.wOriginal, m.wOcrAlt, m.wStatus, m.wAlgoProposed) + confInd(m.wConf) + icon(m.wStatus, m.wOriginal, m.num, 'w') + (wSuspicious ? deleteBtn(wPly, 'w') : '');
+    wTd.onclick = function(e){ if(!e.target.classList.contains('delete-from-here')) goToPly(idx*2 + 1, { skipScroll: true }); };
     wTd.ondblclick = function(e){ if(e.target.classList.contains('delete-from-here')) return; if(e.target.classList.contains('revert-fix')){ e.stopPropagation(); revertToOriginalOcr(parseInt(e.target.dataset.num), e.target.dataset.color); return; } e.stopPropagation(); enterEditMode(m.num, 'w'); };
     wTd.oncontextmenu = function(e){ e.preventDefault(); showMoveContextMenu(e, idx*2, m.num, 'w'); };
 
@@ -390,8 +481,8 @@ function renderMoveList(){
     if(bSuspicious) bClass += ' bg-red-900/20';
     bTd.className = bClass;
     bTd.title = m.bOriginal ? 'was: ' + m.bOriginal + (m.bStatus === 'fixed' ? ' — double-click ✓ to revert' : '') : 'Click to view • Double-click to edit • Right-click for insert/delete';
-    bTd.innerHTML = tierInd(bPly) + (m.black || '') + corrInd(m.bOriginal, m.bOcrAlt, m.bStatus) + confInd(m.bConf) + icon(m.bStatus, m.bOriginal, m.num, 'b') + (bSuspicious && m.black ? deleteBtn(bPly, 'b') : '');
-    bTd.onclick = function(e){ if(!e.target.classList.contains('delete-from-here')) goToPly(idx*2 + 2); };
+    bTd.innerHTML = tierInd(bPly) + (m.black || '') + corrInd(m.bOriginal, m.bOcrAlt, m.bStatus, m.bAlgoProposed) + confInd(m.bConf) + icon(m.bStatus, m.bOriginal, m.num, 'b') + (bSuspicious && m.black ? deleteBtn(bPly, 'b') : '');
+    bTd.onclick = function(e){ if(!e.target.classList.contains('delete-from-here')) goToPly(idx*2 + 2, { skipScroll: true }); };
     bTd.ondblclick = function(e){ if(e.target.classList.contains('delete-from-here')) return; if(e.target.classList.contains('revert-fix')){ e.stopPropagation(); revertToOriginalOcr(parseInt(e.target.dataset.num), e.target.dataset.color); return; } e.stopPropagation(); enterEditMode(m.num, 'b'); };
     bTd.oncontextmenu = function(e){ e.preventDefault(); showMoveContextMenu(e, idx*2+1, m.num, 'b'); };
 
@@ -417,6 +508,28 @@ function renderMoveList(){
   var status = '✅ ' + valid + '/' + total;
   if(state.stuckInfo) status += ' • <span class="text-red-400">❌ ' + state.stuckInfo.num + '.' + state.stuckInfo.color.toUpperCase() + '</span>';
   document.getElementById('move-status').innerHTML = status;
+
+  // Restore the preserved scroll position SYNCHRONOUSLY. rAF restoration
+  // races when renderMoveList is called multiple times in rapid succession
+  // (the second call captures scrollTop=0 from the wipe before the first
+  // rAF fires, then both rAFs race and the second wins → list at 0).
+  // Synchronous restore happens before the caller can do anything else;
+  // any subsequent goToPly's scrollCurrentMoveIntoView runs AFTER and can
+  // override if it really needs to (e.g., new stuck point centering).
+  if (_msContainer && _msSavedScrollTop > 0) {
+    _msContainer.scrollTop = _msSavedScrollTop;
+  }
+  // Diagnostic — gated on a flag the user can flip in DevTools to debug
+  // stuck-at-1 reports without flooding the console for everyone else.
+  if (state._debugScroll) {
+    var nowTop = _msContainer ? _msContainer.scrollTop : 'no-container';
+    console.log('[renderMoveList] saved=' + _msSavedScrollTop +
+                ' restored=' + nowTop +
+                ' rows=' + (state.moves ? state.moves.length : 0) +
+                ' currentPly=' + state.currentPly +
+                ' stuckPly=' + state.stuckPly +
+                ' lastScrolledStuckPly=' + state.lastScrolledStuckPly);
+  }
 }
 
 /**
@@ -474,18 +587,42 @@ function detectSuspiciousTail(){
   var MIN_SUSPICIOUS = 3;  // Need at least 3 suspicious moves total
   var GOOD_STREAK_TO_STOP = 4;  // 4 consecutive good moves = real game, stop scanning (signatures can produce 1-2 confident noise moves)
 
-  // Build flat list with move info
+  // Build flat list with move info. Use REAL game ply derived from m.num
+  // so a game with missing cells produces indices the renderer's
+  // comparison (wPly = stateIdx * 2) can match against. Flat-list index
+  // diverges from real ply when Black is blank for several consecutive
+  // rows (state.moves index stays 0-based contiguous but real ply jumps).
   var moves = [];
   state.moves.forEach(function(m){
-    if(m.white) moves.push({ply: moves.length, conf: m.wConf || 0.9, san: m.white});
-    if(m.black) moves.push({ply: moves.length, conf: m.bConf || 0.9, san: m.black});
+    if(m.white) moves.push({ply: (m.num - 1) * 2, conf: m.wConf || 0.9, san: m.white});
+    if(m.black) moves.push({ply: (m.num - 1) * 2 + 1, conf: m.bConf || 0.9, san: m.black});
   });
 
   if(moves.length < 4) return null;
 
   // Determine if each move is "suspicious" based on complexity + confidence
-  function isSuspicious(mv){
+  // PLUS a structural same-SAN-as-neighbor check. In real chess no player
+  // plays the same SAN twice in a row, and two consecutive identical SANs
+  // across White/Black (e.g. W plays c4 then B plays c4) requires a very
+  // specific piece constellation — three in a row is essentially impossible.
+  // When OCR reads a scribble / signature / blank as the same simple SAN
+  // over and over, each instance scores high confidence on its own, so the
+  // confidence-only check used to let a "c4 c4 c4 c4" run count as 4
+  // "consecutive good" moves and break the backward scan BEFORE it could
+  // reach the low-confidence cells that preceded the run.
+  function isSuspicious(mv, neighbor){
     var complexity = getMoveComplexity(mv.san);
+    // Same-SAN rule catches scribble-scribble noise patterns (c4 c4 c4 …)
+    // but EXEMPT captures/checks/castling/promotion (complexity 2). Those
+    // can legitimately appear back-to-back — the canonical case is a
+    // recapture on the same square: 35.B Rxd7 followed by 36.W Rxd7
+    // means black's rook captured on d7 and white's rook recaptured.
+    // Flagging that as noise stretched the noise window back past the
+    // real game, dropping the suspicious-ratio below 50% and hiding
+    // the genuine scribble tail from the user.
+    if(complexity < 2 && neighbor && mv.san && neighbor.san && mv.san === neighbor.san){
+      return true;
+    }
     var threshold;
     if(complexity === 2) threshold = THRESHOLD_COMPLEX;
     else if(complexity === 1) threshold = THRESHOLD_MODERATE;
@@ -500,7 +637,12 @@ function detectSuspiciousTail(){
   var suspiciousCount = 0;
 
   for(var i = moves.length - 1; i >= 0; i--){
-    if(isSuspicious(moves[i])){
+    // Compare each cell against the NEXT-in-flat-order neighbor (which we
+    // already scanned in the previous iteration since we're walking
+    // backwards). Mid-run and run-start cells get flagged by the same-SAN
+    // rule; only the tail cell has no neighbor.
+    var neighbor = (i + 1 < moves.length) ? moves[i + 1] : null;
+    if(isSuspicious(moves[i], neighbor)){
       suspiciousCount++;
       consecutiveGood = 0;
       noiseStartCandidate = i;
@@ -526,14 +668,75 @@ function detectSuspiciousTail(){
     return null;
   }
 
-  // Find the actual start: first suspicious move in the noisy region
+  // Find the actual start: first suspicious move in the noisy region.
+  // Same neighbor-aware check so the first cell of a same-SAN run gets
+  // flagged even when its own confidence passes (c4@90% as the first
+  // c4 in a run counts because c4@90% at idx+1 is its neighbor).
   for(var j = noiseStartCandidate; j < moves.length; j++){
-    if(isSuspicious(moves[j])){
+    var jNeighbor = (j + 1 < moves.length) ? moves[j + 1] : null;
+    if(isSuspicious(moves[j], jNeighbor)){
       return j;
     }
   }
 
   return noiseStartCandidate;
+}
+
+/**
+ * Repetition-based tail detector. The confidence-only detectSuspiciousTail
+ * misses the common noise pattern where a scribble / signature / blank row
+ * gets OCR'd as the same simple SAN over and over (c4 c4 c4 c4 …) — each
+ * instance is high-confidence on its own but the repetition is impossible
+ * in real chess. A white pawn can only reach c4 once in a game; two
+ * consecutive identical SANs in the flat list means W=X then B=X at the
+ * next move, which requires an exactly-right piece constellation; three
+ * in a row in real chess is essentially never legitimate.
+ *
+ * Returns the flat ply index of the first move in the longest run of
+ * consecutive identical SANs at the tail, IF that run is length >= 3.
+ * Otherwise null.
+ */
+function detectRepeatingTail(){
+  if(state.noiseCleanupDone) return null;
+  if(!state.moves || state.moves.length < 2) return null;
+
+  // Use the REAL game ply (derived from m.num + color) rather than the
+  // flat-list index. For games with missing cells (e.g. Black's column is
+  // blank for several consecutive rows because the player stopped writing)
+  // these diverge — flat-list index 86 could correspond to game ply 88,
+  // and the renderer's `wPly = idx * 2` comparison would miss the first
+  // row of the run.
+  var moves = [];
+  state.moves.forEach(function(m){
+    if(m.white) moves.push({ply: (m.num - 1) * 2, san: m.white});
+    if(m.black) moves.push({ply: (m.num - 1) * 2 + 1, san: m.black});
+  });
+  if(moves.length < 3) return null;
+
+  // Walk backwards from the tail. Count the run of identical SANs.
+  var tailSan = moves[moves.length - 1].san;
+  if(!tailSan) return null;
+  var runStartIdx = moves.length - 1;
+  for(var i = moves.length - 2; i >= 0; i--){
+    if(moves[i].san === tailSan){
+      runStartIdx = i;
+    } else {
+      break;
+    }
+  }
+  var runLen = moves.length - runStartIdx;
+  if(runLen >= 3){
+    if(typeof log === 'function'){
+      var startPly = moves[runStartIdx].ply;
+      var endPly = moves[moves.length - 1].ply;
+      var startMv = Math.floor(startPly / 2) + 1 + '.' + (startPly % 2 === 0 ? 'W' : 'B');
+      var endMv = Math.floor(endPly / 2) + 1 + '.' + (endPly % 2 === 0 ? 'W' : 'B');
+      log('🗑️ Repeating SAN tail: "' + tailSan + '" x' + runLen +
+          ' at ' + startMv + '..' + endMv + ' (flagged from ply ' + startPly + ')');
+    }
+    return moves[runStartIdx].ply;
+  }
+  return null;
 }
 
 /**
@@ -548,11 +751,15 @@ function detectTrailingNoise(){
   var THRESHOLD_MODERATE = 0.50;
   var THRESHOLD_PAIR = 0.55;
 
-  // Build flat list with move info
+  // Build flat list with move info. Use REAL game ply derived from m.num
+  // so a game with missing cells produces indices the renderer's
+  // comparison (wPly = stateIdx * 2) can match against. Flat-list index
+  // diverges from real ply when Black is blank for several consecutive
+  // rows (state.moves index stays 0-based contiguous but real ply jumps).
   var moves = [];
   state.moves.forEach(function(m){
-    if(m.white) moves.push({ply: moves.length, conf: m.wConf || 0.9, san: m.white});
-    if(m.black) moves.push({ply: moves.length, conf: m.bConf || 0.9, san: m.black});
+    if(m.white) moves.push({ply: (m.num - 1) * 2, conf: m.wConf || 0.9, san: m.white});
+    if(m.black) moves.push({ply: (m.num - 1) * 2 + 1, conf: m.bConf || 0.9, san: m.black});
   });
 
   if(moves.length < 4) return null;
@@ -732,5 +939,28 @@ function deleteMovesFromPly(ply){
   } else {
     // Normal mode - revalidate
     revalidate();
+  }
+
+  // Refresh the structural pipeline: recount noise, refresh alignment cache,
+  // re-evaluate at-point trigger. The user typically uses this menu item to
+  // chop trailing noise, so this is what makes the noise notice auto-clear
+  // and lets the algorithms launch right after.
+  if (window.SheetAlignment) {
+    window.SheetAlignment.runStructuralChecks();
+  }
+
+  // In batch mode, sync the per-game caches with the truncated state.
+  // Without this, batchState.ocrResults[gameId].sheet1/sheet2 stay pointed
+  // at the pre-truncation array (state.ocrCellsSheet1/2 were reassigned
+  // above, breaking reference equality), so the game-list counter reads
+  // the old length — user-reported "113/113" for a 111-move game after
+  // cutting two noise cells. The reconstruction result is invalidated too
+  // so the side panels don't replay stale "SOLVED (N fixes)" referencing
+  // plies that no longer exist.
+  if (window.BatchGameList &&
+      typeof window.BatchGameList.syncAfterTruncation === 'function') {
+    try { window.BatchGameList.syncAfterTruncation(); } catch (e) {
+      console.warn('[Batch] syncAfterTruncation failed:', e);
+    }
   }
 }

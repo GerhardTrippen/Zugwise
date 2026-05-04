@@ -30,9 +30,18 @@ var SearchManager = (function() {
      * @param {Array<string>} methods - ['greedy', 'beam'] or ['greedy', 'beam', 'dijkstra']
      * @param {Object} methodOptions - per-method options, e.g. { greedy: {max_fixes: 15}, beam: {beam_width: 5} }
      */
-    SearchManager.prototype.launchSearches = function(ocrMoves, methods, methodOptions) {
+    SearchManager.prototype.launchSearches = function(ocrMoves, methods, methodOptions, lockedPlies) {
         methods = methods || ['greedy', 'beam'];
         methodOptions = methodOptions || {};
+
+        // If caller passes the current locked-plies array, rebuild the singleton
+        // set before launch so merge-locked plies and user confirmations are
+        // honored by every algorithm — not only by sendUserFix additions.
+        if (Array.isArray(lockedPlies)) {
+            this.lockedPlies.clear();
+            var selfL = this;
+            lockedPlies.forEach(function(p) { selfL.lockedPlies.add(p | 0); });
+        }
 
         var self = this;
         methods.forEach(function(method) {
@@ -185,6 +194,26 @@ var SearchManager = (function() {
                 opts.max_steps = (options && options.max_steps) || 1000;
                 opts.max_fixes_per_path = (options && options.max_fixes_per_path) || 15;
             }
+            // Review-requeue frontier: tells the worker to never propose
+            // fixes for plies < confirmed_ply (only greedy honors this today).
+            if (options && options.confirmed_ply) {
+                opts.confirmed_ply = options.confirmed_ply | 0;
+            }
+            // Backtrack lookback cap. Mirrors the user's Deep Search Depth
+            // setting so Greedy/Beam/Dijkstra consider the same candidate
+            // pool the interactive Deep Search panel does. Explicit option
+            // wins, then currentSettings.deep_search_depth, then default 5.
+            var _maxBacktrack;
+            if (options && options.max_backtrack != null) {
+                _maxBacktrack = options.max_backtrack | 0;
+            } else if (typeof window !== 'undefined' &&
+                       window.currentSettings &&
+                       typeof window.currentSettings.deep_search_depth === 'number') {
+                _maxBacktrack = window.currentSettings.deep_search_depth | 0;
+            } else {
+                _maxBacktrack = 5;
+            }
+            opts.max_backtrack = _maxBacktrack;
 
             // Create search state
             var stateInfo = await worker._send('search-create', {
@@ -254,7 +283,85 @@ var SearchManager = (function() {
         }
     };
 
+    // =========================================================================
+    // Background / headless launch — for batch reconstruction queue
+    // =========================================================================
+    //
+    // Promise-wrapped variant that takes per-call callbacks instead of using
+    // the instance-level onStepUpdate/onComplete/onStatusChange fields.
+    //
+    // Typical use (from batch-reconstruct-queue.js):
+    //     var mgr = new SearchManager();  // fresh instance, NOT window.searchManager
+    //     var results = await mgr.launchSearchesPromise(ocrMoves,
+    //         ['greedy','beam','dijkstra'], methodOptions, {
+    //             onStepUpdate: function(method, step) { ... },
+    //             onStatusChange: function(method, status) { ... }
+    //         });
+    //     // results = { greedy: {status,moves,fixes}, beam: {...}, dijkstra: {...} }
+    //
+    // Uses a fresh instance so background work does not clobber the UI
+    // singleton's worker pool, statuses, or callbacks. Per-call callbacks are
+    // restored at settle time so a re-used instance is still safe.
+
+    SearchManager.prototype.launchSearchesPromise = function(ocrMoves, methods, methodOptions, callbacks, lockedPlies) {
+        var self = this;
+        methods = methods || ['greedy', 'beam'];
+        methodOptions = methodOptions || {};
+        callbacks = callbacks || {};
+
+        var prevStepUpdate = self.onStepUpdate;
+        var prevStatusChange = self.onStatusChange;
+        var prevComplete = self.onComplete;
+
+        return new Promise(function(resolve) {
+            var settled = {};
+            var results = {};
+            var resolved = false;
+
+            function markDone(method, result) {
+                if (resolved) return;
+                if (settled[method]) return;  // don't double-count per method
+                settled[method] = true;
+                if (result !== undefined && result !== null) {
+                    results[method] = result;
+                }
+                var allDone = methods.every(function(m) { return settled[m]; });
+                if (allDone) {
+                    resolved = true;
+                    self.onStepUpdate = prevStepUpdate;
+                    self.onStatusChange = prevStatusChange;
+                    self.onComplete = prevComplete;
+                    resolve(results);
+                }
+            }
+
+            self.onStepUpdate = function(method, step) {
+                if (callbacks.onStepUpdate) {
+                    try { callbacks.onStepUpdate(method, step); } catch (e) {}
+                }
+            };
+            self.onStatusChange = function(method, status) {
+                if (callbacks.onStatusChange) {
+                    try { callbacks.onStatusChange(method, status); } catch (e) {}
+                }
+                // Terminal non-complete statuses also settle the method so
+                // cancelled/errored methods don't leave the promise hanging.
+                if (status === 'error' || status === 'idle') {
+                    markDone(method, null);
+                }
+            };
+            self.onComplete = function(method, result) {
+                markDone(method, result);
+            };
+
+            self.launchSearches(ocrMoves, methods, methodOptions, lockedPlies);
+        });
+    };
+
     return SearchManager;
 })();
 
+// UI singleton — foreground/interactive searches use this.
+// Background batch jobs should instantiate their own `new SearchManager()`.
 window.searchManager = new SearchManager();
+window.SearchManager = SearchManager;

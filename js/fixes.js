@@ -9,10 +9,76 @@ function plyToStr(ply) {
   return num + '.' + color;
 }
 
+// Human-readable descriptions for the score components attached to every fix.
+// Used to build a hover tooltip on fix buttons so a curious user can see why
+// a fix ranked where it did without reading the code.
+var SCORE_COMPONENT_DESCRIPTIONS = {
+  sim:         'Character similarity to OCR text (sim × 40)',
+  hi_sim:      'Bonus for very high similarity (≥90%)',
+  reach:       'Plies the game continues after this fix (capped at 50)',
+  reach_tb:    'Reach tiebreaker for fixes that reach far beyond the stuck ply',
+  reach10:     'Bonus for reaching 10+ plies past the stuck point',
+  complete:    'Bonus if this fix completes the whole game',
+  abs_fix:     'Bonus if this fix resolves an existing absurdity',
+  lo_conf:     'Bonus if the original OCR had very low confidence',
+  chk_mm:      'Bonus if this fix resolves a check/notation mismatch',
+  chk_en:      'Bonus if this fix enables a future check in the game',
+  chk_fc:      'Bonus for a forcing check in the fix sequence',
+  stk_chk:     'Bonus tied to the check symbol on the stuck move',
+  clr_dst:     'Bonus if this fix clears the destination of a later move',
+  dup_fix:     'Bonus if this fix resolves a duplicate-move conflict',
+  dup_res:     'Bonus for resolving a broader duplicate-move cluster',
+  future:      'Bonus for enabling more legal future moves',
+  near:        'Bonus for being near the stuck ply (smaller edits preferred)',
+  ocr_c:       'Bonus scaled by OCR confidence of the candidate',
+  ocr_pat:     'Bonus if this candidate was already in the OCR alternatives',
+  abs_pen:     'Penalty: leaves a piece hanging (quiescence-backed)',
+  hang:        '(legacy, unused) simple hanging penalty',
+  pwn_h:       '(legacy, unused) pawn-hanging penalty',
+  win_cap:     '(legacy, unused) winning-capture bonus',
+  miss_c:      '(legacy, unused) missed-capture penalty',
+  mfc:         'Penalty: ignores a free capture of a major piece',
+  ofc:         'Penalty: lets opponent make a free capture with check',
+  bad_tr:      'Penalty: SEE-verified losing exchange initiated by this move',
+  zero_r:      'Penalty: this fix does not advance the game',
+  dist:        'Penalty scaled by ply distance from the stuck point',
+  stuck:       'Bonus for fixes AT the stuck ply that advance',
+  fut_cap:     'Bonus if a future OCR move references this fix\u2019s square',
+  p2_pen:      'Phase-2 penalty (fixes found during extended search)',
+  v_mate:      'Verification penalty (fix creates material loss confirmed by quiescence)'
+};
+
+// Render a single color-coded score-component pill for the fix-details panel.
+// Green = positive (bonus), red = negative (penalty), gray = zero. Description
+// goes into the title attribute so curious users can hover for the meaning.
+function renderScoreComponentPill(name, value) {
+  if (value === null || value === undefined) return '';
+  var rounded = Math.round(value * 10) / 10;
+  if (rounded === 0) return '';
+  var sign = rounded > 0 ? '+' : '';
+  var cls = rounded > 0
+    ? 'bg-green-900/40 text-green-300 border-green-700'
+    : 'bg-red-900/40 text-red-300 border-red-700';
+  var desc = SCORE_COMPONENT_DESCRIPTIONS[name] || '';
+  var title = desc ? (name + ' = ' + sign + rounded + '\n' + desc) : (name + ' = ' + sign + rounded);
+  return '<span class="inline-block px-1.5 py-0.5 rounded border ' + cls +
+    '" title="' + title.replace(/"/g, '&quot;') + '">' +
+    name + sign + rounded + '</span>';
+}
+
 // OCR color class: red at stuck ply, yellow for backtrack fixes (matching board arrow colors)
 function ocrColorClass(fix) {
-  if (typeof fix.ply === 'number' && state.stuckPly !== null && fix.ply !== state.stuckPly) {
-    return 'text-yellow-400';  // backtrack fix — yellow like the arrow
+  // Use the ORIGIN stuck ply when set (backtrack-review mode) so the
+  // OCR-text color matches what the headline + move-list outline say:
+  // red on the actual stuck ply, yellow on every other candidate
+  // (including the currently-focused backtrack proposal). Without this,
+  // state.stuckPly equals the focus ply during backtrack review, so the
+  // 15.B fix would read as "stuck" (red) while the 16.B fix at the
+  // actual stuck point read as "backtrack" (yellow) — exactly inverted.
+  var stuckRefPly = (typeof state.originStuckPly === 'number')
+    ? state.originStuckPly : state.stuckPly;
+  if (typeof fix.ply === 'number' && stuckRefPly !== null && fix.ply !== stuckRefPly) {
+    return 'text-yellow-400';  // backtrack / forward-alternative fix
   }
   return 'text-red-400';  // stuck ply fix — red like the error arrow
 }
@@ -109,6 +175,82 @@ function createRevertToOcrButton(originalOcr, container) {
   return revertFix;
 }
 
+// Yellow "Keep <move> — accept as-is" button shown for bad-trade /
+// persistent-absurdity / piece-hanging stuck reasons. Routed through
+// selectFix → applyFix so it behaves like every other suggestion: a
+// single click stages the choice on the main confirm button, the user
+// then commits with the main button (or double-clicks here to apply
+// in one step). Earlier this onclick called keepCurrentMove() directly,
+// which felt inconsistent — clicking a "suggestion field" applied
+// instantly while clicking other suggestion fields only selected them.
+function createKeepAsIsButton(container) {
+  if (!state.stuckInfo || state.stuckPly === null) return null;
+
+  var lbl = state.stuckInfo.num + '.' + state.stuckInfo.color.toUpperCase();
+  var move = state.stuckInfo.move;
+  var ply = state.stuckPly;
+
+  var btn = document.createElement('button');
+  btn.className = 'w-full text-left p-2 rounded-lg border bg-yellow-600/30 border-yellow-500 mb-2 hover:bg-yellow-500/40';
+  btn.title = 'Accept this move despite the warning (may be an intentional sacrifice or gambit) — click to select, then commit with the main button';
+  btn.innerHTML = '<span class="text-yellow-300 font-medium">✓ Keep ' + move + '</span> <span class="text-yellow-400/70 text-xs">— accept as-is</span>';
+
+  // Compute arrow squares so the kept move's from/to lights up like
+  // any other selected fix.
+  var fromSq = null, toSq = null;
+  if (ply !== null) {
+    try {
+      var tempChess = new Chess();
+      for (var j = 0; j < ply; j++) { tempChess.move(state.sans[j]); }
+      var moveObj = tempChess.move(move);
+      if (moveObj) { fromSq = moveObj.from; toSq = moveObj.to; }
+    } catch (e) {}
+  }
+
+  var keepFix = {
+    ocr: move,
+    san: move,
+    ply: ply,
+    ply_str: lbl,
+    similarity: 100,
+    keep_as_is: true,
+    num_changes: 0,
+    source: 'keep_as_is',
+    from_square: fromSq,
+    to_square: toSq,
+    ocr_from_square: state.errorArrow ? state.errorArrow.from : null,
+    ocr_to_square: state.errorArrow ? state.errorArrow.to : null
+  };
+
+  btn.onclick = function() { selectFix(keepFix, btn); };
+  btn.ondblclick = function() { selectFix(keepFix, btn); applyFix(); };
+  container.appendChild(btn);
+  return keepFix;
+}
+
+// Reset the Apply/Confirm button to a neutral disabled state. The per-mode
+// colors (orange edit, blue review, green apply, purple insert) are written
+// only by selectFix() and a few other call sites — none of them ran when
+// the user exited a mode without clicking a new fix, so the button would
+// linger in the previous mode's color. Scenarios the user reported:
+//   - Edited a move, clicked Apply. applyFix() clears state.selectedFix
+//     but nothing repaints the button, so it stays orange with stale text.
+//   - Exited edit mode via Cancel. state.editMode is cleared but the
+//     button keeps the orange styling from the last selectFix call.
+//   - Exited review mode. _restorePanelFixes restores from a snapshot
+//     taken on review entry; if the pre-review state already had a stale
+//     orange/blue button, the restore brings it back.
+// Call this whenever a mode is exited or selectedFix is cleared; selectFix
+// will re-derive the correct color the next time the user picks a fix.
+function resetApplyButton(){
+  var applyBtn = document.getElementById('btn-apply');
+  if (!applyBtn) return;
+  applyBtn.disabled = true;
+  applyBtn.className = 'w-full mb-3 py-3 rounded-lg font-semibold bg-gray-700 text-gray-400 cursor-not-allowed';
+  applyBtn.textContent = 'Select a fix';
+  if (typeof applyFix === 'function') applyBtn.onclick = applyFix;
+}
+
 function renderFixes(fixes){
   var container = document.getElementById('fix-list');
   container.innerHTML = '';
@@ -116,12 +258,7 @@ function renderFixes(fixes){
   // Show "Keep it" button for bad trades, persistent absurdities, or piece hanging
   var reason = state.stuckInfo ? state.stuckInfo.reason : null;
   if(reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging'){
-    var keepBtn = document.createElement('button');
-    keepBtn.className = 'w-full text-left p-2 rounded-lg border bg-yellow-600/30 border-yellow-500 mb-2 hover:bg-yellow-500/40';
-    keepBtn.title = 'Accept this move despite the warning (may be an intentional sacrifice or gambit)';
-    keepBtn.innerHTML = '<span class="text-yellow-300 font-medium">✓ Keep ' + (state.stuckInfo ? state.stuckInfo.move : 'it') + '</span> <span class="text-yellow-400/70 text-xs">— accept as-is</span>';
-    keepBtn.onclick = function(){ keepCurrentMove(); };
-    container.appendChild(keepBtn);
+    createKeepAsIsButton(container);
 
     var sep = document.createElement('div');
     sep.className = 'text-xs text-gray-500 mb-2';
@@ -145,7 +282,18 @@ function renderFixes(fixes){
     var btn = document.createElement('button');
     btn.className = 'w-full text-left p-2.5 rounded-lg border bg-yellow-600/30 border-yellow-500 mb-3';
     btn.title = 'Click to select • Double-click to apply';
-    btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm"><span class="text-gray-400">' + pcPlyStr + '</span> <span class="text-red-400">' + pc.original + '</span> → <span class="text-yellow-300 font-semibold">' + pc.suggested + '</span></span><span class="text-yellow-400 text-xs">' + pc.num_changes + ' changes</span></div><div class="text-xs text-yellow-600 mt-1">Requires confirmation - click to accept</div>';
+    var pcAbsurdTag2 = pc.absurd_warning
+      ? ' <span class="text-red-400" title="' + pc.absurd_warning.replace(/"/g, '&quot;') + '">⚠️</span>'
+      : '';
+    var pcAbsurdLine2 = pc.absurd_warning
+      ? '<div class="text-xs text-red-400 mt-1">' + pc.absurd_warning + '</div>'
+      : '';
+    // OCR text color: red on the actual stuck ply, yellow on a backtrack
+    // proposal at an earlier ply. Reuses ocrColorClass to keep this
+    // pending-similarity block consistent with the deep-search list and
+    // the headline / move-list / OCR-cell highlights.
+    var pcOcrColor = ocrColorClass({ ply: pcPly });
+    btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm"><span class="text-gray-400">' + pcPlyStr + '</span> <span class="' + pcOcrColor + '">' + pc.original + '</span> → <span class="text-yellow-300 font-semibold">' + pc.suggested + '</span>' + pcAbsurdTag2 + '</span><span class="text-yellow-400 text-xs">' + pc.num_changes + ' changes</span></div>' + pcAbsurdLine2 + '<div class="text-xs text-yellow-600 mt-1">Requires confirmation - click to accept</div>';
     // Compute arrow squares for pending confirmation
     var pcFrom = null, pcTo = null;
     try {
@@ -235,12 +383,7 @@ function renderSimpleFixes(){
   // Show "Keep it" button for bad trades, persistent absurdities, or piece hanging
   var reason = state.stuckInfo.reason || 'illegal';
   if(reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging'){
-    var keepBtn = document.createElement('button');
-    keepBtn.className = 'w-full text-left p-2 rounded-lg border bg-yellow-600/30 border-yellow-500 mb-2 hover:bg-yellow-500/40';
-    keepBtn.title = 'Accept this move despite the warning (may be an intentional sacrifice or gambit)';
-    keepBtn.innerHTML = '<span class="text-yellow-300 font-medium">✓ Keep ' + (state.stuckInfo ? state.stuckInfo.move : 'it') + '</span> <span class="text-yellow-400/70 text-xs">— accept as-is</span>';
-    keepBtn.onclick = function(){ keepCurrentMove(); };
-    container.appendChild(keepBtn);
+    createKeepAsIsButton(container);
 
     var sep = document.createElement('div');
     sep.className = 'text-xs text-gray-500 mb-2';
@@ -336,7 +479,26 @@ function renderLegalMoves(){
 
 function selectFix(fix, btn){
   state.selectedFix = fix;
-  var isEdit = fix.isEditMode || state.editMode;
+  // Edit-mode detection MUST consult state.editMode (the live mode) and not
+  // fix.isEditMode (a flag stamped onto fix objects when the legal-moves
+  // panel was rendered for edit mode). After exitEditMode / applyFix clears
+  // state.editMode, the panel's old buttons may still be in the DOM with
+  // their fix.isEditMode flag set; clicking one would otherwise repaint the
+  // Apply button orange even though we're back in interactive mode.
+  // User-reported: "still remains orange after one double-click on a move."
+  //
+  // Review mode wins: if the verification walkthrough is active, never paint
+  // orange. The user-flow that triggered this — double-click to edit during
+  // Greedy review, apply, then re-enter review via the panel — leaves
+  // state.editMode null, but earlier paths and snapshots could land here
+  // with the button still orange from the edit. Forcing isEdit=false in
+  // review mode keeps the Confirm button blue every time, matching the
+  // panel's "Review" button color and matching the user's expectation:
+  // orange is for manual edits only.
+  var _reviewActive = window.VerificationUI &&
+                      typeof window.VerificationUI.isActive === 'function' &&
+                      window.VerificationUI.isActive();
+  var isEdit = !!state.editMode && !_reviewActive;
   var hlClass = isEdit ? 'bg-blue-600/30 border-blue-500' : 'bg-green-600/30 border-green-500';
   document.querySelectorAll('#fix-list button').forEach(function(b){
     b.classList.remove('bg-green-600/30', 'border-green-500', 'bg-blue-600/30', 'border-blue-500');
@@ -402,14 +564,45 @@ function selectFix(fix, btn){
 
   var applyBtn = document.getElementById('btn-apply');
   applyBtn.disabled = false;
+  // Color legend in the fix panel:
+  //   green  = apply (interactive mode)
+  //   blue   = confirm (review mode — matches the "Review" button in the
+  //            algorithm panels so the connection is obvious)
+  //   orange = change/keep (edit mode — distinct from review blue)
+  //   purple = insert missing move
+  //   yellow = pending confirmation (2-change similarity fix)
+  var isReview = window.VerificationUI &&
+                 typeof window.VerificationUI.isActive === 'function' &&
+                 window.VerificationUI.isActive();
   if(isEdit){
     var isSame = fix.san === fix.ocr || fix.similarity === 100;
-    applyBtn.className = 'w-full mb-3 py-3 rounded-lg font-semibold bg-blue-600 hover:bg-blue-500 cursor-pointer';
+    applyBtn.className = 'w-full mb-3 py-3 rounded-lg font-semibold bg-orange-600 hover:bg-orange-500 cursor-pointer';
     applyBtn.textContent = isSame ? '✓ Keep: ' + (fix.ply_str || '') + ' ' + fix.san : '✓ Change: ' + (fix.ply_str || '') + ' ' + fix.ocr + ' → ' + fix.san;
     hideFixDetails();
+  } else if(isReview){
+    applyBtn.className = 'w-full mb-3 py-3 rounded-lg font-semibold bg-blue-700 hover:bg-blue-600 cursor-pointer';
+    // Show the algorithm's SAN exactly — including check/mate markers.
+    // Earlier code stripped trailing +/# to "match" the algorithm's panel
+    // log when the panel and the chess.js-derived button disagreed (panel
+    // "R1d7+ -> Rd7" vs button "R1d7+ -> Rd7+"). User wants the EXACT
+    // SAN preserved: if the algorithm says there's a check, the button
+    // shows the check, and the move applied carries the check too.
+    //
+    // Note: this line uses the CLICKED fix's san. In review mode, that
+    // fix comes from renderQuickFixes/mergeBacktrackFixes (python-chess
+    // SAN against the UI's board state) which can still disagree with
+    // the algorithm's stored SAN by +/#. The selectFix wrapper in
+    // verification-ui.js rewrites this button text with the algorithm's
+    // exact SAN when the clicked fix matches the algorithm's pick.
+    applyBtn.textContent = fix.keep_as_is
+      ? '✓ Confirm Keep: ' + (fix.ply_str || '') + ' ' + fix.san
+      : '✓ Confirm: ' + (fix.ply_str || '') + ' ' + fix.ocr + ' → ' + (fix.san || '');
+    showFixDetails(fix);
   } else {
     applyBtn.className = 'w-full mb-3 py-3 rounded-lg font-semibold bg-green-600 hover:bg-green-500 cursor-pointer';
-    applyBtn.textContent = '✓ Apply: ' + (fix.ply_str || '') + ' ' + fix.ocr + ' → ' + fix.san;
+    applyBtn.textContent = fix.keep_as_is
+      ? '✓ Keep: ' + (fix.ply_str || '') + ' ' + fix.san
+      : '✓ Apply: ' + (fix.ply_str || '') + ' ' + fix.ocr + ' → ' + fix.san;
     showFixDetails(fix);
   }
 }
@@ -419,59 +612,68 @@ function showFixDetails(fix){
   var content = document.getElementById('fix-details-content');
   if(!panel || !content) return;
 
-  // Compact one-liner: 8.W Nd2→Nfd2 | sim=98% ocr=4% abs=1 | +4 moves →3.B | score=99
+  // --- Summary line: 8.W Nd2→Nfd2 | sim=98% ocr=4% abs=1 | Reach:3.B | score=99
   var charSim = typeof fix.char_sim === 'number' ? fix.char_sim : (fix.similarity ? fix.similarity / 100 : 0);
   var ocrConf = fix.ocr_conf || 0;
-  // Normalize ocrConf: if it looks like a decimal (< 1), convert to percentage
   if(ocrConf > 0 && ocrConf < 1) ocrConf = Math.round(ocrConf * 100);
   else ocrConf = Math.round(ocrConf);
   var reachImp = fix.reach_improvement || 0;
   var absurd = fix.absurdity_count || 0;
   var score = fix.unified_score;
 
-  // Build the line
   var html = '<div class="flex items-center gap-2 text-xs font-mono flex-wrap">';
 
-  // Transformation: 8.W Nd2→Nfd2
   if(fix.ply_str){
     html += '<span class="text-gray-400">' + fix.ply_str + '</span>';
   }
-  html += '<span><span class="' + ocrColorClass(fix) + '">' + (fix.ocr || '?') + '</span>→<span class="text-green-400">' + (fix.san || '?') + '</span></span>';
+  html += '<span><span class="' + ocrColorClass(fix) + '">' + (fix.ocr || '?') + '</span>\u2192<span class="text-green-400">' + (fix.san || '?') + '</span></span>';
   html += '<span class="text-gray-600">|</span>';
 
-  // Similarity
   var simPct = Math.round(charSim * 100);
   var simColor = simPct >= 80 ? 'text-green-400' : simPct >= 50 ? 'text-yellow-400' : 'text-gray-400';
-  html += '<span class="' + simColor + '">sim=' + simPct + '%</span>';
+  var simText = 'sim=' + simPct + '%';
+  if (fix.sim_source && fix.sim_source !== fix.ocr) {
+    simText += ' (vs ' + fix.sim_source + ')';
+  }
+  html += '<span class="' + simColor + '">' + simText + '</span>';
 
-  // OCR alt confidence
   if(ocrConf > 0){
     html += ' <span class="text-purple-400">ocr=' + ocrConf + '%</span>';
   }
-
-  // Absurdities
   if(absurd > 0){
     html += ' <span class="text-yellow-400">abs=' + absurd + '</span>';
   }
-
-  // Hanging piece warning
   if(fix.is_hanging){
     html += ' <span class="text-red-400">hanging!</span>';
   }
 
-  // Reach info: Reach:13.W or ✓complete
   var reachStr = reachLabel(fix);
   if(reachStr){
     var reachColor = fix.completes ? 'text-green-400' : (reachImp > 5 ? 'text-green-400' : 'text-blue-400');
     html += '<span class="text-gray-600">|</span><span class="' + reachColor + '">' + reachStr + '</span>';
   }
 
-  // Score
   if(typeof score === 'number'){
     html += '<span class="text-gray-600">|</span><span class="text-white font-semibold">score=' + Math.round(score) + '</span>';
   }
-
   html += '</div>';
+
+  // --- Color-coded component breakdown (hover each pill for description).
+  // Every scored fix (Deep Search, Phase 3, piece-confusion) now carries
+  // score_components. The summary row above still renders for Quick Fix
+  // OCR alts and manual legal-move picks, which have no scoring breakdown
+  // by design — we just don't append a component row for those.
+  if (fix.score_components) {
+    var pills = [];
+    Object.keys(fix.score_components).forEach(function(k) {
+      var pill = renderScoreComponentPill(k, fix.score_components[k]);
+      if (pill) pills.push(pill);
+    });
+    if (pills.length) {
+      html += '<div class="mt-1.5 pt-1.5 border-t border-gray-600/60 flex flex-wrap gap-1 text-[10px] font-mono">' +
+              pills.join('') + '</div>';
+    }
+  }
 
   content.innerHTML = html;
   panel.classList.remove('hidden');
@@ -526,6 +728,11 @@ function applyMissingMoveFix(){
 
   log('✓ Inserted missing move: ' + mc.inserted_move + ' at ply ' + insertPly);
 
+  // Same rationale as applyFix: inserting a missing move means validation
+  // has progressed past the noise tail; clear the flag so exitEditMode and
+  // the snapshot don't keep the yellow panel alive.
+  state.pendingNoiseReview = false;
+
   if(state.ocrCells && state.ocrCells.length > 0 && typeof insertSingleMove === 'function'){
     // Use metadata-preserving insert (handles ocrCells + tracking arrays)
     insertSingleMove(insertPly, mc.inserted_move);
@@ -577,7 +784,11 @@ function applyFix(){
   }
 
   var fix = state.selectedFix;
-  var isEdit = fix.isEditMode || state.editMode;
+  // Same rationale as selectFix: trust the live state.editMode, not the
+  // potentially stale fix.isEditMode flag. Otherwise an old edit-mode fix
+  // object that survived in state.selectedFix could push applyFix down the
+  // edit path even after the user exited edit mode.
+  var isEdit = !!state.editMode;
 
   // If in edit mode and selecting same move, just exit
   if(isEdit && (fix.san === fix.ocr || fix.similarity === 100)){
@@ -608,6 +819,30 @@ function applyFix(){
     fixPly = (fixNum - 1) * 2 + (fixColor === 'w' ? 0 : 1);
   }
   var isKeepAsIs = fix.keep_as_is;
+
+  // Strict-disambig guard for keep-as-is — refuse to lock a SAN that
+  // can't be played AS WRITTEN at this position. chess.js silently
+  // resolves wrong file/rank disambiguators (e.g. "Red8" with no e-rook
+  // plays as Rad8); locking such a SAN would leave the movelist showing
+  // "Red8 ✓" while the board navigates to Rad8 — a movelist/board
+  // divergence reported as "terrible". _strictMove (navigation.js)
+  // validates the disambiguator against the resolved move's from-square.
+  // Lives here (not earlier in selectFix) so the user sees the warning
+  // only when they commit, mirroring how illegality surfaces elsewhere.
+  if (isKeepAsIs && typeof Chess === 'function' && typeof _strictMove === 'function') {
+    var _kChess = new Chess();
+    var _kSansOk = true;
+    for (var _ki = 0; _ki < fixPly; _ki++) {
+      if (!_kChess.move(state.sans[_ki])) { _kSansOk = false; break; }
+    }
+    if (_kSansOk && !_strictMove(_kChess, fix.san)) {
+      log('⚠ Cannot Keep "' + fix.san + '" at ' + fixNum + '.' + fixColor.toUpperCase() +
+          ' — not playable as written (illegal or wrong disambiguator). ' +
+          'Pick a fix from the suggestions instead.');
+      return;
+    }
+  }
+
   log((isKeepAsIs ? 'Locked' : 'Applied fix') + ' at ' + fixNum + '.' + fixColor.toUpperCase() + ': ' + (fix.ocr || '?') + ' -> ' + fix.san);
 
   // Show flash notification with num_changes (user-chosen fix, not auto)
@@ -662,6 +897,30 @@ function applyFix(){
     document.getElementById('fix-panel-title').textContent = 'Fix Suggestions';
   }
   state.pendingConfirmation = null;
+  // Clear the selected fix too. Without this, state.selectedFix keeps the
+  // fix object with isEditMode=true, and any subsequent render that re-runs
+  // selectFix (e.g. entering Greedy review paints the Confirm button via
+  // selectFix → line 496-510) sees isEdit truthy and repaints the button in
+  // the orange edit-mode colour instead of the blue review-mode colour.
+  // User-reported: after editing a move, the Confirm button stayed orange
+  // even after entering Greedy review.
+  state.selectedFix = null;
+
+  // Successfully applying a chess fix means validation has run past the
+  // noise tail — the yellow noise-review panel is no longer relevant.
+  // Without clearing the flag here, exitEditMode below would re-paint the
+  // panel (fixes.js:1241) and the next snapshot would persist
+  // pendingNoiseReview=true, so re-entering the game keeps re-rendering
+  // the panel and skips auto-verify (batch-game-list.js:1015).
+  state.pendingNoiseReview = false;
+
+  // Clear the button's stale text/color now that no fix is selected.
+  // revalidate() below either finds a new stuck point (fetchFixes paints
+  // the button from scratch) or reports "Game complete!" (no stuck point,
+  // so nothing repaints) — without this reset, "Game complete!" would
+  // appear next to an orange "Change: X → Y" button from the just-applied
+  // edit.
+  resetApplyButton();
 
   // UNDO QUICK FIXES AFTER THIS PLY
   // Quick fixes applied after fixPly were based on the OLD (wrong) position.
@@ -698,6 +957,19 @@ function applyFix(){
   }
 
   revalidate();
+
+  // In batch mode, the side-panel Greedy/Beam/Dijkstra results were computed
+  // against the PRE-fix OCR. Ask the orchestrator to re-queue this game so
+  // the panels reflect the corrected input. This aborts in-flight work on
+  // Beam/Dijkstra and restarts Greedy from confirmedPly; escalation follows
+  // normally if Greedy fails again.
+  if (window.BatchGameList && window.BatchGameList.batchState &&
+      window.BatchGameList.batchState.active &&
+      typeof window.BatchGameList.requeueAfterFix === 'function') {
+    try { window.BatchGameList.requeueAfterFix(); } catch (e) {
+      console.warn('[Batch] requeueAfterFix call failed:', e);
+    }
+  }
 }
 
 // =============================================================================
@@ -757,6 +1029,25 @@ function enterEditMode(num, color){
   state.editMode = {num: num, color: color, currentMove: currentMove, ply: ply};
   log('✏️ Edit mode: ' + num + '.' + color.toUpperCase() + ' ' + currentMove);
 
+  // CLEAR stale state from the prior stuck flow. Without this, the Apply
+  // button and "All legal moves" panel can still show the previous stuck
+  // fix (e.g., "Change: 35.B Rxd7 → a5") even though we just entered edit
+  // mode for a different ply (e.g., 35.W). renderEditModeMoves will
+  // repopulate Apply-button state via selectFix(keepFix) once it finishes
+  // its async work.
+  state.selectedFix = null;
+  state.fixArrow = null;
+  state.ocrArrow = null;
+  state.errorArrow = null;
+  state.savedErrorArrow = null;
+  var applyBtnEdit = document.getElementById('btn-apply');
+  if (applyBtnEdit) {
+    applyBtnEdit.disabled = true;
+    applyBtnEdit.className = 'w-full mb-3 py-3 rounded-lg font-semibold bg-gray-700 text-gray-400 cursor-not-allowed';
+    applyBtnEdit.textContent = 'Select a move';
+  }
+  hideFixDetails();
+
   // Update panel title with cancel button
   document.getElementById('fix-panel-title').innerHTML =
     '<span class="text-blue-400">✏️ Editing ' + num + '.' + color.toUpperCase() + '</span> ' +
@@ -775,6 +1066,11 @@ function enterEditMode(num, color){
 
   // Navigate to this position
   goToPly(ply);
+
+  // Refresh the "All legal moves" panel (labelled with edit target, not the
+  // old stuck ply). state.stuckInfo stays pointed at the prior stuck state
+  // so exitEditMode can restore it — we override the label via editMode.
+  _refreshLegalMovesForEditMode(num, color, ply);
 
   // Render moves with current sort mode
   renderEditModeMoves(num, color, currentMove, ply);
@@ -813,6 +1109,18 @@ async function renderEditModeMoves(num, color, currentMove, ply){
   }
   var legalMoves = chess.moves();
 
+  // Verbose legal moves give us from/to per SAN so the green fix-arrow on
+  // the board updates as the user clicks through edit-mode candidates,
+  // matching the behavior of the normal fix-suggestion list. Without this
+  // the fix objects below have no from_square/to_square and selectFix
+  // clears state.fixArrow — so the board sat with no arrow during edits.
+  var legalVerbose = chess.moves({ verbose: true });
+  var sanToFromTo = {};
+  legalVerbose.forEach(function(mv) {
+    if (mv && mv.san) sanToFromTo[mv.san] = { from: mv.from, to: mv.to };
+  });
+  var ocrSquares = sanToFromTo[currentMove] || null;
+
   // Check if current move is legal
   var currentIsLegal = legalMoves.indexOf(currentMove) !== -1;
 
@@ -842,6 +1150,16 @@ async function renderEditModeMoves(num, color, currentMove, ply){
       '<span class="text-green-300">(keep original)</span></span></div>';
     keepBtn.title = 'Keep the current move unchanged';
     var keepFix = {san: currentMove, ocr: currentMove, similarity: 100, ply_str: num + '.' + color.toUpperCase(), ply: ply, isEditMode: true};
+    if (ocrSquares) {
+      keepFix.from_square = ocrSquares.from;
+      keepFix.to_square = ocrSquares.to;
+      // Same square pair on the OCR arrow so the user sees one arrow
+      // (overlapping yellow + green) for "keep" — distinct from the
+      // change-to candidates which draw separate yellow (OCR) and green
+      // (target) arrows.
+      keepFix.ocr_from_square = ocrSquares.from;
+      keepFix.ocr_to_square = ocrSquares.to;
+    }
     keepBtn.onclick = function(){ selectFix(keepFix, keepBtn); };
     keepBtn.ondblclick = function(){ selectFix(keepFix, keepBtn); applyFix(); };
     container.appendChild(keepBtn);
@@ -876,6 +1194,15 @@ async function renderEditModeMoves(num, color, currentMove, ply){
       simLabel + '</div>';
 
     var fix = {san: item.san, ocr: currentMove, similarity: item.sim || 0, ply_str: num + '.' + color.toUpperCase(), ply: ply, isEditMode: true};
+    var candSquares = sanToFromTo[item.san];
+    if (candSquares) {
+      fix.from_square = candSquares.from;
+      fix.to_square = candSquares.to;
+    }
+    if (ocrSquares) {
+      fix.ocr_from_square = ocrSquares.from;
+      fix.ocr_to_square = ocrSquares.to;
+    }
     btn.onclick = function(){ selectFix(fix, btn); };
     btn.ondblclick = function(){ selectFix(fix, btn); applyFix(); };
     container.appendChild(btn);
@@ -986,6 +1313,48 @@ async function renderEditModeMoves(num, color, currentMove, ply){
   document.getElementById('legal-count').textContent = legalMoves.length;
 }
 
+// Paint the "All legal moves at X" panel for the current edit target. Without
+// this, the panel keeps the stuck-ply's label and move list (e.g., "35.B"
+// with black's legal moves) even after we enter edit mode for a different
+// ply. Structure mirrors renderLegalMoves but drives from edit context
+// instead of state.stuckInfo.
+function _refreshLegalMovesForEditMode(num, color, ply){
+  if(!chess) return;
+  var lc = document.getElementById('legal-moves');
+  var posEl = document.getElementById('legal-position');
+  var cntEl = document.getElementById('legal-count');
+  if(!lc || !posEl || !cntEl) return;
+
+  chess.reset();
+  for(var j = 0; j < ply; j++){
+    try{ chess.move(state.sans[j]); } catch(e){ break; }
+  }
+  var legalAtEdit = chess.moves();
+
+  var lbl = num + '.' + color.toUpperCase();
+  posEl.textContent = 'at ' + lbl + ' ';
+  cntEl.textContent = legalAtEdit.length;
+
+  lc.innerHTML = '';
+  legalAtEdit.forEach(function(m){
+    var btn = document.createElement('button');
+    btn.className = 'px-1.5 py-0.5 bg-gray-600 hover:bg-gray-500 rounded text-xs';
+    btn.textContent = m;
+    btn.onclick = function(){
+      var fixObj = {
+        ocr: state.editMode ? state.editMode.currentMove : '',
+        san: m,
+        similarity: 0,
+        ply_str: lbl,
+        ply: ply,
+        isEditMode: true
+      };
+      selectFix(fixObj, btn);
+    };
+    lc.appendChild(btn);
+  });
+}
+
 function exitEditMode(){
   if(!state.editMode) return;
   log('✏️ Exited edit mode');
@@ -995,10 +1364,41 @@ function exitEditMode(){
   state.ocrArrow = null;
   clearBoardSelection();
 
+  // Wipe the orange edit-mode styling so it doesn't linger. The next
+  // selectFix() call will paint the correct color for whatever mode the
+  // user ends up in (interactive green, review blue, etc.).
+  resetApplyButton();
+
+  // Rebuild the "All legal moves" panel from the stuck state (it was
+  // temporarily overridden for the edit target).
+  if (typeof renderLegalMoves === 'function') {
+    try { renderLegalMoves(); } catch (e) { /* non-fatal */ }
+  }
+
   // Restore panel title
   document.getElementById('fix-panel-title').textContent = 'Fix Suggestions';
 
-  // If in noise review mode, restore the noise review UI
+  // If in noise review mode, restore the noise review UI — but only when
+  // no chess fixes have been applied yet. If state.moves has any 'fixed' or
+  // 'locked' status, the user is past the noise stage; re-painting the
+  // yellow panel here is what makes it "come back" after the user has
+  // already worked through the game. Clear the stale flag too so the next
+  // snapshot doesn't persist it. See applyFix / applyMissingMoveFix /
+  // truncateTrailingNoise for the other clear sites.
+  var _userHasFixes = false;
+  if (state.moves) {
+    for (var _i = 0; _i < state.moves.length; _i++) {
+      var _m = state.moves[_i];
+      if (_m.wStatus === 'fixed' || _m.wStatus === 'locked' ||
+          _m.bStatus === 'fixed' || _m.bStatus === 'locked') {
+        _userHasFixes = true;
+        break;
+      }
+    }
+  }
+  if (state.pendingNoiseReview && _userHasFixes) {
+    state.pendingNoiseReview = false;
+  }
   if(state.pendingNoiseReview){
     document.getElementById('stuck-info').innerHTML =
       '<div class="text-yellow-400">⚠️ Potential OCR noise at end</div>' +
@@ -1014,6 +1414,23 @@ function exitEditMode(){
       document.getElementById('stuck-info').innerHTML = '<span class="text-blue-300">🔍 Validating...</span>';
       document.getElementById('fix-list').innerHTML = '<div class="text-gray-400 text-sm p-4 text-center">Checking moves...</div>';
       revalidate();
+      // Mirror ocr.js's original Continue-to-Validation handler: in batch
+      // mode, mark the game's noise as resolved so the auto-VERIFY guard
+      // in _saveGameWorkingState can pass. Without this, a game where the
+      // user navigated back from editing (which re-renders the noise UI
+      // through this fixes.js copy of the panel) and then committed the
+      // truncation here stayed IN_REVIEW / NEEDS_REVIEW forever —
+      // game.hasTrailingNoise never flipped to false. Reported: B9
+      // oscillating between 🔍 and 🟡 after walking the game through to
+      // "🎉 Game complete! 80 moves".
+      if (window.BatchGameList && window.BatchGameList.batchState &&
+          window.BatchGameList.batchState.active &&
+          typeof window.BatchGameList.onTruncationComplete === 'function') {
+        try {
+          window.BatchGameList.onTruncationComplete(
+            window.BatchGameList.batchState.currentGameId);
+        } catch (e) { /* non-fatal */ }
+      }
     };
     renderArrows();
     return;
@@ -1031,52 +1448,6 @@ function exitEditMode(){
 }
 
 // =============================================================================
-// KEEP MOVE (OVERRIDE ABSURDITY WARNING)
-// =============================================================================
-
-function keepCurrentMove(){
-  // Called when user clicks "Keep it" for a bad trade or absurdity warning
-  // This tells the backend to accept this move despite the EAD warning
-  if(!state.stuckInfo || !state.stuckPly) return;
-
-  var ply = state.stuckPly;
-  var lbl = state.stuckInfo.num + '.' + state.stuckInfo.color.toUpperCase();
-  var move = state.stuckInfo.move;
-
-  // Add this ply to approved plies
-  if(!state.approvedPlies) state.approvedPlies = [];
-  if(state.approvedPlies.indexOf(ply) === -1){
-    state.approvedPlies.push(ply);
-  }
-
-  // Mark the move as "locked" (user confirmed — sacred, never search again)
-  for(var i = 0; i < state.moves.length; i++){
-    if(state.moves[i].num === state.stuckInfo.num){
-      if(state.stuckInfo.color === 'w'){
-        state.moves[i].wStatus = 'locked';
-      } else {
-        state.moves[i].bStatus = 'locked';
-      }
-      break;
-    }
-  }
-
-  log('🔒 Locked move: ' + lbl + ' ' + move + ' (approved despite warning — will never be searched again)');
-
-  // Update confirmed ply to advance past this move
-  state.confirmedPly = Math.max(state.confirmedPly, ply + 1);
-
-  // LOCKED: user confirmed move is correct — sacred, never search this ply again
-  if (!state.lockedPlies) state.lockedPlies = [];
-  if (state.lockedPlies.indexOf(ply) === -1) {
-    state.lockedPlies.push(ply);
-  }
-
-  // Revalidate - the backend will now skip EAD for this ply
-  revalidate();
-}
-
-// =============================================================================
 // QUICK FIXES - Instant OCR alternatives (before backtracking)
 // =============================================================================
 
@@ -1088,7 +1459,18 @@ function keepCurrentMove(){
 async function computeQuickFixes() {
   if (!state.stuckInfo || state.stuckPly === null) return [];
 
-  var ply = state.stuckPly;
+  // Target the red-arrow ply, not the focus ply. ocrColorClass uses
+  // `originStuckPly || stuckPly` to decide red vs yellow on the same
+  // convention; Quick Fixes follow suit so the alternatives offered are
+  // for the move that's actually broken (red arrow), not for the
+  // backtrack candidate the walkthrough is currently focused on. In
+  // interactive mode `originStuckPly` is null and this is just stuckPly.
+  // In Review with a backtrack-focused fix, `originStuckPly` points at
+  // the actual stuck (e.g., 4.B's bad-trade `e6`) while stuckPly points
+  // at the candidate ply Greedy proposed to fix it (e.g., 4.W's `e4`).
+  // Quick Fixes for 4.B = alternatives to the broken move, which is
+  // what the user is trying to choose between.
+  var ply = (typeof state.originStuckPly === 'number') ? state.originStuckPly : state.stuckPly;
   var moveNum = Math.floor(ply / 2);
   var isWhite = ply % 2 === 0;
   var moveEntry = state.moves[moveNum];
@@ -1100,7 +1482,7 @@ async function computeQuickFixes() {
   var topMove = isWhite ? moveEntry.white : moveEntry.black;
   var topConf = isWhite ? moveEntry.wConf : moveEntry.bConf;
 
-  // Build board position at stuck ply
+  // Build board position at the target ply.
   if (!chess) return [];
   chess.reset();
   for (var j = 0; j < ply; j++) {
@@ -1109,7 +1491,10 @@ async function computeQuickFixes() {
 
   var quickFixes = [];
   var seenMoves = new Set();
-  var lbl = state.stuckInfo.num + '.' + state.stuckInfo.color.toUpperCase();
+  // Label from the target ply, not state.stuckInfo (which reflects the
+  // focus ply in Review). Keeps the "[QUICK-FIX] 4.B …" log lines and
+  // ply_str on each fix consistent with the row Quick Fixes is operating on.
+  var lbl = (moveNum + 1) + '.' + (isWhite ? 'W' : 'B');
 
   // === Section 0: Try normalizing the illegal top move itself as lenient notation ===
   // If OCR decoded "e5xd4" or "Nf3-e5" etc., the top move IS the lenient candidate.
@@ -1190,8 +1575,33 @@ async function computeQuickFixes() {
         return;
       }
 
-      if (normalized === topMove || seenMoves.has(normalized)) {
-        console.log('[QUICK-FIX] Lenient: "' + rawMove + '" → "' + normalized + '" (already seen, skipped)');
+      if (normalized === topMove) {
+        // Lenient agrees with the OCR's top guess — nothing new to surface as a fix.
+        return;
+      }
+
+      if (seenMoves.has(normalized)) {
+        // Cross-sheet corroboration: another candidate already proposes this SAN.
+        // Typical case: black's strict OCR has "Bxe5" at 11%, and white's lenient
+        // "BxN" normalizes (against the current board) to the same "Bxe5". Without
+        // this branch the signal was silently dropped; now we add the lenient conf
+        // to the existing entry, mirroring how mergeAlternatives sums confidences
+        // when a move appears in both sheets' alts.
+        var existing = null;
+        for (var qi = 0; qi < quickFixes.length; qi++) {
+          if (quickFixes[qi].san === normalized) { existing = quickFixes[qi]; break; }
+        }
+        if (existing) {
+          var lenientPct = Math.round(conf * 100);
+          var prevConf = existing.ocr_conf;
+          existing.ocr_conf = Math.min(prevConf + lenientPct, 100);
+          existing.lenient_corroborated = true;
+          if (!existing.lenient_source_raw) existing.lenient_source_raw = rawMove;
+          console.log('[QUICK-FIX] Lenient: "' + rawMove + '" → "' + normalized +
+                      '" corroborates existing candidate (' + prevConf + '% + ' + lenientPct + '% → ' + existing.ocr_conf + '%)');
+        } else {
+          console.log('[QUICK-FIX] Lenient: "' + rawMove + '" → "' + normalized + '" (already seen, no entry to corroborate)');
+        }
         return;
       }
 
@@ -1476,27 +1886,9 @@ function _normalizeLenientJS(raw, chessInstance, legalMoves) {
   return null;
 }
 
-/**
- * Simple edit distance (Levenshtein) for safety check.
- */
-function _editDistance(a, b) {
-  if (!a) return b ? b.length : 0;
-  if (!b) return a.length;
-  var m = a.length, n = b.length;
-  var dp = [];
-  for (var i = 0; i <= m; i++) {
-    dp[i] = [i];
-    for (var j = 1; j <= n; j++) {
-      dp[i][j] = i === 0 ? j : 0;
-    }
-  }
-  for (var i = 1; i <= m; i++) {
-    for (var j = 1; j <= n; j++) {
-      dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1] : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
-    }
-  }
-  return dp[m][n];
-}
+// Shared edit-distance moved to utils.js (function `editDistance`).
+// Local alias kept for back-compat with existing call sites in this file.
+var _editDistance = editDistance;
 
 /**
  * Render quick fixes immediately when stuck.
@@ -1509,12 +1901,7 @@ function renderQuickFixes(quickFixes) {
   // Show "Keep it" button for bad trades, persistent absurdities, or piece hanging
   var reason = state.stuckInfo ? state.stuckInfo.reason : null;
   if (reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging') {
-    var keepBtn = document.createElement('button');
-    keepBtn.className = 'w-full text-left p-2 rounded-lg border bg-yellow-600/30 border-yellow-500 mb-2 hover:bg-yellow-500/40';
-    keepBtn.title = 'Accept this move despite the warning (may be an intentional sacrifice or gambit)';
-    keepBtn.innerHTML = '<span class="text-yellow-300 font-medium">✓ Keep ' + (state.stuckInfo ? state.stuckInfo.move : 'it') + '</span> <span class="text-yellow-400/70 text-xs">— accept as-is</span>';
-    keepBtn.onclick = function() { keepCurrentMove(); };
-    container.appendChild(keepBtn);
+    createKeepAsIsButton(container);
 
     var sep = document.createElement('div');
     sep.className = 'text-xs text-gray-500 mb-2';
@@ -1564,6 +1951,12 @@ function renderQuickFixes(quickFixes) {
         sanClass = 'text-purple-400';
         sourceTag = '';
       }
+      if (fix.lenient_corroborated) {
+        var lenientHint = fix.lenient_source_raw
+          ? ' (lenient: ' + fix.lenient_source_raw + ')'
+          : '';
+        sourceTag += '<span class="text-amber-500 text-[10px] ml-1" title="Also matched by lenient notation from the other sheet' + lenientHint + '">↔ both</span>';
+      }
 
       btn.className = 'w-full text-left p-2.5 rounded-lg border ' + bgClass + ' ' + borderClass;
       btn.title = (fix.source || 'OCR alternative') + ' • Click to select • Double-click to apply';
@@ -1609,7 +2002,13 @@ function renderQuickFixes(quickFixes) {
     var btn = document.createElement('button');
     btn.className = 'w-full text-left p-2.5 rounded-lg border bg-yellow-600/30 border-yellow-500 mb-3';
     btn.title = 'Click to select • Double-click to apply';
-    btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm"><span class="text-gray-400">' + pcPlyStr + '</span> <span class="text-red-400">' + pc.original + '</span> → <span class="text-yellow-300 font-semibold">' + pc.suggested + '</span></span><span class="text-yellow-400 text-xs">' + reasonStr + '</span></div><div class="text-xs text-yellow-600 mt-1">Requires confirmation - click to accept</div>';
+    var pcAbsurdTag = pc.absurd_warning
+      ? ' <span class="text-red-400" title="' + pc.absurd_warning.replace(/"/g, '&quot;') + '">⚠️</span>'
+      : '';
+    var pcAbsurdLine = pc.absurd_warning
+      ? '<div class="text-xs text-red-400 mt-1">' + pc.absurd_warning + '</div>'
+      : '';
+    btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm"><span class="text-gray-400">' + pcPlyStr + '</span> <span class="text-red-400">' + pc.original + '</span> → <span class="text-yellow-300 font-semibold">' + pc.suggested + '</span>' + pcAbsurdTag + '</span><span class="text-yellow-400 text-xs">' + reasonStr + '</span></div>' + pcAbsurdLine + '<div class="text-xs text-yellow-600 mt-1">Requires confirmation - click to accept</div>';
     // Compute arrow squares for pending confirmation
     var pcFrom = null, pcTo = null;
     try {

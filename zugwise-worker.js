@@ -110,6 +110,10 @@ onmessage = async function(e) {
                 result = await getSimilarity(data.text1, data.text2);
                 break;
 
+            case 'similarity-batch':
+                result = await getSimilarityBatch(data.ocrText, data.candidates);
+                break;
+
             // Streaming backtrack search
             case 'backtrack-create':
                 result = await createBacktrackState(data.moves, data.stuckAt, data.ocrMoves, data.minPly, data.fixedPlies, data.phase2Depth, data.lockedPlies, data.stuckReason);
@@ -600,16 +604,43 @@ else:
                             )
                             print(f"[DUAL SEARCH] Secondary search found {len(_fixes_2)} fixes")
 
-                            _seen = set()
-                            _merged = []
+                            # Tag each fix with its source before merging so the
+                            # downstream debug dump can show which search produced it.
+                            for _pf in fixes_result:
+                                _pf.setdefault('_source', 'primary')
+                            for _sf in _fixes_2:
+                                _sf.setdefault('_source', 'secondary')
+
+                            # Score-based dedup: on (ply, san) collision, keep the
+                            # version with the higher unified_score. The old
+                            # primary-wins policy silently dropped secondary fixes
+                            # even when they scored better (e.g. secondary's
+                            # Rxd7->Rxc7 at sim=93% losing to primary's
+                            # Rfc1->Rxc7 at sim=89% on the same SAN). Score wins now.
+                            _primary_keys = set((f.get('ply', -1), f.get('san', '')) for f in fixes_result)
+                            _best_by_key = {}
                             for _fix in fixes_result + _fixes_2:
                                 _key = (_fix.get('ply', -1), _fix.get('san', ''))
-                                if _key not in _seen:
-                                    _seen.add(_key)
-                                    _merged.append(_fix)
+                                _existing = _best_by_key.get(_key)
+                                if _existing is None or _fix.get('unified_score', 0) > _existing.get('unified_score', 0):
+                                    _best_by_key[_key] = _fix
+                            _merged = list(_best_by_key.values())
                             _merged.sort(key=lambda x: -x.get('unified_score', 0))
                             fixes_result = _merged
-                            print(f"[DUAL SEARCH] Merged: {len(fixes_result)} unique fixes")
+                            print(f"[DUAL SEARCH] Merged: {len(fixes_result)} unique fixes "
+                                  f"(primary_keys={len(_primary_keys)}, secondary_unique={len(fixes_result) - len(_primary_keys)})")
+                            # Full dump of the merged list so the user can see what
+                            # actually survived the sort and what got cut at [:20].
+                            print(f"[DUAL SEARCH] === Final merged fixes (showing all {len(fixes_result)}, top 20 returned to UI) ===")
+                            for _i, _f in enumerate(fixes_result):
+                                _marker = '  ' if _i < 20 else 'X '  # X = cut by [:20]
+                                _src = _f.get('_source', '?')
+                                _p = _f.get('ply_str') or ply_to_str(_f.get('ply', -1))
+                                _o = _f.get('ocr', '')
+                                _s = _f.get('san', '')
+                                _sc = _f.get('unified_score', 0)
+                                _sim = _f.get('similarity', 0)
+                                print(f"[DUAL] {_marker}[{_i+1:>2}] {_p:>5}  {_o:>8} -> {_s:<8}  score={_sc:>5}  sim={_sim:>3}%  src={_src}")
                         except Exception as _e2:
                             print(f"[DUAL SEARCH] Secondary search error: {_e2}")
 
@@ -797,6 +828,24 @@ _result
     return JSON.parse(result);
 }
 
+// Batch version — score many candidates against one OCR text in a single
+// Pyodide round-trip. Edit mode calls this once for all 30+ legal moves at
+// the edit ply instead of 30+ individual getSimilarity calls (which were
+// causing a multi-second 'Loading...' freeze).
+async function getSimilarityBatch(ocrText, candidates) {
+    const ocrJson = JSON.stringify(String(ocrText || ''));
+    const candJson = JSON.stringify((candidates || []).map(String));
+
+    const result = await pyodide.runPythonAsync(`
+import json
+_ocr = json.loads('${ocrJson.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')
+_cands = json.loads('${candJson.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')
+_scores = [move_similarity(_ocr, c) for c in _cands]
+json.dumps({'similarities': _scores})
+    `);
+    return JSON.parse(result);
+}
+
 // =============================================================================
 // ABSURDITY CHECK FOR QUICK FIXES
 // =============================================================================
@@ -835,9 +884,12 @@ for _cand in _candidates:
     _san = _cand['san']
     try:
         # Check 1: Does this move leave OUR piece hanging?
+        # fast_mode=False so quiescence accounts for defender recapture
+        # (a rook attacked by a knight but defended by king nets only +2
+        # for opponent, not the full rook value).
         _test_moves = list(_moves[:_ply]) + [_san]
-        _abs = detect_absurdity_at_ply(_test_moves, _ply, verbose=False, fast_mode=True)
-        if _abs and _abs.severity >= 3:
+        _abs = detect_absurdity_at_ply(_test_moves, _ply, verbose=False, fast_mode=False)
+        if _abs and _abs.severity >= 2:
             _results.append({'ply': _ply, 'san': _san, 'is_absurd': True, 'reason': _abs.details})
             continue
 
@@ -1361,23 +1413,59 @@ import chess
 _primary = json.loads('''${primaryJson}''')
 _secondary = _dual_verified_${stateId} if '_dual_verified_${stateId}' in dir() else []
 
-# Merge: deduplicate by (ply, san), keep first occurrence (primary wins)
-_seen = set()
-_merged = []
+# Tag source on each fix for the debug dump.
+for _pf in _primary:
+    _pf.setdefault('_source', 'primary')
+for _sf in _secondary:
+    _sf.setdefault('_source', 'secondary')
+
+# Score-based dedup: on (ply, san) collision, keep the version with the higher
+# unified_score. The old primary-wins policy silently dropped secondary fixes
+# that actually scored better (e.g. Rxd7->Rxc7 sim=93% was losing to
+# Rfc1->Rxc7 sim=89% on the same SAN). Higher score wins now.
+_best_by_key = {}
 for _fix in _primary + _secondary:
     _key = (_fix.get('ply', -1), _fix.get('san', ''))
-    if _key not in _seen:
-        _seen.add(_key)
-        _merged.append(_fix)
+    _existing = _best_by_key.get(_key)
+    if _existing is None or _fix.get('unified_score', 0) > _existing.get('unified_score', 0):
+        _best_by_key[_key] = _fix
+_merged = list(_best_by_key.values())
 _merged.sort(key=lambda x: -x.get('unified_score', 0))
 print(f"[DUAL SEARCH] Merged: {len(_merged)} unique fixes (primary={len(_primary)}, secondary={len(_secondary)})")
 
-# Add arrow data to new secondary fixes only (primary already has arrows)
-_primary_keys = set((f.get('ply', -1), f.get('san', '')) for f in _primary)
+# Dump the OCRMove at stuck_ply so we can verify the worker's candidate
+# ordering matches what merge-sheets.js should have produced. If primary
+# ordering ever looks inverted (e.g. low-conf before high-conf), this log
+# is the diagnostic.
+_dbg_ocr = _ocr_lookup_${stateId}.get(_stuck_at_${stateId}) if '_ocr_lookup_${stateId}' in dir() else None
+if _dbg_ocr is not None:
+    print(f"[DUAL SEARCH] OCRMove at {ply_to_str(_stuck_at_${stateId})}: "
+          f"{len(_dbg_ocr.candidates)} candidates in worker order:")
+    for _ci, (_cm, _cc) in enumerate(_dbg_ocr.candidates):
+        print(f"[DUAL]   cand[{_ci}] = '{_cm}' @ {_cc:.0%}")
+
+# Full dump of the merged list. Marker X = cut by the [:20] slice returned
+# to the UI. src tells you which search produced the fix.
+print(f"[DUAL SEARCH] === Final merged fixes (showing all {len(_merged)}, top 20 returned to UI) ===")
+for _i, _f in enumerate(_merged):
+    _marker = '  ' if _i < 20 else 'X '
+    _src = _f.get('_source', '?')
+    _p = _f.get('ply_str') or ply_to_str(_f.get('ply', -1))
+    _o = _f.get('ocr', '')
+    _s = _f.get('san', '')
+    _sc = _f.get('unified_score', 0)
+    _sim = _f.get('similarity', 0)
+    print(f"[DUAL] {_marker}[{_i+1:>2}] {_p:>5}  {_o:>8} -> {_s:<8}  score={_sc:>5}  sim={_sim:>3}%  src={_src}")
+
+# Compute arrow data for any fix that doesn't already have it. Primary fixes
+# come through with from_square/to_square set by the earlier finalize step;
+# secondary fixes don't. With score-based dedup, a secondary fix can now
+# occupy a slot whose (ply, san) also existed in primary — but the fix
+# object itself is the secondary one without arrows. Gate on the actual
+# presence of from_square in the fix dict, not on (ply, san) key membership.
 for fix in _merged:
-    _key = (fix.get('ply', -1), fix.get('san', ''))
-    if _key in _primary_keys:
-        continue  # Already has arrow data from primary finalization
+    if fix.get('from_square') is not None and fix.get('to_square') is not None:
+        continue  # Already has arrow data
 
     if 'ply_str' not in fix and 'ply' in fix:
         fix['ply_str'] = ply_to_str(fix['ply'])

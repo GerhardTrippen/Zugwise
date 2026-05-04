@@ -167,6 +167,14 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
+        name: "Mississauga Chess Club 40-Move Carbon Copy Old (1 page)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
         name: "Mississauga Chess Club 60-Move Carbon Copy (1 page)",
         builtin: true,
         pages: [

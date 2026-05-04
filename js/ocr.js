@@ -63,8 +63,9 @@ async function handleFiles(files){
   // Otherwise, validate now
   if(!state.pendingNoiseReview){
     await validateAndDisplay(paired, filename);
-    // Launch background search workers after validation (if stuck)
-    launchBackgroundSearches(paired);
+    // Launch background search workers after validation (if stuck).
+    // Use state.moves (not paired) so searches see auto-corrected SANs.
+    launchBackgroundSearches();
   }
   // If pendingNoiseReview is true, validation will be triggered by "Continue" button
 }
@@ -125,6 +126,10 @@ async function handleReOCR() {
 }
 
 function showOcrResults(paired, filename){
+  // Clear the tournament/pairing header — batch mode re-renders it right
+  // after this call, so single-game uploads simply leave it hidden.
+  if (typeof window.clearGameHeader === 'function') window.clearGameHeader();
+
   // Reset state for new game
   state.moves = [];
   state.sans = [];
@@ -139,6 +144,9 @@ function showOcrResults(paired, filename){
   } else {
     state.lockedPlies = [];
   }
+  // SearchManager.lockedPlies persists on the singleton across games, so
+  // drop any plies locked during a prior game before launching fresh searches.
+  if (window.searchManager) window.searchManager.lockedPlies.clear();
   state.pendingNoiseReview = false;
   state.noiseCleanupDone = false;  // Reset so detection runs on new game
 
@@ -153,7 +161,9 @@ function showOcrResults(paired, filename){
       wConf: m.wConf || 0.9,
       bConf: m.bConf || 0.9,
       wAlts: m.wAlts || [],
-      bAlts: m.bAlts || []
+      bAlts: m.bAlts || [],
+      wLenientAlts: m.wLenientAlts || [],
+      bLenientAlts: m.bLenientAlts || []
     });
     if(m.white) state.sans.push(m.white);
     if(m.black) state.sans.push(m.black);
@@ -169,6 +179,23 @@ function showOcrResults(paired, filename){
   if (reocrBtn) reocrBtn.classList.toggle('hidden', !state.ocrOriginalFiles || state.ocrOriginalFiles.length === 0);
   resetApplyButton();
 
+  // Diagnostic: dump the last 12 ply confidences so a regression in the
+  // noise detectors (or confidence-inflation from merge-sheets topMove
+  // promotion) is visible in logs.
+  try {
+    var _tailN = 12;
+    var _tailMoves = [];
+    state.moves.forEach(function(m){
+      if(m.white) _tailMoves.push({ply: (m.num - 1) * 2,     san: m.white, conf: m.wConf || 0.9});
+      if(m.black) _tailMoves.push({ply: (m.num - 1) * 2 + 1, san: m.black, conf: m.bConf || 0.9});
+    });
+    var _tailSlice = _tailMoves.slice(Math.max(0, _tailMoves.length - _tailN));
+    var _tailStr = _tailSlice.map(function(t){
+      return (Math.floor(t.ply/2)+1) + '.' + (t.ply%2===0?'W':'B') + ' ' + t.san + '@' + Math.round(t.conf*100) + '%';
+    }).join(' | ');
+    log('🔎 Tail (last ' + _tailSlice.length + '): ' + _tailStr);
+  } catch(e) { /* non-fatal */ }
+
   // Auto-truncate very obvious garbage tail (all below 25% confidence)
   if(typeof autoTruncateObviousTail === 'function'){
     var autoTrunc = autoTruncateObviousTail();
@@ -177,13 +204,80 @@ function showOcrResults(paired, filename){
     }
   }
 
-  // Check for suspicious tail BEFORE validation
-  var suspiciousTailStart = detectSuspiciousTail();
-  if(suspiciousTailStart === null) suspiciousTailStart = detectTrailingNoise();
+  // Check for suspicious tail BEFORE validation. Three detectors in order:
+  //   1. detectSuspiciousTail — confidence-based, handles the common case
+  //      where the scoresheet's final rows are smudged / blank / scribbled
+  //      and OCR returns low-confidence reads.
+  //   2. detectRepeatingTail — catches the case where OCR reads a scribble /
+  //      signature as a simple SAN over and over (c4 c4 c4 c4 …); each
+  //      instance scores high confidence individually, but the repetition
+  //      itself is the signal. This one's important because writers often
+  //      fill the last few rows with their signature or scribbles that
+  //      the BiLSTM happens to land on as a valid-looking pawn move.
+  //   3. detectTrailingNoise — last-resort check on just the final 1-2
+  //      plies, for when neither scan fired.
+  var _suspFromTail = detectSuspiciousTail();
+  var _suspFromRepeat = (_suspFromTail === null) ? detectRepeatingTail() : null;
+  var _suspFromTrailing = (_suspFromTail === null && _suspFromRepeat === null) ? detectTrailingNoise() : null;
+  log('🔎 Noise detectors: suspiciousTail=' + _suspFromTail +
+      ' repeatingTail=' + _suspFromRepeat +
+      ' trailingNoise=' + _suspFromTrailing);
+  var suspiciousTailStart = _suspFromTail;
+  if(suspiciousTailStart === null) suspiciousTailStart = _suspFromRepeat;
+  if(suspiciousTailStart === null) suspiciousTailStart = _suspFromTrailing;
+  // Defense in depth: in batch mode, if the user already worked past the
+  // noise on a prior visit (saved workingState has pendingNoiseReview=false
+  // and at least one applied fix), skip re-painting the yellow panel. The
+  // batch restore at batch-game-list.js:605-616 wipes the residue, but the
+  // panel still flickers in and the bound click handler closes over the
+  // pristine state.moves we just rebuilt — clicking it later wipes the
+  // user's fixes (the symptom the user reported). Skipping outright is
+  // simpler and cheaper than relying on the post-hoc cleanup.
+  var _alreadyResolved = false;
+  try {
+    if (suspiciousTailStart !== null && window.BatchGameList &&
+        window.BatchGameList.batchState && window.BatchGameList.batchState.active) {
+      var _bs = window.BatchGameList.batchState;
+      var _g = _bs.currentGameId && _bs.games && _bs.games.get(_bs.currentGameId);
+      var _ws = _g && _g.workingState;
+      if (_ws && _ws.pendingNoiseReview === false && Array.isArray(_ws.moves)) {
+        for (var _wi = 0; _wi < _ws.moves.length; _wi++) {
+          var _wm = _ws.moves[_wi];
+          if (_wm.wStatus === 'fixed' || _wm.wStatus === 'locked' ||
+              _wm.bStatus === 'fixed' || _wm.bStatus === 'locked') {
+            _alreadyResolved = true;
+            break;
+          }
+        }
+      }
+    }
+  } catch (e) { /* non-fatal */ }
+  if (_alreadyResolved) {
+    log('🔇 Noise already resolved on prior visit — skipping noise-review panel');
+    suspiciousTailStart = null;
+  }
   if(suspiciousTailStart !== null){
-    // Navigate to end so user can review/delete noise
+    // Navigate to (and center on) the FIRST suspicious move — that's the
+    // cell showing a trashcan, and it's what the user needs to eyeball to
+    // decide where the real game ends.
     state.pendingNoiseReview = true;
-    goToPly(state.sans.length);
+    goToPly(suspiciousTailStart + 1);
+    var susMoveNum = Math.floor(suspiciousTailStart / 2) + 1;
+    var susRow = document.getElementById('move-row-' + susMoveNum);
+    if (susRow) {
+      var susContainer = document.getElementById('move-list-container');
+      if (susContainer) {
+        var susRect = susRow.getBoundingClientRect();
+        var cRect = susContainer.getBoundingClientRect();
+        susContainer.scrollTop = susContainer.scrollTop + susRect.top - cRect.top - susContainer.clientHeight / 2 + susRow.offsetHeight / 2;
+      }
+      if (window.VerificationUI && typeof window.VerificationUI.scrollPanelsToTop === 'function') {
+        window.VerificationUI.scrollPanelsToTop();
+      }
+    }
+    if (typeof updateOcrContextPanel === 'function') {
+      try { updateOcrContextPanel(suspiciousTailStart + 1); } catch (e) {}
+    }
     log('⚠️ Suspicious low-confidence moves detected at end - please review before validation');
 
     // Show noise review UI
@@ -216,7 +310,20 @@ function showOcrResults(paired, filename){
         });
       });
       validateAndDisplay(currentPaired, filename).then(function(){
-        launchBackgroundSearches(currentPaired);
+        launchBackgroundSearches();
+        // Batch mode: state.ocrCells (and state.ocrCellsSheet1/2) have been
+        // truncated in place by deleteMovesFromPly. Let batch-game-list
+        // persist the cleaned OCR and enqueue the game for reconstruction —
+        // it was deliberately held out of the orchestrator until the user
+        // dealt with the noise.
+        if (window.BatchGameList && window.BatchGameList.batchState &&
+            window.BatchGameList.batchState.active &&
+            typeof window.BatchGameList.onTruncationComplete === 'function') {
+          try {
+            window.BatchGameList.onTruncationComplete(
+              window.BatchGameList.batchState.currentGameId);
+          } catch (e) {}
+        }
       });
     };
   } else {

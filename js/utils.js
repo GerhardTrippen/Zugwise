@@ -2,10 +2,265 @@
 // UTILITIES - Small helper functions
 // =============================================================================
 
+// =============================================================================
+// Dual-sheet detection & splitting (shared by Image tab + Batch mode)
+// =============================================================================
+
+/**
+ * Check if an image is a dual-sheet side-by-side scan (landscape orientation).
+ * Two portrait scoresheets scanned together on a flatbed produce a landscape
+ * image with aspect ratio typically 1.2-1.4.
+ *
+ * @param {File} file - Image file
+ * @returns {Promise<{isDual: boolean, width: number, height: number, ratio: number}>}
+ */
+function detectDualSheet(file) {
+  return new Promise(function(resolve) {
+    var url = URL.createObjectURL(file);
+    var img = new Image();
+    img.onload = function() {
+      var w = img.naturalWidth;
+      var h = img.naturalHeight;
+      URL.revokeObjectURL(url);
+      var ratio = w / h;
+      var isDual = ratio > 1.15;
+      console.log('[DualSheet] detectDualSheet: ' + file.name +
+                  ' ' + w + 'x' + h + ' ratio=' + ratio.toFixed(3) +
+                  ' → ' + (isDual ? 'DUAL' : 'single'));
+      resolve({ isDual: isDual, width: w, height: h, ratio: ratio });
+    };
+    img.onerror = function(e) {
+      console.warn('[DualSheet] detectDualSheet: failed to load image ' + file.name, e);
+      URL.revokeObjectURL(url);
+      resolve({ isDual: false, width: 0, height: 0, ratio: 0 });
+    };
+    img.src = url;
+  });
+}
+
+/**
+ * Find the optimal vertical cut position for a dual-sheet scan using an
+ * ink-density projection. Two side-by-side scoresheets each contribute two
+ * column clusters (move numbers + moves), giving the signature:
+ *
+ *   col1  col2     [SEAM]     col3  col4
+ *   ████  ████                ████  ████
+ *       ↑    ↑            ↑       ↑
+ *    narrow gap       WIDE gap  narrow gap
+ *
+ * The seam is the widest, deepest valley. If no clear valley is found
+ * (uncentered, noisy, or not actually dual) the caller falls back to the
+ * midpoint, so this can only improve on the old behaviour — never regress.
+ *
+ * @param {HTMLImageElement} img - Loaded image
+ * @param {number} width - Image width (original, full resolution)
+ * @param {number} height - Image height (original, full resolution)
+ * @returns {{cutX: number, confident: boolean, reason: string}}
+ */
+function findDualSheetCut(img, width, height) {
+  // Downsample for speed — 1D projection doesn't need full resolution.
+  var targetW = Math.min(width, 1200);
+  var scale = targetW / width;
+  var targetH = Math.max(1, Math.round(height * scale));
+
+  var canvas = document.createElement('canvas');
+  canvas.width = targetW;
+  canvas.height = targetH;
+  var ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, targetW, targetH);
+  var data;
+  try {
+    data = ctx.getImageData(0, 0, targetW, targetH).data;
+  } catch (e) {
+    return { cutX: Math.floor(width / 2), confident: false,
+             reason: 'getImageData failed: ' + e.message };
+  }
+
+  // Ink density per column: count of dark pixels (luma < threshold).
+  var THRESHOLD = 160;
+  var density = new Float32Array(targetW);
+  for (var y = 0; y < targetH; y++) {
+    var rowStart = y * targetW * 4;
+    for (var x = 0; x < targetW; x++) {
+      var i = rowStart + x * 4;
+      var luma = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      if (luma < THRESHOLD) density[x] += 1;
+    }
+  }
+
+  // Box-filter smoothing (window ~1% of width) to suppress single-column noise
+  // from handwriting strokes while preserving the ~column-width valley shape.
+  var smoothWin = Math.max(5, Math.floor(targetW / 100));
+  var smooth = new Float32Array(targetW);
+  var runSum = 0;
+  for (var x = 0; x < targetW; x++) {
+    runSum += density[x];
+    if (x >= smoothWin) runSum -= density[x - smoothWin];
+    smooth[x] = runSum / Math.min(x + 1, smoothWin);
+  }
+
+  var peakDensity = 0;
+  for (var x = 0; x < targetW; x++) {
+    if (smooth[x] > peakDensity) peakDensity = smooth[x];
+  }
+  if (peakDensity < 1) {
+    return { cutX: Math.floor(width / 2), confident: false,
+             reason: 'blank image — no ink detected' };
+  }
+
+  // Find deepest valley in the middle 30%–70% range (candidate seam).
+  var searchStart = Math.floor(targetW * 0.30);
+  var searchEnd = Math.floor(targetW * 0.70);
+  var minDensity = Infinity;
+  var minIdx = Math.floor(targetW / 2);
+  for (var x = searchStart; x < searchEnd; x++) {
+    if (smooth[x] < minDensity) { minDensity = smooth[x]; minIdx = x; }
+  }
+
+  // Measure valley extent: expand from the minimum while density stays under
+  // 40% of peak. This defines the "quiet band" around the seam.
+  var valleyThreshold = peakDensity * 0.40;
+  var left = minIdx, right = minIdx;
+  while (left > 0 && smooth[left] < valleyThreshold) left--;
+  while (right < targetW - 1 && smooth[right] < valleyThreshold) right++;
+  var valleyWidth = right - left;
+
+  // Widest intra-sheet gap on either side of the seam — our comparison baseline.
+  // Skip outer 5% to ignore page margins that would look like a giant valley.
+  function widestValleyInRange(lo, hi) {
+    var best = 0, cur = 0;
+    for (var x = lo; x < hi; x++) {
+      if (smooth[x] < valleyThreshold) { cur++; if (cur > best) best = cur; }
+      else cur = 0;
+    }
+    return best;
+  }
+  var leftGap = widestValleyInRange(Math.floor(targetW * 0.05), searchStart);
+  var rightGap = widestValleyInRange(searchEnd, Math.floor(targetW * 0.95));
+  var maxIntraGap = Math.max(leftGap, rightGap);
+
+  var midX = Math.floor(width / 2);
+
+  // Acceptance tests — only override midpoint when the evidence is strong.
+  if (minDensity > peakDensity * 0.30) {
+    return { cutX: midX, confident: false,
+             reason: 'shallow valley (min=' + Math.round(minDensity) +
+                     ' vs peak=' + Math.round(peakDensity) + ')' };
+  }
+  if (maxIntraGap > 0 && valleyWidth < maxIntraGap * 1.5) {
+    return { cutX: midX, confident: false,
+             reason: 'seam gap ' + valleyWidth + 'px not clearly wider than ' +
+                     'intra-sheet gap ' + maxIntraGap + 'px' };
+  }
+
+  var cutX = Math.round(((left + right) / 2) / scale);
+  return { cutX: cutX, confident: true,
+           reason: 'valley at x=' + cutX + ' (width=' + Math.round(valleyWidth / scale) +
+                   'px, depth=' + Math.round((1 - minDensity / peakDensity) * 100) + '%)' };
+}
+
+/**
+ * Split a dual-sheet image, producing two separate image Files (left half =
+ * one player's sheet, right half = the other player's sheet). Uses ink-valley
+ * detection to find the real seam; falls back to the midpoint if the valley
+ * signal is weak.
+ *
+ * @param {File} file - The wide image file
+ * @param {number} width - Image width
+ * @param {number} height - Image height
+ * @returns {Promise<{left: File, right: File}>}
+ */
+async function splitDualSheet(file, width, height) {
+  var url = URL.createObjectURL(file);
+  var img = new Image();
+  await new Promise(function(resolve) {
+    img.onload = resolve;
+    img.src = url;
+  });
+  URL.revokeObjectURL(url);
+
+  var cut = findDualSheetCut(img, width, height);
+  var cutX = cut.cutX;
+  console.log('[DualSheet] split ' + file.name + ': ' +
+              (cut.confident ? 'ink-valley cut at x=' + cutX
+                             : 'midpoint fallback at x=' + cutX) +
+              ' — ' + cut.reason);
+
+  var baseName = file.name.replace(/\.\w+$/, '');
+
+  // Left half [0, cutX]
+  var canvasL = document.createElement('canvas');
+  canvasL.width = cutX;
+  canvasL.height = height;
+  canvasL.getContext('2d').drawImage(img, 0, 0, cutX, height, 0, 0, cutX, height);
+  var blobL = await new Promise(function(resolve) {
+    canvasL.toBlob(function(b) { resolve(b); }, 'image/png');
+  });
+  var leftFile = new File([blobL], baseName + '_left.png', { type: 'image/png' });
+
+  // Right half [cutX, width]
+  var canvasR = document.createElement('canvas');
+  canvasR.width = width - cutX;
+  canvasR.height = height;
+  canvasR.getContext('2d').drawImage(img, cutX, 0, width - cutX, height, 0, 0, width - cutX, height);
+  var blobR = await new Promise(function(resolve) {
+    canvasR.toBlob(function(b) { resolve(b); }, 'image/png');
+  });
+  var rightFile = new File([blobR], baseName + '_right.png', { type: 'image/png' });
+
+  return { left: leftFile, right: rightFile };
+}
+
+/**
+ * Convert a PDF file to image File(s) using BatchPdf (pdf.js).
+ * Returns array of image Files, one per page.
+ *
+ * @param {File} pdfFile - The PDF file
+ * @returns {Promise<Array<File>>}
+ */
+async function pdfToImageFiles(pdfFile) {
+  if (!window.BatchPdf) {
+    throw new Error('PDF support not loaded (batch-pdf.js)');
+  }
+  var pages = await window.BatchPdf.pdfToImages(pdfFile);
+  return pages.map(function(p) { return p.file; });
+}
+
+/**
+ * Check if a file is a PDF.
+ * @param {File} file
+ * @returns {boolean}
+ */
+function isPDF(file) {
+  return /\.pdf$/i.test(file.name) || file.type === 'application/pdf';
+}
+
 // Simple similarity fallback - exact match only
 // For proper similarity, use backend /api/similarity endpoint or Pyodide
 function simpleSim(a, b){
   return a === b ? 100 : 0;
+}
+
+// Levenshtein edit-distance between two strings. Used by fixes.js for fix
+// safety checks and by sheet-alignment.js for filtering "structural" sheet
+// disagreement vs single-character OCR variance. Two-row DP for memory.
+function editDistance(a, b) {
+  a = a || ''; b = b || '';
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  var prev = new Array(b.length + 1);
+  var cur  = new Array(b.length + 1);
+  for (var j = 0; j <= b.length; j++) prev[j] = j;
+  for (var i = 1; i <= a.length; i++) {
+    cur[0] = i;
+    for (var k = 1; k <= b.length; k++) {
+      var cost = (a.charCodeAt(i - 1) === b.charCodeAt(k - 1)) ? 0 : 1;
+      cur[k] = Math.min(cur[k - 1] + 1, prev[k] + 1, prev[k - 1] + cost);
+    }
+    var tmp = prev; prev = cur; cur = tmp;
+  }
+  return prev[b.length];
 }
 
 // Character similarity for OCR - matches common handwriting confusions
@@ -83,14 +338,16 @@ function compareMoveAlpha(a, b){
 
 // Get similarity-sorted moves (Pyodide, Flask, or local fallback)
 async function getSimilaritySortedMoves(legalMoves, ocrMove){
-  // Try Pyodide first
+  // Try Pyodide first. Use the BATCH API — calling getSimilarity once per
+  // legal move (30+ separate Pyodide round-trips for a typical position)
+  // made edit-mode's 'Loading...' sit for seconds.
   if (CONFIG.usePyodide && window.zugwise && window.zugwise.isReady) {
     try {
-      var scores = [];
-      for (var i = 0; i < legalMoves.length; i++) {
-        var result = await window.zugwise.getSimilarity(ocrMove, legalMoves[i]);
-        scores.push({ san: legalMoves[i], sim: Math.round((result.similarity || 0) * 100) });
-      }
+      var batch = await window.zugwise.getSimilarityBatch(ocrMove, legalMoves);
+      var sims = (batch && batch.similarities) || [];
+      var scores = legalMoves.map(function(san, i){
+        return { san: san, sim: Math.round((sims[i] || 0) * 100) };
+      });
       return scores.sort(function(a, b){ return b.sim - a.sim; });
     } catch (e) {
       log('⚠ Pyodide similarity error: ' + e.message);

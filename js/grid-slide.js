@@ -237,7 +237,13 @@ function scoreCluster(cl,H,W,maxWP,rowCount){
         }
     }
 
-    var score=ar*sf*hf*(0.5+0.5*ss)*(0.5+0.5*xTight)*(0.6+0.4*hConsistency)*(0.6+0.4*gapMultipleScore)*rowPenalty;
+    // xTight penalty: steeper drop-off below 0.7 (non-column clusters have loose x-spread)
+    var xFactor = 0.5 + 0.5 * xTight;
+    if (xTight < 0.7) {
+        xFactor *= xTight;  // e.g., xTight=0.64 → 0.82*0.64=0.525 (was 0.82)
+    }
+
+    var score=ar*sf*hf*(0.5+0.5*ss)*xFactor*(0.6+0.4*hConsistency)*(0.6+0.4*gapMultipleScore)*rowPenalty;
     return{score:score,width:w,height:h,aspectRatio:ar,spacingScore:ss,rowEstimate:rowEst,xStd:Math.round(xStd),xTight:Math.round(xTight*100)/100,hConsistency:Math.round(hConsistency*100)/100,gapMultipleScore:Math.round(gapMultipleScore*100)/100,rowPenalty:Math.round(rowPenalty*100)/100,reason:'ok'};
 }
 
@@ -1901,10 +1907,16 @@ function slideAutoFind(srcGray, srcMat, config, log) {
         }
     }
 
-    // Phase 4: If columns estimate too few rows, retry with higher Max W%
-    if (bestResult.bestScore > 0 && bestResult.minRowEst < rowCount - 1) {
+    // Phase 4: If columns estimate too few rows OR x-spread is loose, retry with higher Max W%
+    // The xTight branch handles sheets with print-like handwriting where two-digit numbers
+    // (e.g. 22, 33) merge into single wide CCs that get rejected by default maxW%=2.5%.
+    if (bestResult.bestScore > 0 &&
+        (bestResult.minRowEst < rowCount - 1 || bestResult.minXT < 0.9)) {
         var maxWSteps = [3.5, 4.5];
-        log('  Columns estimate ~' + bestResult.minRowEst + ' rows (need ' + rowCount + ') — retrying with higher maxW%...');
+        var reason = (bestResult.minRowEst < rowCount - 1)
+            ? '~' + bestResult.minRowEst + ' rows (need ' + rowCount + ')'
+            : 'xTight=' + bestResult.minXT.toFixed(2) + ' < 0.9';
+        log('  Columns ' + reason + ' — retrying with higher maxW%...');
         for (var wi = 0; wi < maxWSteps.length; wi++) {
             if (maxWSteps[wi] <= curMaxW) continue;
             var tryMaxWR = maxWSteps[wi] / 100;
@@ -1912,13 +1924,18 @@ function slideAutoFind(srcGray, srcMat, config, log) {
             var trial4 = tryCombination(bestMinH / 100, bestXW, tryMaxWR);
             log('    score=' + trial4.result.bestScore.toFixed(2) + ' ~' + trial4.result.minRowEst + 'rows'
                 + ' xTight=' + trial4.result.minXT.toFixed(2) + ' (' + trial4.cands.cands.length + ' cands)');
-            if (trial4.result.bestScore > 0 && trial4.result.minRowEst > bestResult.minRowEst
-                && trial4.result.minXT >= 0.9) {
+            // Accept if trial is valid AND has tight x-spread AND doesn't regress coverage,
+            // AND improves EITHER coverage OR x-tightness by a meaningful margin.
+            var rowEstOK = trial4.result.minRowEst >= rowCount * 0.8;
+            var coverageGain = trial4.result.minRowEst > bestResult.minRowEst;
+            var xTightGain = trial4.result.minXT > bestResult.minXT + 0.2;
+            if (trial4.result.bestScore > 0 && trial4.result.minXT >= 0.9
+                && rowEstOK && (coverageGain || xTightGain)) {
                 bestResult = trial4.result; bestMaxW = maxWSteps[wi];
                 if (bestBinary) bestBinary.delete();
                 bestBinary = trial4.cands.binary;
                 bestCands = trial4.cands.cands; bestClResult = trial4.cl;
-                if (bestResult.minRowEst >= rowCount) break;
+                if (bestResult.minRowEst >= rowCount && bestResult.minXT >= 0.95) break;
             } else { trial4.cands.binary.delete(); }
         }
     }
@@ -2053,6 +2070,11 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
     var mI = merged.map(function(c, i) { return {cl: c, score: mS[i].score}; });
     mI.sort(function(a, b) { return b.score - a.score; });
     var top = mI.slice(0, expCols).filter(function(it) { return it.score > 0; }).map(function(it) { return it.cl; });
+    // Track which mI indices were selected for replacement logic later
+    var usedMIclusters = new Set();
+    for (var umi = 0; umi < Math.min(expCols, mI.length); umi++) {
+        if (mI[umi].score > 0) usedMIclusters.add(mI[umi].cl);
+    }
     top.sort(function(a, b) {
         return (a.reduce(function(s, c) { return s + c.cx; }, 0) / a.length)
              - (b.reduce(function(s, c) { return s + c.cx; }, 0) / b.length);
@@ -2257,6 +2279,128 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
                     + classification.headerRows.length + ' header + '
                     + classification.footerRows.length + ' footer)');
             }
+        }
+    }
+
+    // === Alignment-based column rejection ===
+    // If a column's hole alignment scored below 40%, it's probably the wrong cluster.
+    // Try replacing it with the next-best candidate from mI.
+    var ALIGN_REJECT_PCT = 40;
+    for (var reji = 0; reji < top.length; reji++) {
+        var ca = colAlignments[reji];
+        if (!ca || !ca.alignment) continue;
+        if (ca.alignment.pct >= ALIGN_REJECT_PCT) continue;
+
+        log('\n[AlignReject] Col' + (reji + 1) + ' alignment=' + Math.round(ca.alignment.pct)
+            + '% < ' + ALIGN_REJECT_PCT + '% — trying replacement candidates');
+
+        var bestReplaceDataIndices = null;
+        var bestReplaceGrps = null;
+        var bestReplacePct = ca.alignment.pct;
+        var bestReplaceCluster = null;
+        var bestReplaceAlignment = null;
+
+        // Try next candidates from mI (score-sorted, skip already-used)
+        for (var rci = 0; rci < mI.length; rci++) {
+            if (mI[rci].score <= 0) continue;
+            if (usedMIclusters.has(mI[rci].cl)) continue;
+
+            var candCluster = mI[rci].cl;
+
+            // Quick xTight check — skip if too loose
+            var candScoring = scoreCluster(candCluster, srcMat.rows, srcMat.cols, maxWP, rowCount);
+            if (candScoring.xTight < 0.5) continue;
+
+            // Build row groups for alignment
+            var candSorted = candCluster.slice().sort(function(a, b) { return a.cy - b.cy; });
+            var candAvgH = candSorted.reduce(function(s, c) { return s + c.h; }, 0) / candSorted.length;
+            var candYTol = candAvgH * 0.6;
+            var candGrps = [[candSorted[0]]];
+            for (var cgi = 1; cgi < candSorted.length; cgi++) {
+                var lastCg = candGrps[candGrps.length - 1];
+                if (candSorted[cgi].cy - lastCg[lastCg.length - 1].cy <= candYTol) {
+                    lastCg.push(candSorted[cgi]);
+                } else {
+                    candGrps.push([candSorted[cgi]]);
+                }
+            }
+
+            // Header classification (simplified — use all rows as data for alignment test)
+            var candRowStats = candGrps.map(function(g) {
+                var cy2 = g.reduce(function(s, c) { return s + c.cy; }, 0) / g.length;
+                var hArr = g.map(function(c) { return c.h; }).sort(function(a, b) { return a - b; });
+                var medH2 = hArr[Math.floor(hArr.length / 2)];
+                var tw = Math.max.apply(null, g.map(function(c) { return c.x + c.w; }))
+                       - Math.min.apply(null, g.map(function(c) { return c.x; }));
+                return {cy: cy2, medH: medH2, totalW: tw, count: g.length, group: g};
+            });
+            var candClassify = classifyClusterRows(candRowStats, rowCount, function(){}, 'CandCol', reji, isBackPage);
+
+            var candDataIndices = [];
+            for (var cdi = 0; cdi < candGrps.length; cdi++) {
+                if (candClassify.headerRows.indexOf(cdi) < 0 &&
+                    candClassify.footerRows.indexOf(cdi) < 0) {
+                    candDataIndices.push(cdi);
+                }
+            }
+
+            if (candDataIndices.length < 3) continue;
+
+            // Run hole alignment on candidate
+            var candHoleData = candDataIndices.map(function(idx2) {
+                return analyzeRowHoles(binary, candGrps[idx2]);
+            });
+            var candRowYs = candDataIndices.map(function(idx2) {
+                return candGrps[idx2].reduce(function(s, c) { return s + c.cy; }, 0) / candGrps[idx2].length;
+            });
+
+            var frontCols = (format === '3col') ? 3 : 2;
+            var candStartNum;
+            if (isBackPage) {
+                candStartNum = frontCols * frontRows + reji * rowCount + 1;
+            } else {
+                candStartNum = reji * rowCount + 1;
+            }
+
+            var candAlign = alignColumnByHoles(
+                candHoleData, candRowYs, rowCount,
+                (reji === 0 && !isBackPage),
+                isBackPage, reji, format, log, 'CandCol' + (reji + 1), frontRows
+            );
+
+            if (!candAlign) continue;
+
+            log('[AlignReject]   Candidate (n=' + candCluster.length + ' xT=' + candScoring.xTight
+                + '): align=' + Math.round(candAlign.pct) + '%');
+
+            if (candAlign.pct > bestReplacePct) {
+                bestReplacePct = candAlign.pct;
+                bestReplaceCluster = candCluster;
+                bestReplaceAlignment = candAlign;
+                bestReplaceDataIndices = candDataIndices;
+                bestReplaceGrps = candGrps;
+            }
+
+            // Stop searching if we found a very good match
+            if (bestReplacePct >= 70) break;
+        }
+
+        if (bestReplaceCluster) {
+            log('[AlignReject] ✓ Replacing Col' + (reji + 1) + ': '
+                + Math.round(ca.alignment.pct) + '% → ' + Math.round(bestReplacePct) + '%');
+            // Swap the cluster
+            usedMIclusters.delete(top[reji]);  // may not match after rescue, but harmless
+            top[reji] = bestReplaceCluster;
+            usedMIclusters.add(bestReplaceCluster);
+            // Update alignment
+            colAlignments[reji] = {
+                alignment: bestReplaceAlignment,
+                dataGrpIndices: bestReplaceDataIndices,
+                grps: bestReplaceGrps,
+                colIdx: reji
+            };
+        } else {
+            log('[AlignReject] No better candidate found for Col' + (reji + 1));
         }
     }
 

@@ -35,8 +35,25 @@ async function loadPythonModules(pyodide) {
     const singleLinePattern = new RegExp(
         `^from\\s+(${localModules.join('|')})\\s+import\\s+[^(].*$`, 'gm'
     );
+    // Multi-line: match from `from X import (` to the closing `)`, honoring
+    // both PEP 8 styles (`)` on its own line OR at the end of the last
+    // import member line) AND parens that appear inside member comments.
+    //
+    // History:
+    //   Original: [^)]* — stopped at ANY `)`, including those inside
+    //     comments like `# stricter check (no cross-board offset)`. Left
+    //     an orphan `)` on a line and broke the module's SyntaxError.
+    //   First fix: [\s\S]*?^\s*\) — required `)` at line-start. Handled
+    //     comments but missed the `find_free_captures_with_check)` style
+    //     where the closing paren follows the last member name on the
+    //     same line. fix_finding.py uses that style → failed to load →
+    //     BacktrackSearchState undefined.
+    //   Current: match any char that is NOT `#` or `)`, OR a full
+    //     line-comment `#...\n`, greedily, then `\)`. Stops at the first
+    //     `)` that is NOT inside a line comment. Handles both styles
+    //     and paren-in-comment cases.
     const multiLinePattern = new RegExp(
-        `^from\\s+(${localModules.join('|')})\\s+import\\s+\\([^)]*\\)`, 'gms'
+        `^from\\s+(${localModules.join('|')})\\s+import\\s+\\((?:[^#)]|#[^\\n]*)*\\)`, 'gm'
     );
 
     for (const moduleName of modules) {

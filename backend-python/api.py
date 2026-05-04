@@ -675,11 +675,14 @@ def api_find_fixes():
                     'ocr_from_square': ocr_from,
                     'ocr_to_square': ocr_to,
                     'similarity': round(f.get('char_sim', 0) * 100),
+                    'char_sim': f.get('char_sim', 0),
                     'reach': f.get('reach', 0),
                     'reach_improvement': f.get('reach_improvement', 0),
                     'completes': f.get('completes', False),
                     'score': round(f.get('unified_score', 0)),
+                    'unified_score': f.get('unified_score', 0),
                     'absurdity_count': f.get('absurdity_count', 0),
+                    'absurdity_penalty': f.get('absurdity_penalty', 0),
                     'is_hanging': f.get('is_hanging', False),
                     'hanging_value': f.get('hanging_value', 0),
                     'is_absurdity_fix': f.get('is_absurdity_fix', False),
@@ -687,6 +690,11 @@ def api_find_fixes():
                     'enables_future': f.get('enables_future', False),
                     'future_moves_enabled': f.get('future_moves_enabled', 0),
                     'ocr_conf': f.get('ocr_conf', 0),
+                    # Scoring breakdown for the fix-details panel. Without
+                    # this, the UI can only show the summary line (score +
+                    # sim) and the color-coded component pills are missing.
+                    'score_components': f.get('score_components'),
+                    'sim_source': f.get('sim_source'),
                     'explanation': explanation,
                     'num_changes': num_changes,
                     'needs_confirmation': needs_confirmation,

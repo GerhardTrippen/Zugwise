@@ -158,7 +158,15 @@ async function validateAndDisplay(paired,filename){
       state.stuckInfo=null;
       state.errorArrow=null;
       state.savedErrorArrow=null;
+      // No stuck point on initial validation = game is already valid.
+      // Cancel any background searches that just got launched (e.g. by
+      // mergePlayerMoves) since there's nothing to search for.
+      try { if (typeof cancelSearch === 'function') cancelSearch(); } catch(e){}
     }
+
+    // At-point alignment trigger: surface a structural suggestion (or hide a
+    // stale one) now that we know where reconstruction stopped.
+    if (window.SheetAlignment) window.SheetAlignment.evaluateAtPointAlignment();
 
     // FIRST: Render move list and show stuck position immediately
     renderMoveList();
@@ -169,14 +177,39 @@ async function validateAndDisplay(paired,filename){
 
     // THEN: Start finding fixes (user sees stuck position while this runs)
     if(state.stuckInfo){
+      if(window.VerificationUI && typeof window.VerificationUI.scrollPanelsToTop === 'function') window.VerificationUI.scrollPanelsToTop();
       fetchFixes(); // Don't await - let it run while user sees the stuck position
     }
 
-  }catch(e){log('⚠ Validation error: '+e.message);}
+  }catch(e){
+    log('⚠ Validation error: '+e.message);
+    var stuckDiv=document.getElementById('stuck-info');
+    if(stuckDiv) stuckDiv.innerHTML='<span class="text-red-400">⚠ Validation failed: '+e.message+'</span>';
+    var fixDiv=document.getElementById('fix-list');
+    if(fixDiv) fixDiv.innerHTML='<div class="text-gray-400 text-sm p-4 text-center">Check the log for details</div>';
+  }
 }
 
 async function fetchFixes(){
   if(!state.stuckInfo)return;var lbl=state.stuckInfo.num+'.'+state.stuckInfo.color.toUpperCase();
+
+  // Capture searchGeneration BEFORE any await so other code paths
+  // (verification entry, game switch, manual fix) can supersede this
+  // fetchFixes by bumping state.searchGeneration. The original code
+  // bumped-and-captured only AFTER the await computeQuickFixes, which
+  // meant any bump that happened during that await was swallowed —
+  // fetchFixes resumed, bumped itself, captured the new value, and the
+  // subsequent checkpoints always matched. Result: a fetchFixes fired by
+  // the pre-review validate pass would happily overwrite the review
+  // panels (quick fixes + deep search) after the user had already entered
+  // verification mode for a different stuck ply.
+  state.searchGeneration = (state.searchGeneration || 0) + 1;
+  var thisSearchGeneration = state.searchGeneration;
+  if(state._verificationActive){
+    // Verification mode took over before fetchFixes could meaningfully
+    // run — don't paint anything into the verification panels.
+    return;
+  }
 
   // Build message based on stuck reason
   var stuckHtml='';
@@ -214,13 +247,19 @@ async function fetchFixes(){
 
   // QUICK FIXES: Compute and show OCR alternatives (uses Pyodide similarity if available)
   state.quickFixes = await computeQuickFixes();
+
+  // Superseded check BEFORE any DOM paint. If verification entry (or a
+  // game switch) happened during the computeQuickFixes await, the review
+  // panels are already showing content for a different ply and we must
+  // not overwrite them.
+  if(state.searchGeneration !== thisSearchGeneration || state._verificationActive){
+    log('🔍 Quick-fix render for search #'+thisSearchGeneration+' suppressed (superseded by #'+state.searchGeneration+' or verification active)');
+    return;
+  }
+
   hideFixDetails();
   renderQuickFixes(state.quickFixes);
   renderLegalMoves();
-
-  // Increment search generation to invalidate any pending backtrack results
-  state.searchGeneration = (state.searchGeneration || 0) + 1;
-  var thisSearchGeneration = state.searchGeneration;
 
   // Update apply button based on quick fixes
   var applyBtn=document.getElementById('btn-apply');
@@ -282,7 +321,9 @@ async function fetchFixes(){
         if(m.wAlts&&m.wAlts.length>0){
           m.wAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});
         }
-        ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts});
+        var lenientAlts=[];
+        if(m.wLenientAlts&&m.wLenientAlts.length>0){m.wLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
+        ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts});
       }
       if(m.black){
         flat.push(m.black);
@@ -290,7 +331,9 @@ async function fetchFixes(){
         if(m.bAlts&&m.bAlts.length>0){
           m.bAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});
         }
-        ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts});
+        var lenientAlts=[];
+        if(m.bLenientAlts&&m.bLenientAlts.length>0){m.bLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
+        ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts});
       }
     });
 
@@ -346,11 +389,17 @@ async function fetchFixes(){
     var earlyExit = false;
 
     while(!searchComplete){
-      // Check if search was superseded
-      if(state.searchGeneration !== thisSearchGeneration){
-        log('🔍 Streaming search #'+thisSearchGeneration+' aborted (superseded by search #'+state.searchGeneration+' — fix applied or revalidation triggered)');
+      // Check if search was superseded — by a newer search, or by review
+      // mode taking over (review uses cached algorithm candidates and only
+      // needs computeQuickFixes; deep-search results would never be used).
+      if(state.searchGeneration !== thisSearchGeneration || state._verificationActive){
+        var reasonStr = state._verificationActive
+          ? 'review mode entered'
+          : 'superseded by search #'+state.searchGeneration+' — fix applied or revalidation triggered';
+        log('🔍 Streaming search #'+thisSearchGeneration+' aborted ('+reasonStr+')');
         // Cleanup - finalize will delete state vars
         try { await window.zugwise.backtrackFinalize(stateId); } catch(e){}
+        showCalculating(false);
         return;
       }
 
@@ -386,9 +435,13 @@ async function fetchFixes(){
       log('🔍 Phase 2: '+phase2Info.phase2_total_plies+' plies to search');
       var phase2Done = false;
       while(!phase2Done){
-        if(state.searchGeneration !== thisSearchGeneration){
-          log('🔍 Phase 2 search #'+thisSearchGeneration+' aborted (superseded by search #'+state.searchGeneration+')');
+        if(state.searchGeneration !== thisSearchGeneration || state._verificationActive){
+          var p2Reason = state._verificationActive
+            ? 'review mode entered'
+            : 'superseded by search #'+state.searchGeneration;
+          log('🔍 Phase 2 search #'+thisSearchGeneration+' aborted ('+p2Reason+')');
           try { await window.zugwise.backtrackFinalizeComplete(stateId); } catch(e){}
+          showCalculating(false);
           return;
         }
         var p2Step = await window.zugwise.backtrackPhase2Step(stateId);
@@ -414,9 +467,10 @@ async function fetchFixes(){
     updateDeepSearchProgress(0, 0, 0, null, 'Verifying fixes');
     var data = await window.zugwise.backtrackFinalizeComplete(stateId);
 
-    // Check if search was superseded (user applied a fix while we were searching)
-    if(state.searchGeneration !== thisSearchGeneration){
-      log('🔍 Deep search #'+thisSearchGeneration+' result ignored (superseded by search #'+state.searchGeneration+')');
+    // Check if search was superseded (user applied a fix / switched game /
+    // entered verification while we were searching)
+    if(state.searchGeneration !== thisSearchGeneration || state._verificationActive){
+      log('🔍 Deep search #'+thisSearchGeneration+' result ignored (superseded by search #'+state.searchGeneration+' or verification active)');
       showCalculating(false);
       return;
     }
@@ -433,7 +487,7 @@ async function fetchFixes(){
         deepSection.innerHTML = '<div class="text-xs text-gray-500 mt-3 mb-2 pt-2 border-t border-gray-600 flex items-center gap-2"><span class="calculating">🔍</span><span>Searching with 2nd candidate: <b>'+dsi.secondary_move+'</b> ('+Math.round(dsi.secondary_conf*100)+'%) at '+dsi.stuck_ply_str+'...</span></div>';
       }
       await new Promise(function(resolve){ setTimeout(resolve, 0); });
-      if(state.searchGeneration !== thisSearchGeneration){ showCalculating(false); return; }
+      if(state.searchGeneration !== thisSearchGeneration || state._verificationActive){ showCalculating(false); return; }
 
       var searchResult = await window.zugwise.backtrackDualSearch(stateId);
 
@@ -444,7 +498,7 @@ async function fetchFixes(){
           deepSection.innerHTML = '<div class="text-xs text-gray-500 mt-3 mb-2 pt-2 border-t border-gray-600 flex items-center gap-2"><span class="calculating">🔍</span><span>Verifying '+Math.min(searchResult.raw_count, 8)+' dual search fixes...</span></div>';
         }
         await new Promise(function(resolve){ setTimeout(resolve, 0); });
-        if(state.searchGeneration !== thisSearchGeneration){ showCalculating(false); return; }
+        if(state.searchGeneration !== thisSearchGeneration || state._verificationActive){ showCalculating(false); return; }
 
         var verifyResult = await window.zugwise.backtrackDualVerify(stateId);
 
@@ -454,7 +508,7 @@ async function fetchFixes(){
           deepSection.innerHTML = '<div class="text-xs text-gray-500 mt-3 mb-2 pt-2 border-t border-gray-600 flex items-center gap-2"><span class="calculating">🔍</span><span>Merging '+primaryCount+' + '+verifyResult.verified_count+' fixes...</span></div>';
         }
         await new Promise(function(resolve){ setTimeout(resolve, 0); });
-        if(state.searchGeneration !== thisSearchGeneration){ showCalculating(false); return; }
+        if(state.searchGeneration !== thisSearchGeneration || state._verificationActive){ showCalculating(false); return; }
 
         var mergedResult = await window.zugwise.backtrackDualMerge(stateId, data.fixes||[]);
         if(mergedResult && mergedResult.fixes){
@@ -516,19 +570,39 @@ async function revalidate(){
       flat.push(m.white);
       var alts=[];
       if(m.wAlts&&m.wAlts.length>0){m.wAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
-      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts});
+      var lenientAlts=[];
+      if(m.wLenientAlts&&m.wLenientAlts.length>0){m.wLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
+      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts});
     }
     if(m.black){
       flat.push(m.black);
       var alts=[];
       if(m.bAlts&&m.bAlts.length>0){m.bAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
-      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts});
+      var lenientAlts=[];
+      if(m.bLenientAlts&&m.bLenientAlts.length>0){m.bLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
+      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts});
     }
   });
   // Pass confirmedPly as startPly to skip re-checking already-confirmed moves
   var startPly = state.confirmedPly || 0;
+  // One-shot suppress of similarity / OCR-alternative auto-fix — set by the
+  // post-override path (verification-ui.js _beginReviewEdit) so the user
+  // sees the real new stuck point instead of validate_moves silently
+  // applying one-or-nothing rescue fixes on plies they just reverted to OCR
+  // baseline. Without this, the user overrides 35.W, revalidate auto-fixes
+  // 35.B / 36.W / 36.B via similarity swaps, and the game reports
+  // "complete" — stealing the fresh Greedy's review opportunity.
+  var settings = getAutoFixSettings();
+  if (state._skipAutoFixNextRevalidate) {
+    settings = Object.assign({}, settings, {
+      ocr_autofix: false,
+      similarity_autofix: false
+    });
+    delete state._skipAutoFixNextRevalidate;
+    log('🔄 (post-override: auto-fix suppressed for this revalidate)');
+  }
   log('🔄 Revalidating '+flat.length+' moves (starting EAD from ply '+startPly+')...');
-  try{var val=await callValidateAPI(flat, ocrData, getAutoFixSettings(), state.approvedPlies||[], startPly);
+  try{var val=await callValidateAPI(flat, ocrData, settings, state.approvedPlies||[], startPly);
     // Store pending confirmation for display in fix panel (not modal)
     state.pendingConfirmation = val.pending_confirmation || null;
     // Build lookup from ply to corrected SAN and OCR alt info
@@ -567,9 +641,41 @@ async function revalidate(){
           showAutoFixFlash(origB,m.black);
         }
       }
-      if(m.white){if(m.wStatus!=='fixed'&&m.wStatus!=='locked'){if(val.stuck_at===ply)m.wStatus='error';else if(val.stuck_at!==null&&ply>val.stuck_at)m.wStatus='pending';else m.wStatus='ok';}if(m.wStatus==='ok'||m.wStatus==='fixed'||m.wStatus==='locked')state.sans.push(m.white);ply++;}if(m.black){if(m.bStatus!=='fixed'&&m.bStatus!=='locked'){if(val.stuck_at===ply)m.bStatus='error';else if(val.stuck_at!==null&&ply>val.stuck_at)m.bStatus='pending';else m.bStatus='ok';}if((m.wStatus==='ok'||m.wStatus==='fixed'||m.wStatus==='locked')&&(m.bStatus==='ok'||m.bStatus==='fixed'||m.bStatus==='locked'))state.sans.push(m.black);ply++;}});
+      if(m.white){
+        if(m.wStatus!=='fixed'&&m.wStatus!=='locked'){
+          if(val.stuck_at===ply) m.wStatus='error';
+          else if(val.stuck_at!==null&&ply>val.stuck_at){
+            m.wStatus='pending';
+            // Past-stuck revert: when the game is stuck earlier, the board
+            // state at this ply is no longer reachable, so any silent auto-
+            // correct stored on this entry was derived from a now-invalid
+            // position. Restore the OCR baseline so the ⚡ marker disappears
+            // and the user sees the raw move at this ply (the auto-correct
+            // will be re-derived from scratch on the next revalidate once
+            // the stuck point is resolved). User-confirmed fixes
+            // (status='fixed'/'locked') are skipped by the outer guard.
+            if(m.wOriginal){m.white=m.wOriginal;m.wOriginal=null;m.wOcrAlt=false;}
+          }
+          else m.wStatus='ok';
+        }
+        if(m.wStatus==='ok'||m.wStatus==='fixed'||m.wStatus==='locked')state.sans.push(m.white);
+        ply++;
+      }
+      if(m.black){
+        if(m.bStatus!=='fixed'&&m.bStatus!=='locked'){
+          if(val.stuck_at===ply) m.bStatus='error';
+          else if(val.stuck_at!==null&&ply>val.stuck_at){
+            m.bStatus='pending';
+            if(m.bOriginal){m.black=m.bOriginal;m.bOriginal=null;m.bOcrAlt=false;}
+          }
+          else m.bStatus='ok';
+        }
+        if((m.wStatus==='ok'||m.wStatus==='fixed'||m.wStatus==='locked')&&(m.bStatus==='ok'||m.bStatus==='fixed'||m.bStatus==='locked'))state.sans.push(m.black);
+        ply++;
+      }
+    });
     // NOTE: Do NOT update confirmedPly here - it's the user's search boundary,
-    // set by applyFix()/keepCurrentMove(). Updating it would defeat the purpose.
+    // set by applyFix(). Updating it would defeat the purpose.
     log('✓ After fix: '+state.sans.length+'/'+flat.length+' moves OK (confirmedPly='+state.confirmedPly+')');
     if(val.stuck_at!==null){
       state.stuckPly=val.stuck_at;
@@ -590,13 +696,33 @@ async function revalidate(){
       state.stuckInfo=null;
       state.errorArrow=null;
       state.savedErrorArrow=null;
-      // Invalidate any in-flight deep searches
+      // Invalidate any in-flight deep searches AND cancel any background
+      // search workers (greedy / beam / dijkstra) — game is solved, no
+      // reason to keep CPU spinning on it.
       state.searchGeneration = (state.searchGeneration || 0) + 1;
+      try { if (typeof cancelSearch === 'function') cancelSearch(); } catch(e){}
       showCalculating(false);
       if(val.is_checkmate){
+        var validated=state.sans.length;
+        var noiseCount=0;
+        if(state.ocrCells){
+          noiseCount=Math.max(0,state.ocrCells.length-validated);
+        }else{
+          var plyCount=0;
+          (state.moves||[]).forEach(function(m){if(m.white)plyCount++;if(m.black)plyCount++;});
+          noiseCount=Math.max(0,plyCount-validated);
+        }
+        var trashHtml=noiseCount>0
+          ? '<div class="mt-3 text-xs text-gray-400">'+noiseCount+' move'+(noiseCount===1?'':'s')
+            +' after checkmate — likely OCR noise. '
+            +'<button class="underline text-red-400 hover:text-red-300 ml-1" '
+            +'onclick="truncateTrailingNoise('+validated+')" '
+            +'title="Delete '+noiseCount+' trailing move'+(noiseCount===1?'':'s')+'">'
+            +'🗑️ Delete</button></div>'
+          : '';
         document.getElementById('stuck-info').innerHTML='<span class="text-green-400">✓ Checkmate! Game complete!</span>';
-        document.getElementById('fix-list').innerHTML='<div class="text-green-400 text-sm p-4 text-center">♔ Checkmate! Game complete!</div>';
-        log('♔ Checkmate! Game complete! '+state.sans.length+' moves validated');
+        document.getElementById('fix-list').innerHTML='<div class="text-green-400 text-sm p-4 text-center">♔ Checkmate! Game complete!'+trashHtml+'</div>';
+        log('♔ Checkmate! Game complete! '+validated+' moves validated'+(noiseCount>0?' ('+noiseCount+' noise move'+(noiseCount===1?'':'s')+' past mate)':''));
       }else{
         document.getElementById('stuck-info').innerHTML='<span class="text-green-400">✓ All moves valid!</span>';
         document.getElementById('fix-list').innerHTML='<div class="text-green-400 text-sm p-4 text-center">🎉 Game complete!</div>';
@@ -604,7 +730,18 @@ async function revalidate(){
       }
       document.getElementById('source-preview').classList.add('hidden');
       resetApplyButton();
+      // Game has reached a complete state (checkmate or all-valid). Wipe
+      // any leftover Greedy/Beam/Dijkstra panel state so a previously-run
+      // algorithm result doesn't keep showing "SOLVED (N fixes)" / "Stale" /
+      // "Queued" alongside the green completion banner. bindGame()'s
+      // VERIFIED/EXPORTED early-return doesn't catch this case because the
+      // game is functionally complete but not yet user-verified.
+      if (typeof markPanelsGameComplete === 'function') {
+        try { markPanelsGameComplete(); } catch (e) {}
+      }
     }
+    // At-point alignment trigger after every revalidation.
+    if (window.SheetAlignment) window.SheetAlignment.evaluateAtPointAlignment();
   }catch(e){log('⚠ Revalidation error: '+e.message);}
   // Recalculate tiers after fix application (legality may have changed)
   if (state.ocrCells && window.MergeSheets && state.mergeTierMap) {
@@ -630,77 +767,9 @@ async function revalidate(){
   renderArrows();
   // THEN: Find fixes AFTER goToPly (so goToPly doesn't clear fixArrow set by fetchFixes)
   if(state.stuckInfo){
+    if(window.VerificationUI && typeof window.VerificationUI.scrollPanelsToTop === 'function') window.VerificationUI.scrollPanelsToTop();
     fetchFixes();
   }
-}
-
-// =============================================================================
-// BEAM SEARCH AUTO-SOLVE - Apply beam search result when it auto-completes game
-// =============================================================================
-
-function applyBeamSearchResult(data){
-  // Build paired moves structure from beam search result
-  var paired=[];
-  for(var i=0;i<data.moves.length;i+=2){
-    var num=Math.floor(i/2)+1;
-    paired.push({
-      num:num,
-      white:data.moves[i]||'',
-      black:data.moves[i+1]||'',
-      wStatus:'ok',
-      bStatus:data.moves[i+1]?'ok':'pending',
-      wConf:0.9,
-      bConf:0.9
-    });
-  }
-
-  // Mark fixes and show flash notifications
-  if(data.fixes&&data.fixes.length>0){
-    data.fixes.forEach(function(fix){
-      var fixNum=Math.floor(fix.ply/2)+1;
-      var fixColor=fix.ply%2===0?'w':'b';
-      for(var j=0;j<paired.length;j++){
-        if(paired[j].num===fixNum){
-          if(fixColor==='w'){
-            paired[j].wStatus='fixed';
-            if(fix.ocr&&fix.ocr!==fix.san){
-              paired[j].wOriginal=fix.ocr;
-              showAutoFixFlash(fix.ocr,fix.san,0,'Beam fix');
-            }
-          }else{
-            paired[j].bStatus='fixed';
-            if(fix.ocr&&fix.ocr!==fix.san){
-              paired[j].bOriginal=fix.ocr;
-              showAutoFixFlash(fix.ocr,fix.san,0,'Beam fix');
-            }
-          }
-          break;
-        }
-      }
-    });
-  }
-
-  // Update state
-  state.moves=paired;
-  state.sans=data.moves.slice();
-  state.stuckPly=null;
-  state.stuckInfo=null;
-  state.errorArrow=null;
-  state.fixArrow=null;
-  state.ocrArrow=null;
-
-  // Update UI to show game complete
-  document.getElementById('stuck-info').innerHTML='<span class="text-green-400">✓ All moves valid!</span> <span class="text-blue-300 text-xs">(beam search: '+data.fixes.length+' fixes)</span>';
-  document.getElementById('fix-list').innerHTML='<div class="text-green-400 text-sm p-4 text-center">🎉 Game auto-completed by beam search!</div>';
-  document.getElementById('source-preview').classList.add('hidden');
-  resetApplyButton();
-
-  // Render and navigate
-  renderMoveList();
-  renderArrows();
-  goToPly(state.sans.length);
-
-  log('✓ Applied '+data.fixes.length+' beam search fixes, game complete');
 }
 
 // =============================================================================

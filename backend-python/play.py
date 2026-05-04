@@ -25,7 +25,7 @@ Usage:
 """
 
 import chess
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 from dataclasses import dataclass
 
 # Import from existing modules
@@ -36,7 +36,9 @@ from absurdity import (
     is_piece_adequately_defended,
     find_all_absurdities,
     is_bad_trade_move,  # Instant bad trade detection
-    is_piece_genuinely_hanging  # SINGLE SOURCE OF TRUTH for hanging detection
+    is_piece_genuinely_hanging,  # SINGLE SOURCE OF TRUTH for hanging detection
+    is_classically_hanging_free,  # EAD-only stricter check, no cross-board offset
+    side_has_independent_free_capture,  # gate: distinguish mutual-hang from overloaded trade
 )
 
 
@@ -100,8 +102,9 @@ def check_piece_hanging(
         if value < 3:  # Flag minor pieces (3), Rooks (5), and Queens (9)
             continue
 
-        # Skip the piece that just moved - that's handled by bad_trade detection
-        if sq == move_just_played.to_square:
+        # For capture moves, bad_trade detection handles the moved piece.
+        # For non-capture moves landing on a hanging square (e.g. Bh6), check it here.
+        if sq == move_just_played.to_square and captured_value > 0:
             continue
 
         # Skip pieces worth <= what we just captured (capture priority is rational)
@@ -122,6 +125,28 @@ def check_piece_hanging(
             sq_name = chess.square_name(sq)
             piece_name_str = {3: "minor piece", 5: "Rook", 9: "Queen"}.get(value, f"piece({value})")
             explanation = f"Move leaves {piece_name_str} on {sq_name} hanging"
+            return (sq_name, value, explanation)
+
+        # EAD-only fallback: fire classical-hang ONLY when quiescence
+        # deemed the hang "not bad enough" due to cross-board compensation
+        # (the "minor gain only" branch — net_gain < 2 after offsetting
+        # captures elsewhere). This branch has two sub-cases:
+        #   - independent mutual-hang: both sides already have a classical
+        #     free capture that happen to net out → two absurdities, flag.
+        #   - overloaded-defender trade: the compensation only exists
+        #     *because* the opponent's capture removes a defender (e.g. a
+        #     pawn attacks our bishop AND defends a knight we can take —
+        #     capturing the bishop uncovers the knight) → valid exchange,
+        #     don't flag.
+        # side_has_independent_free_capture distinguishes them by checking
+        # whether side_that_moved already has a pre-existing classical free
+        # capture in the *current* position, before any hypothetical trade.
+        if (reason.startswith("minor gain only")
+                and is_classically_hanging_free(board, sq, piece)
+                and side_has_independent_free_capture(board, side_that_moved)):
+            sq_name = chess.square_name(sq)
+            piece_name_str = {3: "minor piece", 5: "Rook", 9: "Queen"}.get(value, f"piece({value})")
+            explanation = f"Move leaves {piece_name_str} on {sq_name} hanging (classical)"
             return (sq_name, value, explanation)
 
     return None
@@ -151,7 +176,8 @@ def play_until_absurd_or_stuck(
     severity_threshold: int = 3,      # Bishop/Knight or higher
     persistence_threshold: int = 2,   # Stop if ignored for 2+ moves
     auto_correct: bool = False,
-    verbose: bool = False
+    verbose: bool = False,
+    approved_plies: Optional[Set[int]] = None,  # User-confirmed: skip EAD
 ) -> Tuple[int, str, Optional[PersistentAbsurdity]]:
     """
     Play through moves, stopping at:
@@ -176,6 +202,15 @@ def play_until_absurd_or_stuck(
         Whether to use auto-correction in try_move (passed through)
     verbose : bool
         Print debug information
+    approved_plies : Optional[Set[int]]
+        Plies the user has confirmed (or that came from a tier-1 merge
+        agreement). Skip all EAD checks on these — bad-trade,
+        moved-piece-hanging, persistent-absurdity tracking. The move is
+        still played (illegality is still detected), but its quality is
+        not second-guessed. Mirrors validation.py::check_ead_after_move's
+        early return on `ply in approved_plies`. Without this, Greedy/Beam/
+        Dijkstra stop at user-confirmed plies the user has explicitly told
+        them to accept, while interactive validate happily plays through.
         
     Returns
     -------
@@ -198,10 +233,11 @@ def play_until_absurd_or_stuck(
         print("Game completed successfully")
     """
     board = chess.Board()
-    
+    approved_plies = approved_plies or set()
+
     # Track active absurdities by square: {square_name: PersistentAbsurdity}
     active_absurdities: Dict[str, PersistentAbsurdity] = {}
-    
+
     for ply, san in enumerate(moves):
         # Try to make the move
         move = try_move(board, san, auto_correct=auto_correct)
@@ -210,42 +246,42 @@ def play_until_absurd_or_stuck(
                 print(f"  [X] Illegal at ply {ply}: '{san}'")
             return ply, "illegal", None
 
+        # User-confirmed (or tier-1 merge-locked) move — skip every EAD check
+        # and just play it. This mirrors validation.py::check_ead_after_move's
+        # `if ply in approved_plies: return False, None, None`. Without this,
+        # Greedy/Beam/Dijkstra stop at user-confirmed plies that the user has
+        # explicitly told them to accept, while interactive validate plays
+        # right through. Any active hanging-piece tracking from earlier plies
+        # gets dropped by the resolver below at the next non-approved ply
+        # (an approved move counts as "the position has moved on").
+        if ply in approved_plies:
+            board.push(move)
+            active_absurdities = {}
+            continue
+
         # NEW: Check for bad trade BEFORE playing the move
-        # This catches blunders like Qxd4 where Queen can be recaptured
-        # Skip if move is forced (only legal move in check) — no choice available
+        # This catches blunders like Qxd4 where Queen can be recaptured,
+        # Rf6 (rook walks into exchange sac vs bishop) and Bxc5 (bishop for pawn).
+        # Threshold is `loss >= 2` (decoupled from severity_threshold, which
+        # filters by piece value for persistent-hanging tracking).
+        # Skip if move is forced (only legal move in check) — no choice available.
         is_forced_move = board.is_check() and len(list(board.legal_moves)) == 1
         is_bad, loss, explanation = is_bad_trade_move(board, move)
-        if is_bad and loss >= severity_threshold and not is_forced_move:
+        if is_bad and loss >= 2 and not is_forced_move:
             trade_square = move.to_square
-            # Check: does opponent capture the piece on the very next move?
-            # If yes, it's punishment for a real blunder, not OCR absurdity
-            board.push(move)
-            opponent_captures = False
-            if ply + 1 < len(moves):
-                next_move = try_move(board, moves[ply + 1], auto_correct=auto_correct)
-                if next_move and next_move.to_square == trade_square:
-                    opponent_captures = True
-            board.pop()
-
-            if opponent_captures:
-                if verbose:
-                    print(f"  [EAD] Bad trade at ply {ply} but opponent captures "
-                          f"next move — not absurd, just bad chess")
-                # Don't return — let the game continue normally
-            else:
-                moving_piece = board.piece_at(move.from_square)
-                piece_sym = moving_piece.symbol() if moving_piece else '?'
-                bad_trade_abs = PersistentAbsurdity(
-                    start_ply=ply,
-                    absurdity_type='bad_trade',
-                    piece_symbol=piece_sym,
-                    square=chess.square_name(trade_square),
-                    severity=loss,
-                    persistence=0  # Immediate detection
-                )
-                if verbose:
-                    print(f"  [!] BAD TRADE at ply {ply}: {explanation}")
-                return ply, "bad_trade", bad_trade_abs
+            moving_piece = board.piece_at(move.from_square)
+            piece_sym = moving_piece.symbol() if moving_piece else '?'
+            bad_trade_abs = PersistentAbsurdity(
+                start_ply=ply,
+                absurdity_type='bad_trade',
+                piece_symbol=piece_sym,
+                square=chess.square_name(trade_square),
+                severity=loss,
+                persistence=0  # Immediate detection
+            )
+            if verbose:
+                print(f"  [!] BAD TRADE at ply {ply}: {explanation}")
+            return ply, "bad_trade", bad_trade_abs
 
         # Check if side is in check BEFORE making the move
         was_in_check_before_move = board.is_check()
@@ -280,29 +316,19 @@ def play_until_absurd_or_stuck(
             sq_name, piece_val, explanation = hanging_result
             hanging_square = chess.parse_square(sq_name)
 
-            # Check: does opponent capture the hanging piece on the very next move?
-            # If yes, it's punishment for a real blunder, not OCR absurdity
-            # ALSO: if opponent gives CHECK instead of capturing, that's a strong
-            # tactical choice — not evidence of OCR error
-            opponent_captures = False
+            # If opponent gives CHECK on the very next move, that's a strong
+            # tactical choice — not evidence of OCR error.
+            # We no longer exempt the case where opponent captures the hanging piece:
+            # losing a piece for nothing is absurd even if the opponent takes it.
             opponent_gives_check = False
             if ply + 1 < len(moves):
                 next_move = try_move(board, moves[ply + 1], auto_correct=auto_correct)
                 if next_move:
-                    if next_move.to_square == hanging_square:
-                        opponent_captures = True
-                    else:
-                        # Check if opponent's move gives check
-                        board.push(next_move)
-                        opponent_gives_check = board.is_check()
-                        board.pop()
+                    board.push(next_move)
+                    opponent_gives_check = board.is_check()
+                    board.pop()
 
-            if opponent_captures:
-                if verbose:
-                    print(f"  [EAD] Piece hanging on {sq_name} but opponent "
-                          f"captures next move — not absurd, just bad chess")
-                # Don't return — let the game continue, feed into persistence tracking
-            elif opponent_gives_check:
+            if opponent_gives_check:
                 if verbose:
                     print(f"  [EAD] Piece hanging on {sq_name} but opponent "
                           f"gives check instead — tactical choice, not absurd")
@@ -424,27 +450,31 @@ def _detect_hanging_pieces(
     
     # Also check: is there a free capture available that's being ignored?
     # (This detects the other side of the absurdity - opponent not taking)
+    # Note: `board` is the position AFTER side_just_moved played. It is now
+    # the opponent's turn, so board.legal_moves enumerates opponent options.
+    opponent = board.turn
+    target_side = side_just_moved
     if ply + 1 < len(moves):
         next_san = moves[ply + 1]
         for move in board.legal_moves:
             if not board.is_capture(move):
                 continue
-            
+
             captured = board.piece_at(move.to_square)
             if not captured:
                 continue
-            
+
             cap_value = piece_value(captured)
             if cap_value < 3:
                 continue
-            
+
             # Is this capture being ignored?
             try:
                 next_move = board.parse_san(next_san)
                 if next_move.to_square != move.to_square:
-                    # Not taking the hanging piece!
-                    # Check if the piece is defended
-                    if not board.is_attacked_by(not opponent, move.to_square):
+                    # Opponent is not taking the hanging piece of side_just_moved.
+                    # Check the captured piece has no own-side defender.
+                    if not board.is_attacked_by(target_side, move.to_square):
                         hanging.append({
                             'type': 'free_capture_ignored',
                             'piece': captured.symbol(),

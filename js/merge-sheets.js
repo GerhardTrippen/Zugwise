@@ -141,6 +141,25 @@ function mergePly(cell1, cell2, num, color) {
     cell2.lenientAlternatives || []
   );
 
+  // Top-move promotion: if a merged alternative (with summed confidence
+  // across both sheets) beats the raw top-move confidence picked above,
+  // promote it to top. The raw topMove selection only compared cell1.move
+  // vs cell2.move confidences; a move that appears as an *alternative* in
+  // both sheets (summed by mergeAlternatives) can easily exceed either
+  // sheet's top-move conf. Example: cell1.top=Rfc1@0.53, cell2.top=Kf1@0.30,
+  // but both sheets' alts contain Rxd7 — summed to 0.76. Without this
+  // promotion, Rfc1 stays as top and the DUAL SEARCH secondary/primary
+  // slots get inverted relative to true confidence.
+  if (mergedAlts.length > 0 && mergedAlts[0].confidence > topConf) {
+    var newTop = mergedAlts.shift();
+    // Demote the old top into alts, then re-sort + cap at 10.
+    mergedAlts.push({ move: topMove, confidence: topConf });
+    mergedAlts.sort(function(a, b) { return b.confidence - a.confidence; });
+    if (mergedAlts.length > 10) mergedAlts.length = 10;
+    topMove = newTop.move;
+    topConf = newTop.confidence;
+  }
+
   return {
     num: num,
     color: color,

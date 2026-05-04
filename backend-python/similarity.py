@@ -28,14 +28,23 @@ CHAR_SIMILARITIES = {
     ('d', 'g'): 0.5, ('g', 'd'): 0.5, # Both have round body, but different orientation
 
     # Rank number confusions - EXPANDED
+    # Calibrated against ABBYY Cloud confusion matrix (Horvath/Dreher thesis §11.2.4)
+    # and adjusted upward since our BiLSTM has higher confusion rates than ABBYY.
     ('1', '7'): 0.5, ('1', 'l'): 0.6, ('1', '5'): 0.4, ('1', '4'): 0.4,
+    ('1', '2'): 0.3, ('1', '3'): 0.4, ('1', '6'): 0.5, ('1', '8'): 0.3,  # ABBYY: 6→1=53, 3→1=29
     ('2', '7'): 0.6, ('2', 'z'): 0.4, ('2', '6'): 0.6,  # Added 2<->6
+    ('2', '4'): 0.4, ('2', '5'): 0.5, ('2', '8'): 0.3,  # ABBYY: 5→2=36, 4→2=27
     ('3', '8'): 0.5, ('3', '5'): 0.6, ('3', '6'): 0.5,
     ('3', '4'): 0.6, ('4', '3'): 0.6,  # 3<->4 confusion
+    ('3', '7'): 0.3,  # ABBYY: 7→3=5, 3→7=1
     ('4', '9'): 0.4, ('4', '1'): 0.4,
+    ('4', '5'): 0.3, ('4', '6'): 0.3, ('4', '7'): 0.3, ('4', '8'): 0.2,  # ABBYY: 4→5=9, 4→7=6
     ('5', '3'): 0.6, ('5', '6'): 0.6, ('5', 's'): 0.4,
+    ('5', '7'): 0.2, ('5', '8'): 0.3,  # ABBYY: 5→8=4, 8→5=5
     ('6', '5'): 0.6, ('6', '8'): 0.5, ('6', 'b'): 0.4, ('6', '2'): 0.6,  # Added 6<->2
+    ('6', '7'): 0.2,  # ABBYY: rare
     ('7', '1'): 0.5, ('7', '2'): 0.6,
+    ('7', '8'): 0.2,  # ABBYY: 0 confusions, but keep non-default
     ('8', '3'): 0.5, ('8', '6'): 0.5, ('8', 'B'): 0.3,
     ('2', '3'): 0.5, ('3', '2'): 0.5, # Similar curves, but keep below 2↔7 (0.6) mirror confusion
    

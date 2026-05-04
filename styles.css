@@ -9,7 +9,26 @@
 .move-error { color: #f87171; background: rgba(239, 68, 68, 0.15); border-radius: 4px; }
 .move-fixed { color: #4ade80; }
 .move-locked { color: #facc15; }
-.move-current { background: rgba(59, 130, 246, 0.3); border-radius: 4px; }
+/* Current-cell highlight: yellow outline matches the OCR context panel's
+   yellow highlight for the same cell, so the movelist and handwritten
+   panel visibly track each other. Outline (not background) so it stays
+   visible even on cells that already have a background colour from a
+   Tailwind utility — suspicious-tail cells wore bg-red-900/20 and the
+   old blue 30%-opacity background was completely swallowed. */
+.move-current {
+  outline: 2px solid rgba(253, 224, 71, 0.8);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+/* Origin stuck-ply highlight for backtrack-fix review: red outline on the
+   actual stuck cell so the move list mirrors the headline ("⚠️ 16.B h6 —
+   bad trade?") while the yellow outline still marks the backtrack proposal
+   ply (15.B). For non-backtrack fixes this class is never applied. */
+.move-origin-stuck {
+  outline: 2px solid rgba(248, 113, 113, 0.85);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
 .move-pending { color: #9ca3af; }
 .move-corrected { border-left: 2px solid #22d3ee; padding-left: 4px; }
 .processing-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; z-index: 50; border-radius: 0.5rem; }

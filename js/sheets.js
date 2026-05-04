@@ -12,14 +12,17 @@ var sheetsState = {
   // Each sheet: { file, image, corners, status, ocrResult, moveCount }
   player1: [null, null, null],
   player2: [null, null, null],
-  
+
   // Color assignment (auto-detected from header or manual)
   player1Color: null,  // 'white' | 'black' | null
   player2Color: null,
-  
+
   // Currently active corner picker
   activeCornerPicker: null,  // { player: 1|2, sheet: 0|1|2 }
-  
+
+  // Dual-sheet thumbnails (original landscape image data URLs, per page slot)
+  dualSheetThumbnails: [null, null, null],
+
   // Processing state
   isProcessing: false
 };
@@ -45,190 +48,14 @@ function initSheetsUploader() {
     console.warn('sheets-uploader container not found');
     return;
   }
-  
+
   container.innerHTML = renderSheetsUploader();
   attachSheetEventListeners();
-  log('📋 Multi-sheet uploader initialized');
+  log('📋 Sheet uploader initialized');
 }
 
 // =============================================================================
-// SIMPLE MODE (single player, 3 page boxes)
-// =============================================================================
-
-function initSimpleSheetsUploader() {
-  var container = document.getElementById('simple-sheets');
-  if (!container) {
-    console.warn('simple-sheets container not found');
-    return;
-  }
-
-  container.innerHTML = renderSimpleSheetsUploader();
-  attachSimpleSheetEventListeners();
-}
-
-function renderSimpleSheetsUploader() {
-  return `
-    <div class="simple-sheets-container">
-      <div class="flex gap-4 items-start mb-3">
-        <div class="flex gap-3 flex-shrink-0">
-          ${renderSheetBox(1, 0)}
-          ${renderSheetBox(1, 1)}
-          ${renderSheetBox(1, 2)}
-        </div>
-        ${renderSheetsInfoPanel()}
-      </div>
-      <!-- Status Legend -->
-      <div class="flex items-center justify-center gap-4 text-xs text-gray-400 mb-3">
-        <span><span class="inline-block w-2 h-2 rounded-full bg-green-500"></span> Grid OK</span>
-        <span><span class="inline-block w-2 h-2 rounded-full bg-yellow-500"></span> Needs corners</span>
-        <span><span class="inline-block w-2 h-2 rounded-full bg-blue-500"></span> OCR running</span>
-        <span><span class="inline-block w-2 h-2 rounded-full bg-purple-500"></span> Done</span>
-      </div>
-      <div class="flex justify-center">
-        <button id="btn-process-simple" class="px-6 py-2 bg-green-600 hover:bg-green-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded font-medium" disabled>
-          Process Sheets →
-        </button>
-      </div>
-    </div>
-  `;
-}
-
-function attachSimpleSheetEventListeners() {
-  var container = document.getElementById('simple-sheets');
-  if (!container) return;
-
-  // Sheet box clicks
-  container.querySelectorAll('.sheet-box').forEach(function(box) {
-    box.addEventListener('click', handleSheetBoxClick);
-  });
-
-  // File input changes
-  container.querySelectorAll('.sheet-file-input').forEach(function(input) {
-    input.addEventListener('change', handleSheetFileChange);
-  });
-
-  // Drag & drop
-  container.querySelectorAll('.sheet-box').forEach(function(box) {
-    box.addEventListener('dragover', function(e) { e.preventDefault(); box.classList.add('ring-2', 'ring-blue-400'); });
-    box.addEventListener('dragleave', function(e) { e.preventDefault(); box.classList.remove('ring-2', 'ring-blue-400'); });
-    box.addEventListener('drop', handleSheetDrop);
-  });
-
-  // Per-sheet format/rowCount override dropdowns
-  container.querySelectorAll('.sheet-format-select').forEach(function(sel) {
-    sel.addEventListener('click', function(e) { e.stopPropagation(); });
-    sel.addEventListener('change', function(e) {
-      e.stopPropagation();
-      var player = parseInt(sel.dataset.player);
-      var sheetIdx = parseInt(sel.dataset.sheet);
-      var sheet = sheetsState['player' + player][sheetIdx];
-      if (sheet) {
-        sheet.format = sel.value;
-        redetectGrid(player, sheetIdx);
-      }
-    });
-  });
-  container.querySelectorAll('.sheet-rows-select').forEach(function(sel) {
-    sel.addEventListener('click', function(e) { e.stopPropagation(); });
-    sel.addEventListener('change', function(e) {
-      e.stopPropagation();
-      var player = parseInt(sel.dataset.player);
-      var sheetIdx = parseInt(sel.dataset.sheet);
-      var sheet = sheetsState['player' + player][sheetIdx];
-      if (sheet) {
-        sheet.rowCount = parseInt(sel.value) || 20;
-        redetectGrid(player, sheetIdx);
-      }
-    });
-  });
-  container.querySelectorAll('.sheet-method-select').forEach(function(sel) {
-    sel.addEventListener('click', function(e) { e.stopPropagation(); });
-    sel.addEventListener('change', function(e) {
-      e.stopPropagation();
-      var player = parseInt(sel.dataset.player);
-      var sheetIdx = parseInt(sel.dataset.sheet);
-      var sheet = sheetsState['player' + player][sheetIdx];
-      if (sheet) {
-        sheet.method = sel.value;
-        redetectGrid(player, sheetIdx);
-      }
-    });
-  });
-
-  // "Try Contour" buttons
-  container.querySelectorAll('.sheet-try-contour').forEach(function(btn) {
-    btn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      var player = parseInt(btn.dataset.player);
-      var sheetIdx = parseInt(btn.dataset.sheet);
-      var sheet = sheetsState['player' + player][sheetIdx];
-      if (sheet) {
-        sheet.method = 'contour';
-        redetectGrid(player, sheetIdx);
-      }
-    });
-  });
-
-  // Process button
-  var processBtn = document.getElementById('btn-process-simple');
-  if (processBtn) processBtn.addEventListener('click', handleProcessSheets);
-}
-
-function refreshSimpleSheetsUI() {
-  var container = document.getElementById('simple-sheets');
-  if (!container) return;
-
-  container.innerHTML = renderSimpleSheetsUploader();
-  attachSimpleSheetEventListeners();
-  updateSimpleProcessButton();
-}
-
-function updateSimpleProcessButton() {
-  var btn = document.getElementById('btn-process-simple');
-  if (!btn) return;
-
-  var hasReady = false;
-  var hasNeedsCorners = false;
-  var hasProcessing = false;
-
-  for (var s = 0; s < 3; s++) {
-    var sheet = sheetsState.player1[s];
-    if (sheet) {
-      if (sheet.status === SHEET_STATUS.GRID_OK || sheet.status === SHEET_STATUS.OCR_DONE) {
-        hasReady = true;
-      }
-      if (sheet.status === SHEET_STATUS.NEEDS_CORNERS) {
-        hasNeedsCorners = true;
-      }
-      if (sheet.status === SHEET_STATUS.LOADING || sheet.status === SHEET_STATUS.OCR_RUNNING) {
-        hasProcessing = true;
-      }
-    }
-  }
-
-  var canProcess = hasReady && !hasNeedsCorners && !hasProcessing && !sheetsState.isProcessing;
-  btn.disabled = !canProcess;
-
-  if (sheetsState.isProcessing) {
-    btn.textContent = 'Processing...';
-  } else if (hasNeedsCorners) {
-    btn.textContent = 'Fix corners first \u26A0\uFE0F';
-  } else if (hasProcessing) {
-    var progressParts = [];
-    for (var ss = 0; ss < 3; ss++) {
-      var sh = sheetsState.player1[ss];
-      if (sh && sh.status === SHEET_STATUS.OCR_RUNNING && sh.ocrProgress) {
-        progressParts.push('Page ' + (ss + 1) + ': ' + sh.ocrProgress);
-      }
-    }
-    btn.textContent = progressParts.length > 0 ? progressParts.join(' | ') : 'Please wait...';
-  } else {
-    btn.textContent = 'Process Sheets \u2192';
-  }
-}
-
-// =============================================================================
-// INFO PANEL (shared between simple and advanced modes)
+// INFO PANEL
 // =============================================================================
 
 function renderSheetsInfoPanel() {
@@ -246,7 +73,8 @@ function renderSheetsInfoPanel() {
         <a href="ocr-prompt.md" target="_blank" class="text-blue-400 hover:text-blue-300 underline">OCR Text</a> tab.
       </div>
       <div class="text-gray-400">
-        Tip: Open multiple browser tabs to process several games at once.
+        Tip: Use <b class="text-gray-300">Batch</b> mode for tournament processing,
+        or open multiple tabs for ad-hoc games.
       </div>
     </div>
   `;
@@ -271,6 +99,8 @@ function renderSheetsUploader() {
         </div>
       </div>
       
+      ${renderDualSheetRow()}
+
       <div class="flex gap-4 items-start">
         <!-- Player Rows -->
         <div class="flex-shrink-0">
@@ -323,7 +153,7 @@ function renderSheetsUploader() {
       <!-- Process Button -->
       <div class="flex justify-end">
         <button id="btn-process-sheets" class="px-6 py-2 bg-green-600 hover:bg-green-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded font-medium" disabled>
-          Process All Sheets →
+          Process Sheets →
         </button>
       </div>
     </div>
@@ -431,7 +261,7 @@ function renderSheetBox(player, sheetIndex) {
     <div id="${id}" class="sheet-box relative w-28 h-36 border-2 rounded-lg bg-gray-700/50 overflow-hidden transition-all ${statusClass}"
          data-player="${player}" data-sheet="${sheetIndex}">
       ${statusIndicator}
-      <input type="file" accept="image/*" class="sheet-file-input hidden" data-player="${player}" data-sheet="${sheetIndex}">
+      <input type="file" accept="image/*,.pdf" class="sheet-file-input hidden" data-player="${player}" data-sheet="${sheetIndex}">
       ${content}
       ${sheetOverrides}
     </div>
@@ -447,6 +277,72 @@ function renderSheetThumbnail(sheet, pageNum, overlayText) {
       <img src="${imgSrc}" class="w-full h-full object-cover" alt="Page ${pageNum}">
       <div class="absolute top-1 left-1 bg-black/50 text-xs px-1 rounded text-gray-300">P${pageNum}</div>
       ${overlay}
+    </div>
+  `;
+}
+
+// =============================================================================
+// DUAL-SHEET BOXES (3 per-page upload slots)
+// =============================================================================
+
+/**
+ * Render a single dual-sheet upload box for a page slot (0, 1, 2).
+ * Landscape-oriented box that accepts one dual-sheet scan (PDF or image)
+ * and auto-splits into Player 1 + Player 2 for that page.
+ */
+function renderDualSheetBox(pageIndex) {
+  var pageNum = pageIndex + 1;
+  var thumbnail = sheetsState.dualSheetThumbnails[pageIndex];
+  var hasP1 = !!sheetsState.player1[pageIndex];
+  var hasP2 = !!sheetsState.player2[pageIndex];
+  var hasBoth = hasP1 && hasP2;
+
+  var content = '';
+  var borderClass = '';
+
+  if (thumbnail && hasBoth) {
+    // Loaded — show landscape thumbnail
+    borderClass = 'border-green-500';
+    content = `
+      <div class="relative w-full h-full">
+        <img src="${thumbnail}" class="w-full h-full object-cover" alt="Dual Page ${pageNum}">
+        <div class="absolute top-0.5 left-0.5 bg-black/60 text-xs px-1 rounded text-gray-300">P${pageNum}</div>
+        <div class="absolute bottom-0 left-0 right-0 bg-black/70 text-xs text-center py-0.5 text-green-300">&#x2713; Split → P1.${pageNum} + P2.${pageNum}</div>
+      </div>`;
+  } else {
+    // Empty — show drop prompt
+    borderClass = 'border-dashed border-gray-600 hover:border-blue-400';
+    content = `
+      <div class="flex flex-col items-center justify-center h-full text-gray-400">
+        <span class="text-lg mb-0.5">+</span>
+        <span class="text-xs">Page ${pageNum}</span>
+      </div>`;
+  }
+
+  return `
+    <div class="dual-sheet-box relative w-36 h-24 border-2 rounded-lg bg-gray-700/50 overflow-hidden transition-all cursor-pointer ${borderClass}"
+         data-page="${pageIndex}" title="Drop dual-sheet scan for page ${pageNum} (PDF or image)">
+      <input type="file" accept="image/*,.pdf" class="dual-sheet-box-input hidden" data-page="${pageIndex}">
+      ${content}
+    </div>
+  `;
+}
+
+/**
+ * Render a row of 3 dual-sheet upload boxes with a label.
+ */
+function renderDualSheetRow() {
+  return `
+    <div class="dual-sheet-row mb-4">
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-xs text-gray-400">Dual-sheet scans</span>
+        <span class="text-xs text-gray-500">(side-by-side scoresheets — auto-splits into P1 + P2)</span>
+      </div>
+      <div class="flex gap-3">
+        ${renderDualSheetBox(0)}
+        ${renderDualSheetBox(1)}
+        ${renderDualSheetBox(2)}
+      </div>
     </div>
   `;
 }
@@ -547,6 +443,118 @@ function attachSheetEventListeners() {
       }
     });
   });
+
+  // Dual-sheet drop zone
+  attachDualSheetDropZone(document.getElementById('sheets-uploader'));
+}
+
+/**
+ * Handle a single file dropped/selected in a specific dual-sheet page box.
+ * Converts PDF → image(s) if needed, detects dual-sheet, splits into P1 + P2.
+ * Multi-page PDFs fill consecutive page slots starting from pageIndex.
+ */
+async function handleDualSheetBoxFile(pageIndex, file) {
+  if (!file) return;
+
+  // Expand PDF into page images
+  var pageImages = [];
+  if (typeof isPDF === 'function' && isPDF(file)) {
+    log('📄 Converting PDF: ' + file.name);
+    try {
+      pageImages = await pdfToImageFiles(file);
+    } catch (e) {
+      log('❌ PDF conversion error: ' + ((e && e.message) ? e.message : String(e)));
+      return;
+    }
+  } else {
+    pageImages = [file];
+  }
+
+  if (pageImages.length === 0) {
+    log('No pages to process');
+    return;
+  }
+
+  var hasDual = false;
+
+  // Process each page image into consecutive slots starting from pageIndex
+  for (var i = 0; i < pageImages.length && (pageIndex + i) < 3; i++) {
+    var slot = pageIndex + i;
+    var pageFile = pageImages[i];
+    var dualInfo = typeof detectDualSheet === 'function' ? await detectDualSheet(pageFile) : { isDual: false };
+
+    if (dualInfo.isDual) {
+      hasDual = true;
+      var halves = await splitDualSheet(pageFile, dualInfo.width, dualInfo.height);
+      log('  Page ' + (slot + 1) + ': dual-sheet (' + dualInfo.width + 'x' + dualInfo.height +
+          ') → P1.' + (slot + 1) + ' + P2.' + (slot + 1));
+
+      // Store landscape thumbnail for the dual-sheet box display
+      try {
+        var thumbUrl = await readFileAsDataURL(pageFile);
+        sheetsState.dualSheetThumbnails[slot] = thumbUrl;
+      } catch (e) {
+        // Non-critical — box will still show "Split" status
+      }
+
+      loadSheetImage(1, slot, halves.left);
+      loadSheetImage(2, slot, halves.right);
+    } else {
+      // Not landscape — load as single sheet into Player 1
+      log('  Page ' + (slot + 1) + ': single sheet → P1.' + (slot + 1));
+      sheetsState.dualSheetThumbnails[slot] = null;
+      loadSheetImage(1, slot, pageFile);
+    }
+  }
+
+}
+
+/**
+ * Wire up the dual-sheet page boxes within a container element.
+ * Each box gets click, drag/drop, and file input handlers.
+ * @param {HTMLElement} container - Parent element to search within
+ */
+function attachDualSheetDropZone(container) {
+  if (!container) return;
+  container.querySelectorAll('.dual-sheet-box').forEach(function(box) {
+    var pageIndex = parseInt(box.dataset.page);
+    var fileInput = box.querySelector('.dual-sheet-box-input');
+
+    // Click → open file picker
+    box.addEventListener('click', function() {
+      if (fileInput) fileInput.click();
+    });
+
+    // Drag & drop
+    box.addEventListener('dragover', function(e) {
+      e.preventDefault();
+      box.classList.add('ring-2', 'ring-blue-400');
+    });
+    box.addEventListener('dragleave', function(e) {
+      e.preventDefault();
+      box.classList.remove('ring-2', 'ring-blue-400');
+    });
+    box.addEventListener('drop', function(e) {
+      e.preventDefault();
+      box.classList.remove('ring-2', 'ring-blue-400');
+      var files = Array.from(e.dataTransfer.files).filter(function(f) {
+        return f.type.startsWith('image/') || isPDF(f);
+      });
+      if (files.length > 0) {
+        handleDualSheetBoxFile(pageIndex, files[0]);
+      }
+    });
+
+    // File input change
+    if (fileInput) {
+      fileInput.addEventListener('change', function() {
+        if (fileInput.files && fileInput.files.length > 0) {
+          handleDualSheetBoxFile(pageIndex, fileInput.files[0]);
+        }
+        fileInput.value = '';  // Reset so same file can be re-selected
+      });
+    }
+  });
 }
 
 function handleSheetBoxClick(e) {
@@ -573,9 +581,9 @@ function handleSheetFileChange(e) {
   var input = e.target;
   var player = parseInt(input.dataset.player);
   var sheetIndex = parseInt(input.dataset.sheet);
-  
+
   if (input.files && input.files.length > 0) {
-    loadSheetImage(player, sheetIndex, input.files[0]);
+    loadSheetFile(player, sheetIndex, input.files[0]);
   }
 }
 
@@ -583,16 +591,16 @@ function handleSheetDrop(e) {
   e.preventDefault();
   var box = e.currentTarget;
   box.classList.remove('ring-2', 'ring-blue-400');
-  
+
   var player = parseInt(box.dataset.player);
   var sheetIndex = parseInt(box.dataset.sheet);
-  
+
   var files = Array.from(e.dataTransfer.files).filter(function(f) {
-    return f.type.startsWith('image/');
+    return f.type.startsWith('image/') || isPDF(f);
   });
-  
+
   if (files.length > 0) {
-    loadSheetImage(player, sheetIndex, files[0]);
+    loadSheetFile(player, sheetIndex, files[0]);
   }
 }
 
@@ -634,7 +642,8 @@ function handleClearSheets() {
   sheetsState.player2 = [null, null, null];
   sheetsState.player1Color = null;
   sheetsState.player2Color = null;
-  
+  sheetsState.dualSheetThumbnails = [null, null, null];
+
   refreshSheetsUI();
   log('🗑️ Cleared all sheets');
 }
@@ -670,6 +679,66 @@ async function handleProcessSheets() {
     sheetsState.isProcessing = false;
     updateProcessButton();
   }
+}
+
+// =============================================================================
+// FILE INTAKE — PDF conversion + dual-sheet detection
+// =============================================================================
+
+/**
+ * Entry point for all file uploads (drop or file-input).
+ * Handles PDF → image conversion and dual-sheet auto-split before
+ * delegating to loadSheetImage() for grid detection + OCR.
+ */
+async function loadSheetFile(player, sheetIndex, file) {
+  var imageFile = file;
+
+  // PDF → image conversion
+  if (typeof isPDF === 'function' && isPDF(file)) {
+    log('📄 Converting PDF: ' + file.name);
+    try {
+      var imageFiles = await pdfToImageFiles(file);
+      if (imageFiles.length === 0) {
+        log('❌ PDF conversion produced no pages');
+        return;
+      }
+      // For multi-page PDFs, load page 1 into current slot, page 2+ into next slots
+      if (imageFiles.length > 1) {
+        log('📄 PDF has ' + imageFiles.length + ' pages — loading into consecutive slots');
+        for (var p = 0; p < imageFiles.length && (sheetIndex + p) < 3; p++) {
+          if (p === 0) {
+            imageFile = imageFiles[0];  // Will be processed below (may be dual-sheet)
+          } else {
+            // Load subsequent pages into next sheet slots (same player)
+            loadSheetFile(player, sheetIndex + p, imageFiles[p]);
+          }
+        }
+      } else {
+        imageFile = imageFiles[0];
+      }
+    } catch (e) {
+      log('❌ PDF conversion error: ' + ((e && e.message) ? e.message : String(e)));
+      return;
+    }
+  }
+
+  // Dual-sheet detection: if the image is landscape, split into two players
+  if (typeof detectDualSheet === 'function') {
+    var dualInfo = await detectDualSheet(imageFile);
+    if (dualInfo.isDual) {
+      log('📐 Dual-sheet detected (' + dualInfo.width + 'x' + dualInfo.height +
+          ', ratio ' + dualInfo.ratio.toFixed(2) + ') — splitting into Player 1 + Player 2');
+      var halves = await splitDualSheet(imageFile, dualInfo.width, dualInfo.height);
+
+      // Load left half into Player 1, right half into Player 2 (same page slot)
+      loadSheetImage(1, sheetIndex, halves.left);
+      loadSheetImage(2, sheetIndex, halves.right);
+      return;
+    }
+  }
+
+  // Normal single-sheet image
+  loadSheetImage(player, sheetIndex, imageFile);
 }
 
 // =============================================================================
@@ -1549,14 +1618,25 @@ async function processAllSheets() {
   
   // If we have both players, merge their moves
   if (allMoves.length === 2) {
-    var merged = mergePlayerMoves(allMoves[0], allMoves[1]);
-    log('✓ Merged moves from both players: ' + merged.length + ' total');
+    // Fresh OCR for a new game — un-dismiss the informational noise notice so
+    // it shows for this game (if any noise exists). Also reset the NW
+    // alignment iteration cursor so the cascade starts from the beginning.
+    state.noiseBannerDismissed = false;
+    state.nwSearchFrom = 0;
+    state.alignmentAutoSurfaceMode = true;
+    state.dismissedNWKeys = {};
+    state.postponedNWKeys = {};
+    if (window.SheetAlignment) window.SheetAlignment.clearAllStructuralBanners();
 
-    // Store per-sheet OCR cells for context panel and download
+    // Store per-sheet OCR cells BEFORE merging so the structural pipeline
+    // (run from inside mergePlayerMoves) can see them via state.
     var whiteData = allMoves[0].color === 'white' ? allMoves[0] : allMoves[1];
     var blackData = allMoves[0].color === 'black' ? allMoves[0] : allMoves[1];
     state.ocrCellsSheet1 = whiteData.moves;
     state.ocrCellsSheet2 = blackData.moves;
+
+    var merged = mergePlayerMoves(allMoves[0], allMoves[1]);
+    log('✓ Merged moves from both players: ' + merged.length + ' total');
     state.ocrCells = merged;  // Combined cells for OCR context panel
     state.hasGridImage = merged.some(function(m) { return m.imageDataUrl; });
     state.inputMode = 'dual-sheets';
@@ -1583,9 +1663,18 @@ async function processAllSheets() {
     // Route through showOcrResults for noise review, then validate
     var paired = pairMoves(merged);
     showOcrResults(paired, 'Dual scoresheets');
-    if (!state.pendingNoiseReview) {
+    // Skip validateAndDisplay when this batch game is about to auto-enter
+    // verification mode (selectGame will fire enterVerificationMode
+    // immediately after processAllSheets returns). validateAndDisplay
+    // would fire an async fetchFixes against the PRE-Greedy OCR (which
+    // finds a stuck point somewhere early, like 6.W), renderQuickFixes
+    // resolves seconds later AFTER verification's _focusFix has already
+    // rendered its own quick-fixes for the user's resumed fix (say
+    // 19.W), and the stale pre-verify render stomps the fresh one.
+    // Skip = no stale fetchFixes = no stomp.
+    if (!state.pendingNoiseReview && !_willAutoVerify()) {
       await validateAndDisplay(paired, 'Dual scoresheets');
-      if (filesChanged) launchBackgroundSearches(paired);
+      if (filesChanged) launchBackgroundSearches();
     }
   } else {
     // Single player
@@ -1593,16 +1682,33 @@ async function processAllSheets() {
     state.ocrCells = moves;
     state.ocrCellsSheet1 = null;
     state.ocrCellsSheet2 = null;
+    state.noiseBannerDismissed = true;  // single-sheet has no per-sheet noise to flag
+    if (window.SheetAlignment) window.SheetAlignment.clearAllStructuralBanners();
     state.hasGridImage = moves.some(function(m) { return m.imageDataUrl; });
     state.inputMode = 'image';
     log('✓ Single player moves: ' + moves.length + ' total');
     var paired = pairMoves(moves);
     showOcrResults(paired, 'Single scoresheet');
-    if (!state.pendingNoiseReview) {
+    if (!state.pendingNoiseReview && !_willAutoVerify()) {
       await validateAndDisplay(paired, 'Single scoresheet');
-      if (filesChanged) launchBackgroundSearches(paired);
+      if (filesChanged) launchBackgroundSearches();
     }
   }
+}
+
+// Returns true if the currently-loading batch game will auto-enter
+// verification mode right after processAllSheets finishes. Prevents the
+// pre-verify validateAndDisplay → fetchFixes race with verification's
+// own quick-fix render.
+function _willAutoVerify() {
+  if (!window.BatchGameList || !window.BatchGameList.batchState) return false;
+  var bs = window.BatchGameList.batchState;
+  if (!bs.active || !bs.currentGameId) return false;
+  if (!window.VerificationUI) return false;
+  var game = bs.games.get(bs.currentGameId);
+  if (!game || !game.reconstructPicked) return false;
+  var res = game.reconstructPicked.result;
+  return !!(res && (res.status === 'SOLVED' || res.status === 'VALID'));
 }
 
 function mergePlayerMoves(player1Data, player2Data) {
@@ -1641,6 +1747,12 @@ function mergePlayerMoves(player1Data, player2Data) {
   var aSummary = window.MergeSheets.agreementSummary(merged);
   showTierSummaryBanner(aSummary, lockMode);
 
+  // Structural pipeline: noise gate first, alignment only after noise resolved.
+  // Re-runs automatically on every merge (including after reMergeAndRevalidate).
+  if (window.SheetAlignment) {
+    window.SheetAlignment.runStructuralChecks();
+  }
+
   return merged;
 }
 
@@ -1674,21 +1786,13 @@ function pairMoves(ocrMoves) {
 
 function refreshSheetsUI() {
   var container = document.getElementById('sheets-uploader');
-  if (container && !container.classList.contains('hidden')) {
+  if (container) {
     container.innerHTML = renderSheetsUploader();
     attachSheetEventListeners();
-  }
-  // Also refresh simple mode if visible
-  var simpleContainer = document.getElementById('simple-sheets');
-  if (simpleContainer) {
-    refreshSimpleSheetsUI();
   }
 }
 
 function updateProcessButton() {
-  // Always update simple mode button (may be the only one visible)
-  updateSimpleProcessButton();
-
   var btn = document.getElementById('btn-process-sheets');
   if (!btn) return;
 
@@ -1735,7 +1839,7 @@ function updateProcessButton() {
     }
     btn.textContent = progressParts.length > 0 ? progressParts.join(' | ') : 'Please wait...';
   } else {
-    btn.textContent = 'Process All Sheets →';
+    btn.textContent = 'Process Sheets →';
   }
 }
 
@@ -1820,27 +1924,56 @@ function showTierSummaryBanner(agreeSummary, lockMode) {
   // Compact inline layout to fit within the collapsed input bar
   banner.className = 'flex items-center gap-3 ml-3 text-xs';
 
+  // Tooltips explain the dot-color → tier mapping and what each lock mode
+  // actually freezes. &#10; renders as a line break inside the title attr
+  // across all major browsers, so we can give a real explanation without
+  // resorting to a custom popover.
+  var tipAgree = 'Both sheets wrote the same move.&#10;If the move is also legal, it&apos;s classified as Tier 1.';
+  var tipOneSheet = 'Only one sheet has data for this ply (the other was blank or unread).&#10;Classified as Tier 2 when the move is legal.';
+  var tipDisagree = 'Both sheets have data but the moves differ.&#10;Tier 2 if exactly one of the two is legal, Tier 3 otherwise.';
+  var tipLockHeader =
+    'Locked plies are frozen: the fix-finder, Greedy, Beam, and Dijkstra&#10;' +
+    'will not propose changes to them, and the user can&apos;t accidentally&#10;' +
+    'overwrite them via auto-fix. Higher tiers = more confident agreement&#10;' +
+    'between the two scoresheets.';
+  var tipLockOff =
+    'No plies locked.&#10;' +
+    'Every move is fair game for the fix-finder and the search algorithms,&#10;' +
+    'including ones both sheets agreed on. Use this if you suspect the&#10;' +
+    'agreement itself is wrong (e.g. both sheets copied the same misread).';
+  var tipLockT1 =
+    'Lock Tier 1 only.&#10;' +
+    'Tier 1 = both sheets wrote the same move AND it&apos;s legal from the&#10;' +
+    'preceding position. These are treated as ground truth — the fix-finder&#10;' +
+    'works around them. One-sheet plies and disagreements stay editable.';
+  var tipLockT12 =
+    'Lock Tier 1 + Tier 2.&#10;' +
+    'Adds the plies where only one sheet has data, or the sheets disagree&#10;' +
+    'but one of the two options is legal. The fix-finder is then restricted&#10;' +
+    'to plies where neither candidate plays out legally (Tier 3 / red).&#10;' +
+    'Most aggressive setting — use when you trust the OCR pass.';
+
   banner.innerHTML =
     '<span class="text-gray-500">|</span>' +
-    '<span class="text-green-400 cursor-help" title="Both sheets wrote the same move">' +
+    '<span class="text-green-400 cursor-help" title="' + tipAgree + '">' +
       '<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-0.5"></span>' + agreeSummary.agree + '</span>' +
     (agreeSummary.oneSheet > 0 ?
-      '<span class="text-yellow-400 cursor-help" title="Only one sheet has data for this ply">' +
+      '<span class="text-yellow-400 cursor-help" title="' + tipOneSheet + '">' +
         '<span class="inline-block w-2 h-2 rounded-full bg-yellow-400 mr-0.5"></span>' + agreeSummary.oneSheet + '</span>'
       : '') +
     (agreeSummary.disagree > 0 ?
-      '<span class="text-red-400 cursor-help" title="Both sheets have data but they disagree">' +
+      '<span class="text-red-400 cursor-help" title="' + tipDisagree + '">' +
         '<span class="inline-block w-2 h-2 rounded-full bg-red-400 mr-0.5"></span>' + agreeSummary.disagree + '</span>'
       : '') +
     '<span class="text-gray-500">|</span>' +
-    '<span class="cursor-help text-gray-400" title="Lock mode: which plies are protected from fix-finder">Lock:</span>' +
-    '<label class="flex items-center gap-0.5 cursor-pointer" title="No plies locked">' +
+    '<span class="cursor-help text-gray-400" title="' + tipLockHeader + '">Lock:</span>' +
+    '<label class="flex items-center gap-0.5 cursor-pointer" title="' + tipLockOff + '">' +
       '<input type="radio" name="lock-mode" value="none" ' + (lockMode === 'none' ? 'checked' : '') + ' class="lock-mode-radio"> <span class="text-gray-400">Off</span>' +
     '</label>' +
-    '<label class="flex items-center gap-0.5 cursor-pointer" title="Lock Tier 1 (both agree + legal)">' +
+    '<label class="flex items-center gap-0.5 cursor-pointer" title="' + tipLockT1 + '">' +
       '<input type="radio" name="lock-mode" value="tier1" ' + (lockMode === 'tier1' ? 'checked' : '') + ' class="lock-mode-radio"> <span class="text-gray-400">T1</span>' +
     '</label>' +
-    '<label class="flex items-center gap-0.5 cursor-pointer" title="Lock Tier 1 + Tier 2">' +
+    '<label class="flex items-center gap-0.5 cursor-pointer" title="' + tipLockT12 + '">' +
       '<input type="radio" name="lock-mode" value="tier1+2" ' + (lockMode === 'tier1+2' ? 'checked' : '') + ' class="lock-mode-radio"> <span class="text-gray-400">T1+2</span>' +
     '</label>';
 

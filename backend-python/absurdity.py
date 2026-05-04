@@ -95,6 +95,80 @@ def is_apparently_hanging(board: chess.Board, square: chess.Square, piece: chess
     return min_attacker < _piece_value(piece)
 
 
+def is_classically_hanging_free(board: chess.Board, square: chess.Square, piece: chess.Piece) -> bool:
+    """
+    Classical-hang check: can opponent's cheapest attacker capture at `square`
+    and sit safely afterwards (no recapture)?
+
+    Stricter than is_piece_genuinely_hanging because it does NOT consider
+    cross-board tactical compensation. Useful for EAD, where mutual-hang
+    positions (two undefended pieces on opposite sides) should fire even
+    though quiescence correctly nets them to zero.
+
+    Returns True only when the capture is genuinely free — i.e. no defender
+    attacks the square after the capture. Pieces that can be recaptured or
+    that create legitimate sacrificial compensation fall through to
+    is_piece_genuinely_hanging instead.
+
+    Turn-independent: if it isn't currently the attacker's turn, the board
+    turn is flipped in a local copy so the legal-move check works symmetrically
+    for either side (needed when probing the non-moving side's captures).
+    """
+    opponent = not piece.color
+    attackers = list(board.attackers(opponent, square))
+    if not attackers:
+        return False
+
+    if board.turn != opponent:
+        probe_board = board.copy()
+        probe_board.turn = opponent
+        probe_board.ep_square = None  # avoid stale ep state after flip
+    else:
+        probe_board = board
+
+    # Try attackers in order from cheapest up. The first legal capture
+    # decides — if that capture sits safely, piece is classically hanging.
+    attackers.sort(key=lambda s: _piece_value(board.piece_at(s)) if board.piece_at(s) else 10**6)
+    for att_sq in attackers:
+        ap = probe_board.piece_at(att_sq)
+        if ap is None:
+            continue
+        capture_move = chess.Move(att_sq, square)
+        if capture_move not in probe_board.legal_moves:
+            continue
+        test_board = probe_board.copy()
+        test_board.push(capture_move)
+        return not test_board.is_attacked_by(piece.color, square)
+
+    return False
+
+
+def side_has_independent_free_capture(board: chess.Board, by_color: chess.Color) -> bool:
+    """
+    Does `by_color` have a classically-free capture in the current position,
+    independent of any prospective capture by the opponent?
+
+    Used to gate the classical-hang fallback in EAD. When quiescence cancels
+    a mutual-hang to net 0, either:
+    (a) both sides have a pre-existing free capture that net out — two
+        independent absurdities; flag.
+    (b) compensation only exists because the opponent's capture removes a
+        defender (overloaded-defender trade) — legitimate exchange; don't flag.
+
+    This helper detects (a).
+    """
+    opp = not by_color
+    for sq in chess.SQUARES:
+        op = board.piece_at(sq)
+        if op is None or op.color != opp:
+            continue
+        if _piece_value(op) < 3:
+            continue
+        if is_classically_hanging_free(board, sq, op):
+            return True
+    return False
+
+
 def find_hanging_pieces(board: chess.Board, side: chess.Color, min_value: int = 3) -> List[Tuple[chess.Square, chess.Piece, int]]:
     """
     Find all pieces of 'side' that are apparently hanging.
@@ -250,77 +324,94 @@ def is_piece_genuinely_hanging(
     # Note: fast_mode may produce false positives for tactical positions (e.g., back-rank traps).
     # These are handled by verification at the top level (find_fixes_two_phase).
     if fast_mode:
-        # Fast mode: skip full quiescence but do a QUICK 2-ply exchange check
-        # ONLY FOR QUEENS (value >= 9). Queen hanging gives -90 penalty which
-        # buries the fix so far down that the VERIFY step (top 8) can't rescue it.
-        # For minor pieces/rooks (-30/-50 penalty), the fix stays in the top 8
-        # and the VERIFY step re-checks with full quiescence (fast_mode=False).
+        # Fast mode: skip full quiescence but do a QUICK 2-ply exchange check.
+        # After the opponent's cheapest capture of our piece, if we have a
+        # legal capture worth >= our loss, treat as a fair trade and not hanging.
         #
-        # Why only queens: the 2-ply check can't distinguish "real compensation"
-        # from "independent captures that were available anyway." For example,
-        # Ba6 hangs to bxa6, and exd5 captures an undefended knight — but that
-        # knight was capturable before Ba6 too. Only queen trades have penalties
-        # severe enough (-90) to justify the risk of false negatives.
-        if value >= 9:
-            opponent = not piece.color
+        # Two activation regimes:
+        #  - Queens (value >= 9): unconditional. The -90 penalty would otherwise
+        #    bury the fix below the top-N verify cut, and queen swaps are
+        #    unambiguous enough that the false-negative risk is acceptable.
+        #  - Non-queens: gated on "trade enabled by our move" — the recapture
+        #    target must be attacked by our just-moved piece. Without this gate
+        #    an independent pre-existing free capture (e.g. Ba6 hangs to bxa6
+        #    while exd5 captures an unrelated free knight that was capturable
+        #    before Ba6 too) would falsely suppress a real minor-piece hang.
+        #    The gate is what makes Red8/Rad8 work: rook lands on d8 attacking
+        #    d7, so the Rxd7 recapture counts as compensation for losing Bd1;
+        #    it would NOT count for an unrelated h2->h4 push.
+        opponent = not piece.color
 
-            # Collect legal captures of our queen, sorted by attacker value (lowest first).
-            # The opponent will use the cheapest capture — if that doesn't lead to a trade,
-            # the queen is genuinely hanging regardless of what higher-value captures exist.
-            # E.g., Bxd5 wins the queen outright; Qxd5 Nxd5 is a trade — but opponent plays Bxd5.
-            attacker_captures = []
-            for att_sq in board.attackers(opponent, square):
-                att_piece = board.piece_at(att_sq)
-                if att_piece is None:
-                    continue
-                capture_move = chess.Move(att_sq, square)
-                if capture_move not in board.legal_moves:
-                    continue
-                attacker_captures.append((_piece_value(att_piece), att_sq, att_piece, capture_move))
-            attacker_captures.sort(key=lambda x: x[0])  # Lowest value attacker first
+        # Collect legal captures of our piece, sorted by attacker value (lowest first).
+        # The opponent will use the cheapest capture — if that doesn't lead to a trade,
+        # the piece is genuinely hanging regardless of what higher-value captures exist.
+        # E.g., Bxd5 wins the queen outright; Qxd5 Nxd5 is a trade — but opponent plays Bxd5.
+        attacker_captures = []
+        for att_sq in board.attackers(opponent, square):
+            att_piece = board.piece_at(att_sq)
+            if att_piece is None:
+                continue
+            capture_move = chess.Move(att_sq, square)
+            if capture_move not in board.legal_moves:
+                continue
+            attacker_captures.append((_piece_value(att_piece), att_sq, att_piece, capture_move))
+        attacker_captures.sort(key=lambda x: x[0])  # Lowest value attacker first
 
-            for att_val, att_sq, att_piece, capture_move in attacker_captures:
-                test_board = board.copy()
-                test_board.push(capture_move)
+        # Squares attacked by our just-moved piece — used to gate the
+        # non-queen trade check (see comment above). Empty when no move
+        # context is available; non-queens then fall through to "hanging".
+        moved_piece_attacks = (
+            set(board.attacks(move_just_played.to_square))
+            if move_just_played is not None else set()
+        )
 
-                # Can we recapture THEIR queen (or higher)?
-                found_trade = False
-                for our_move in test_board.legal_moves:
-                    if test_board.is_capture(our_move):
-                        target = test_board.piece_at(our_move.to_square)
-                        if target and _piece_value(target) >= value:
-                            if debug:
-                                recapture_san = test_board.san(our_move)
-                                print(f"    [HANG-DEBUG] {piece.symbol()} on {sq_name}: "
-                                      f"fast mode - NOT hanging (queen trade: {recapture_san} "
-                                      f"recovers {_piece_value(target)} pts)")
-                            found_trade = True
-                            return False, 0, f"fast mode: queen trade ({test_board.san(our_move)})"
+        for att_val, att_sq, att_piece, capture_move in attacker_captures:
+            test_board = board.copy()
+            test_board.push(capture_move)
 
-                if not found_trade:
-                    # Before declaring hanging, check promotion compensation:
-                    # After opponent captures our queen, can we promote on our
-                    # reply? Check test_board (our turn after capture) for any
-                    # legal promotion move. This properly handles blocked pawns
-                    # (e.g., pawn on g7 blocked by rook on g8 with nothing on f8/h8).
-                    has_promotion = False
-                    for lm in test_board.legal_moves:
-                        if lm.promotion is not None:
-                            has_promotion = True
-                            break
-                    if has_promotion:
+            # Can we recapture a piece of equal or greater value?
+            found_trade = False
+            for our_move in test_board.legal_moves:
+                if test_board.is_capture(our_move):
+                    target = test_board.piece_at(our_move.to_square)
+                    if target and _piece_value(target) >= value:
+                        # Non-queen gate: only count this trade as
+                        # compensation if it's enabled by our move
+                        # (target attacked by the piece we just moved).
+                        if value < 9 and our_move.to_square not in moved_piece_attacks:
+                            continue
                         if debug:
+                            recapture_san = test_board.san(our_move)
                             print(f"    [HANG-DEBUG] {piece.symbol()} on {sq_name}: "
-                                  f"fast mode - NOT hanging (promotion compensation available)")
-                        return False, 0, "fast mode: promotion compensation"
+                                  f"fast mode - NOT hanging (trade: {recapture_san} "
+                                  f"recovers {_piece_value(target)} pts)")
+                        found_trade = True
+                        return False, 0, f"fast mode: trade ({test_board.san(our_move)})"
 
-                    # Cheapest capture doesn't lead to a trade — queen is genuinely hanging.
-                    # Don't check higher-value captures (opponent will use this one).
+            if not found_trade:
+                # Before declaring hanging, check promotion compensation:
+                # after opponent captures our piece, can we promote on our
+                # reply? Check test_board (our turn after capture) for any
+                # legal promotion move. This properly handles blocked pawns
+                # (e.g., pawn on g7 blocked by rook on g8 with nothing on f8/h8).
+                has_promotion = False
+                for lm in test_board.legal_moves:
+                    if lm.promotion is not None:
+                        has_promotion = True
+                        break
+                if has_promotion:
                     if debug:
                         print(f"    [HANG-DEBUG] {piece.symbol()} on {sq_name}: "
-                              f"fast mode - hanging ({att_piece.symbol()} on "
-                              f"{chess.square_name(att_sq)} captures with no trade)")
-                    return True, value, "hanging (fast mode)"
+                              f"fast mode - NOT hanging (promotion compensation available)")
+                    return False, 0, "fast mode: promotion compensation"
+
+                # Cheapest capture doesn't lead to a trade — piece is genuinely hanging.
+                # Don't check higher-value captures (opponent will use this one).
+                if debug:
+                    print(f"    [HANG-DEBUG] {piece.symbol()} on {sq_name}: "
+                          f"fast mode - hanging ({att_piece.symbol()} on "
+                          f"{chess.square_name(att_sq)} captures with no trade)")
+                return True, value, "hanging (fast mode)"
 
         if debug:
             print(f"    [HANG-DEBUG] {piece.symbol()} on {sq_name}: hanging (fast mode)")
@@ -336,8 +427,11 @@ def is_piece_genuinely_hanging(
             print(f"    [HANG-DEBUG] {piece.symbol()} on {sq_name}: trap - {expl}")
         return False, 0, f"trap: {expl}"
 
-    # Check threshold - only flag if significant gain
-    if net_gain >= 3:  # Minor piece or higher
+    # Check threshold - flag if opponent gains 2+ material.
+    # Using 2 rather than 3 catches cases where the bishop/knight is "sort of" hanging:
+    # e.g. Bh6 gxh6, where white can grab a pawn back via Bxa6 later (net=+2 for black).
+    # Net gain of 2+ is still highly suspicious for a non-capturing move.
+    if net_gain >= 2:
         if debug:
             print(f"    [HANG-DEBUG] {piece.symbol()} on {sq_name}: genuinely hanging, opponent gains {net_gain}")
         return True, net_gain, f"hanging, opponent gains {net_gain}"
@@ -609,12 +703,60 @@ def find_free_captures(board: chess.Board, side_to_move: chess.Color) -> List[Tu
     return free_captures
 
 
+def find_free_captures_with_check(board: chess.Board, side_to_move: chess.Color,
+                                   max_depth: int = 10) -> List[Tuple[chess.Move, chess.Piece, int]]:
+    """
+    Find captures that give check AND win material, verified by quiescence.
+
+    Much narrower than find_free_captures — only fires on captures that also
+    give check. A free capture with check is an immediate forcing threat that
+    no human would allow, regardless of skill level (reconstruction plausibility).
+
+    Only runs quiescence on captures that give check, so in most positions
+    (where zero captures give check) this is essentially free.
+
+    Default max_depth=10 is needed for deep exchanges on the captured square
+    (e.g., Rxg7+ Rxg7 Bxg7 Rxg7 Rxg5 Rxg5 hxg5 hxg5 needs ~8 plies to fully
+    resolve). Shallower search returns premature material counts mid-exchange,
+    falsely flagging non-free captures as free.
+
+    For per-candidate scoring during fix-finding (where this is called 30+
+    times per ply), pass max_depth=6 — fast path. Top candidates get re-checked
+    at full depth in _postprocess_phase2_fixes' verify pass, so any false
+    negatives at depth=6 are caught for the candidates that matter.
+    """
+    free_captures = []
+
+    for move in board.legal_moves:
+        if not board.is_capture(move) or board.is_en_passant(move):
+            continue
+
+        # Cheap gate: does this capture give check?
+        board.push(move)
+        gives_check = board.is_check()
+        board.pop()
+        if not gives_check:
+            continue
+
+        captured_piece = board.piece_at(move.to_square)
+        if not captured_piece:
+            continue
+
+        # Quiescence to verify capture is genuinely free (not a trap)
+        is_trap, net_gain, _ = would_capture_be_bad_quiescence(board, move.to_square, threshold=0, max_depth=max_depth)
+
+        if not is_trap and net_gain >= 1:
+            free_captures.append((move, captured_piece, net_gain))
+
+    return free_captures
+
+
 # =============================================================================
 # CORE ABSURDITY DETECTION
 # =============================================================================
 
 def detect_absurdity_at_ply(moves: List[str], check_ply: int,
-                            verbose: bool = False, threshold: int = 3,
+                            verbose: bool = False, threshold: int = 2,
                             fast_mode: bool = False,
                             board: chess.Board = None) -> Optional[Absurdity]:
     """
@@ -657,6 +799,32 @@ def detect_absurdity_at_ply(moves: List[str], check_ply: int,
 
     # Check if the side to move is in check BEFORE they move
     was_in_check = board.is_check()
+
+    # === BAD-TRADE ABSURDITY ===
+    # Mirror of piece_left_hanging for the case where the destination *is*
+    # defended yet outgunned: e.g. Bxe5 in 3rr1k1/1pp3pp/pnn5/3ppb2/8/
+    # 1P2PNB1/P3BPPP/2RR2K1 — bishop captures pawn, defenders=1, attackers=3,
+    # SEE nets -2. is_apparently_hanging treats the destination as defended
+    # so piece_left_hanging never fires; SEE catches it.
+    # is_bad_trade_move already includes a tactical-compensation escape hatch
+    # (mate-in-1 / free big recapture) so genuine sacrifices don't trip it.
+    # Skipped when the move is forced (only legal response to check).
+    is_forced = was_in_check and len(list(board.legal_moves)) == 1
+    if not is_forced:
+        is_bad, loss, explanation = is_bad_trade_move(board, move)
+        if is_bad and loss >= threshold:
+            moving_piece = board.piece_at(move.from_square)
+            piece_sym = moving_piece.symbol().upper() if moving_piece else '?'
+            to_sq_name = chess.square_name(move.to_square)
+            return Absurdity(
+                ply=check_ply,
+                move_played=move_san,
+                absurdity_type='bad_trade',
+                details=f"{piece_name(piece_sym)} {explanation} on {to_sq_name}",
+                severity=loss,
+                hanging_piece=piece_sym,
+                hanging_square=to_sq_name,
+            )
 
     # Check if this move is a capture - we'll need this for trade detection
     was_capture = board.is_capture(move)
@@ -747,31 +915,18 @@ def detect_absurdity_at_ply(moves: List[str], check_ply: int,
     if not candidates:
         return None
 
-    # Check if opponent captures any hanging piece on next move
-    # If so, it's a blunder, not an absurdity (opponent DID react)
-    # ALSO: if opponent gives CHECK instead of capturing, that's a strong
-    # alternative — the check maintains initiative and they can likely
-    # capture the hanging piece later. Not absurd.
+    # If opponent gives CHECK on the very next move, that's a strong
+    # tactical choice — not evidence of OCR error.
+    # We no longer exempt the case where opponent simply captures the hanging piece:
+    # losing material for nothing is absurd regardless of whether the opponent takes.
     if check_ply + 1 < len(moves):
         next_move = try_move(board, moves[check_ply + 1])
         if next_move:
-            # Filter out pieces that opponent captures on next move
-            candidates = [(sq, pc, val) for sq, pc, val in candidates
-                          if not (next_move.to_square == sq and board.is_capture(next_move))]
-            # If next move gives check, opponent chose check over capturing —
-            # that's a legitimate tactical choice, not evidence of OCR error
-            if candidates:
-                board.push(next_move)
-                next_move_gives_check = board.is_check()
-                board.pop()
-                if next_move_gives_check:
-                    # Opponent gave check instead of capturing hanging piece(s).
-                    # Filter out hanging pieces that opponent COULD still capture
-                    # later (i.e., they're not going anywhere). The check is likely
-                    # stronger. Only keep candidates where the hanging piece can
-                    # escape on the move after check response (complex - for now,
-                    # just exempt all candidates since check > capture is normal chess).
-                    candidates = []
+            board.push(next_move)
+            next_move_gives_check = board.is_check()
+            board.pop()
+            if next_move_gives_check:
+                candidates = []
 
     if not candidates:
         return None
@@ -798,19 +953,30 @@ def detect_absurdity_at_ply(moves: List[str], check_ply: int,
             debug=verbose
         )
 
-        if is_hanging and net_gain >= threshold:
-            square_name = chess.square_name(sq)
-            piece_sym = pc.symbol().upper()
+        if is_hanging:
+            # If this move was a capture, credit the material we gained
+            # against the hanging loss. net_gain (and the fast_mode raw
+            # piece value) only measure what the opponent earns at the
+            # destination — they don't subtract what we already pocketed
+            # with our capture. Without this, e.g. R6xg5 (rook takes
+            # knight, rook then attackable by pawn) was scored severity=5
+            # → -50 penalty, even though the actual exchange nets ~1-2.
+            # Mirrors is_bad_trade_move which already returns severity=
+            # opp_gain - captured_val.
+            effective_loss = net_gain - captured_value if was_capture else net_gain
+            if effective_loss >= threshold:
+                square_name = chess.square_name(sq)
+                piece_sym = pc.symbol().upper()
 
-            return Absurdity(
-                ply=check_ply,
-                move_played=move_san,
-                absurdity_type='piece_left_hanging',
-                details=f"Left {piece_name(piece_sym)} hanging on {square_name} (opponent gains {net_gain:+d}), opponent ignored it",
-                severity=net_gain,
-                hanging_piece=piece_sym,
-                hanging_square=square_name
-            )
+                return Absurdity(
+                    ply=check_ply,
+                    move_played=move_san,
+                    absurdity_type='piece_left_hanging',
+                    details=f"Left {piece_name(piece_sym)} hanging on {square_name} (opponent gains {net_gain:+d}, net loss {effective_loss:+d}), opponent ignored it",
+                    severity=effective_loss,
+                    hanging_piece=piece_sym,
+                    hanging_square=square_name
+                )
 
     return None
 
@@ -824,7 +990,7 @@ def find_first_absurdity(moves: List[str], verbose: bool = False,
     """Find the first move that creates an absurd situation. Returns ply number."""
     for ply in range(len(moves)):
         absurdity = detect_absurdity_at_ply(moves, ply, verbose=False, fast_mode=fast_mode)
-        if absurdity and absurdity.severity >= 3:
+        if absurdity and absurdity.severity >= 2:
             if verbose:
                 print(f"   Absurdity at {ply_to_str(ply)}: {absurdity.details}")
             return ply
@@ -836,7 +1002,7 @@ def find_first_absurdity_full(moves: List[str], verbose: bool = False,
     """Find the first absurdity and return the full Absurdity object."""
     for ply in range(len(moves)):
         absurdity = detect_absurdity_at_ply(moves, ply, verbose=False, fast_mode=fast_mode)
-        if absurdity and absurdity.severity >= 3:
+        if absurdity and absurdity.severity >= 2:
             if verbose:
                 print(f"   Absurdity at {ply_to_str(ply)}: {absurdity.details}")
             return absurdity
@@ -874,7 +1040,7 @@ def find_all_absurdities(moves: List[str], verbose: bool = False,
         # Pass the pre-built board to avoid replay from ply 0
         absurdity = detect_absurdity_at_ply(moves, ply, verbose=False, fast_mode=fast_mode,
                                              board=incremental_board)
-        if absurdity and absurdity.severity >= 3:
+        if absurdity and absurdity.severity >= 2:
             if verbose:
                 print(f"   Absurdity at {ply_to_str(ply)}: {absurdity.details}")
             absurdities.append(absurdity)
@@ -1081,70 +1247,193 @@ def find_check_symbol_mismatches(moves: List[str], verbose: bool = False) -> Lis
 # BAD TRADE DETECTION (for instant flagging)
 # =============================================================================
 
+def see_at_square(board: chess.Board, square: chess.Square, by_color: chess.Color) -> int:
+    """
+    Static Exchange Evaluation at `square`, initiated by `by_color`.
+
+    Alternates cheapest captures at `square` and returns the minimax net
+    material gain for the initiator. Unlike full quiescence, this does NOT
+    explore cross-board tactics — it answers the narrow question "will an
+    exchange sequence at this square win material?" without being influenced
+    by pre-existing tactical opportunities elsewhere on the board.
+
+    The distinction matters for bad_trade detection: a knight walking onto a
+    square defended by an equal-value piece is a fair local trade even if the
+    opponent has a separate winning move on a third piece.
+    """
+    b = board.copy()
+    gains = []
+    side = by_color
+    while True:
+        target = b.piece_at(square)
+        if target is None:
+            break
+        attackers = list(b.attackers(side, square))
+        if not attackers:
+            break
+        attackers.sort(key=lambda s: _piece_value(b.piece_at(s)) if b.piece_at(s) else 10**6)
+
+        # Pick the cheapest attacker that can legally capture. A king cannot
+        # capture into a square still defended by the opposite side (would
+        # move into check). Other pieces are assumed legal here — full
+        # pin-aware handling would require a deeper engine.
+        chosen = None
+        for att_sq in attackers:
+            ap = b.piece_at(att_sq)
+            if ap is None:
+                continue
+            if ap.piece_type == chess.KING and b.is_attacked_by(not side, square):
+                continue  # king can't move into a defended square
+            chosen = (att_sq, ap)
+            break
+
+        if chosen is None:
+            break
+
+        att_sq, att_piece = chosen
+        gains.append(_piece_value(target))
+        b.remove_piece_at(att_sq)
+        b.remove_piece_at(square)
+        b.set_piece_at(square, att_piece)
+        side = not side
+
+    # Minimax: each capturer can stop the sequence if continuing loses material.
+    score = 0
+    for g in reversed(gains):
+        score = max(0, g - score)
+    return score
+
+
+def _capture_has_tactical_compensation(board: chess.Board, our_move: chess.Move,
+                                       to_square: chess.Square, our_loss: int) -> bool:
+    """
+    After we play `our_move` and the opponent captures at `to_square` with
+    their cheapest attacker, do we have a forcing reply (mate, or a free
+    capture worth at least `our_loss`) that compensates for the material?
+
+    SEE alone misses sacrifices that work because the opponent's capture
+    enables a tactic for us — e.g. Bd6 unblocks the c-file so that after
+    Bxd6, Rxc1 is mate. Without this check, every such sacrifice would be
+    flagged as a bad trade.
+
+    Scope is intentionally narrow: only mate-in-1 and "free big capture"
+    after a single opponent recapture. Deeper tactics fall through to the
+    user. The point is to avoid loud false positives on obvious sacrifices,
+    not to do full engine search.
+    """
+    tb = board.copy()
+    tb.push(our_move)
+
+    captures = [m for m in tb.legal_moves
+                if m.to_square == to_square and tb.is_capture(m)]
+    if not captures:
+        return False
+
+    captures.sort(key=lambda m: _piece_value(tb.piece_at(m.from_square))
+                  if tb.piece_at(m.from_square) else 10**6)
+    opp_capture = captures[0]
+    tb.push(opp_capture)
+
+    for m in tb.legal_moves:
+        gives_check = tb.gives_check(m)
+        is_capture = tb.is_capture(m)
+        if not (gives_check or is_capture):
+            continue
+
+        if gives_check:
+            tb.push(m)
+            if tb.is_checkmate():
+                return True
+            tb.pop()
+
+        if is_capture:
+            captured = tb.piece_at(m.to_square)
+            if captured is None:
+                continue
+            cap_val = _piece_value(captured)
+            if cap_val < our_loss:
+                continue
+            # Confirm capture isn't lost back. After we push, it is opponent's
+            # turn (tb.turn == opponent), so SEE is initiated by tb.turn.
+            tb.push(m)
+            see_back = see_at_square(tb, m.to_square, tb.turn)
+            tb.pop()
+            if cap_val - see_back >= our_loss:
+                return True
+
+    return False
+
+
 def is_bad_trade_move(board: chess.Board, move: chess.Move) -> Tuple[bool, int, str]:
     """
-    Check if a capture is a bad trade - BEFORE making the move.
+    Check if a move is a bad trade - BEFORE making the move.
 
-    Returns: (is_bad_trade, material_loss, explanation)
+    Handles both captures (where we take an opponent piece) and non-captures
+    (where we walk a piece onto an attacked square). Returns our net material
+    loss from the exchange that starts at the destination square.
 
-    Uses QUIESCENCE SEARCH for accurate exchange evaluation.
-    This handles arbitrarily deep exchange sequences like:
-    Rxd5 Qxd5 cxd5 Bxd5 exd5...
+    Returns: (is_bad_trade, our_material_loss, explanation)
 
-    Only called in forward pass (EAD), not in fix-finding, so the
-    ~1-5ms cost per capture is acceptable for accuracy.
+    Uses a FOCUSED static exchange evaluation (SEE) at the target square —
+    alternating cheapest captures only, no cross-board tactics. This keeps
+    the check aligned with its intent ("is the piece immediately losing on
+    this square?") and prevents false positives where a move would be flagged
+    because the opponent has an unrelated winning capture elsewhere.
+
+    Fires at our_loss >= 2 to cover exchange sacrifices (rook-for-bishop)
+    and minor-for-pawn — not just full-piece hangs.
     """
-    if not board.is_capture(move):
-        return False, 0, ""
-
-    captured = board.piece_at(move.to_square)
-    if not captured:  # en passant - pawn for pawn, never bad
-        return False, 0, ""
-
     capturing = board.piece_at(move.from_square)
     if not capturing:
         return False, 0, ""
 
-    captured_val = _piece_value(captured)
     capturing_val = _piece_value(capturing)
+    is_capture = board.is_capture(move)
 
-    # If capturing with equal or lesser value, it's fine
-    if capturing_val <= captured_val:
-        return False, 0, ""
+    captured_val = 0
+    if is_capture:
+        captured = board.piece_at(move.to_square)
+        if not captured:  # en passant - pawn for pawn, never bad
+            return False, 0, ""
+        captured_val = _piece_value(captured)
 
-    # Quick check: can we even be recaptured?
+        # If capturing with equal or lesser value, it's fine
+        if capturing_val <= captured_val:
+            return False, 0, ""
+    else:
+        # Non-capture: only worth checking pieces worth 3+
+        # (pawns walking into attacks are too common to flag)
+        if capturing_val < 3:
+            return False, 0, ""
+
     test_board = board.copy()
     test_board.push(move)
     opponent = test_board.turn
     to_square = move.to_square
 
     if not test_board.is_attacked_by(opponent, to_square):
-        return False, 0, ""  # Can't be recaptured - trade is safe
+        return False, 0, ""  # Can't be recaptured - move is safe
 
-    # Use QUIESCENCE SEARCH for accurate exchange evaluation
-    # This searches all forcing moves until the position is quiet
-    #
-    # IMPORTANT: After our capture, it's OPPONENT's turn.
-    # would_capture_be_bad_quiescence evaluates from OPPONENT's perspective.
-    # - is_trap=True means opponent's recapture is bad for OPPONENT
-    #   → our original capture was GOOD (not a bad trade)
-    # - is_trap=False means opponent's recapture is safe/good for OPPONENT
-    #   → our original capture was BAD
-    # - net_gain is from OPPONENT's view (positive = good for opponent)
-    is_trap, net_gain, _ = would_capture_be_bad_quiescence(
-        test_board, to_square, threshold=0, max_depth=8
-    )
+    # Focused SEE: what does opponent net from the exchange sequence at
+    # this square alone? (Independent of any other tactical opportunities.)
+    opp_gain = see_at_square(test_board, to_square, opponent)
 
-    # If opponent's recapture is a trap (bad for them), our capture was GOOD
-    if is_trap:
-        return False, 0, ""
+    # Our net loss = opponent's gain from this square minus anything we
+    # pocketed with our original capture.
+    our_loss = opp_gain - captured_val
 
-    # If opponent gains significant material by recapturing, our capture was BAD
-    # net_gain > 0 means opponent profits from the exchange
-    if net_gain > 2:
+    if our_loss >= 2:
+        # Tactical sacrifice check: opponent's capture may enable a forcing
+        # reply (mate or big free capture) that compensates the material.
+        if _capture_has_tactical_compensation(board, move, to_square, our_loss):
+            return False, 0, ""
+
         piece_names = {1: "pawn", 3: "minor", 5: "Rook", 9: "Queen"}
-        expl = f"{piece_names.get(capturing_val, 'piece')} takes {piece_names.get(captured_val, 'piece')}, loses {net_gain}"
-        return True, net_gain, expl
+        if is_capture:
+            expl = f"{piece_names.get(capturing_val, 'piece')} takes {piece_names.get(captured_val, 'piece')}, loses {our_loss}"
+        else:
+            expl = f"{piece_names.get(capturing_val, 'piece')} walks into loss of {our_loss}"
+        return True, our_loss, expl
 
     return False, 0, ""
 
@@ -1157,7 +1446,7 @@ def evaluate_capture_trade(board: chess.Board, move: chess.Move) -> Tuple[bool, 
 def should_flag_move_immediately(board: chess.Board, move: chess.Move) -> Tuple[bool, str]:
     """Pre-flight check: Should this move be flagged BEFORE playing it?"""
     is_bad, loss, explanation = is_bad_trade_move(board, move)
-    if is_bad and loss >= 3:
+    if is_bad and loss >= 2:
         return True, f"BAD TRADE: {explanation}"
     return False, ""
 

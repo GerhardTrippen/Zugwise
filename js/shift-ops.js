@@ -143,22 +143,25 @@ function rebuildFromOcrCells() {
     var m = paired[mIdx];
 
     if (cell.color === 'w') {
-      // Restore fixed/locked status (protects from revalidation overwrite)
-      if (cell._status === 'fixed' || cell._status === 'locked') {
-        m.wStatus = cell._status;
-        // Apply corrected move text for fixed/locked (per-sheet cells kept
-        // original OCR for merge agreement, so merged text is uncorrected)
-        if (cell._correctedMove) m.white = cell._correctedMove;
-      }
+      // Restore ANY stored status (ok/fixed/locked). Fixed/locked protects
+      // the move from revalidation overwrite; 'ok' is cosmetic (revalidate
+      // will reset it anyway) but restoring it here avoids a noisy-looking
+      // "status drifted" gap between rebuild and revalidate completion.
+      if (cell._status) m.wStatus = cell._status;
+      // Apply corrected move text for ANY corrected move — fixed/locked AND
+      // auto-corrected (status='ok' but EAD applied an OCR alternative). Per-
+      // sheet cells kept the original OCR text so merge agreement could be
+      // computed from raw OCR; without restoring the corrected text here, the
+      // re-merge would silently revert auto-corrections to their original
+      // (often illegal) OCR, dragging validation back to the earliest such move.
+      if (cell._correctedMove) m.white = cell._correctedMove;
       // Restore correction metadata for ALL corrected moves (auto or manual)
-      // so 🔄/⚡ indicators and "was:" tooltips survive structural changes
+      // so 🔄/⚡ indicators and "was:" tooltips survive structural changes.
       if (cell._fixOriginal) m.wOriginal = cell._fixOriginal;
       if (cell._ocrAlt) m.wOcrAlt = true;
     } else {
-      if (cell._status === 'fixed' || cell._status === 'locked') {
-        m.bStatus = cell._status;
-        if (cell._correctedMove) m.black = cell._correctedMove;
-      }
+      if (cell._status) m.bStatus = cell._status;
+      if (cell._correctedMove) m.black = cell._correctedMove;
       if (cell._fixOriginal) m.bOriginal = cell._fixOriginal;
       if (cell._ocrAlt) m.bOcrAlt = true;
     }
@@ -214,6 +217,47 @@ function adjustAllTrackingArrays(atPly, op) {
   // Trust all moves before atPly — they haven't changed.
   // Revalidation (EAD) will start from atPly, which is where the shift happens.
   state.confirmedPly = atPly;
+}
+
+/**
+ * Truncate the move list to keep only the first `keepCount` plies — used to
+ * delete likely-noise cells after the game is validated (e.g. trailing OCR
+ * after checkmate).
+ */
+function truncateTrailingNoise(keepCount) {
+  if (keepCount == null || keepCount < 0) return;
+  var removed = 0;
+  clearStaleState();
+
+  if (state.ocrCells && state.ocrCells.length > keepCount) {
+    syncCorrectionsToOcrCells();
+    removed = state.ocrCells.length - keepCount;
+    state.ocrCells.splice(keepCount);
+    renumberOcrCells(state.ocrCells);
+    rebuildFromOcrCells();
+  } else {
+    var plyCount = 0;
+    (state.moves || []).forEach(function(m) {
+      if (m.white) plyCount++;
+      if (m.black) plyCount++;
+    });
+    if (plyCount <= keepCount) return;
+    if (state.sans) state.sans = state.sans.slice(0, keepCount);
+    if (typeof rebuildMovesFromSans === 'function') rebuildMovesFromSans();
+    removed = plyCount - keepCount;
+  }
+
+  state.confirmedPly = keepCount;
+  // The user has explicitly chopped the trailing noise via the per-row 🗑️
+  // button (or post-checkmate "🗑️ Delete" link in validation.js:679) — the
+  // yellow noise-review panel's purpose is fulfilled. Without this clear,
+  // pendingNoiseReview stays true forever for users who use these buttons
+  // instead of the yellow Continue panel, and the snapshot persists it
+  // across game switches (batch-game-list.js:494).
+  state.pendingNoiseReview = false;
+  log('🗑️ Trimmed ' + removed + ' trailing noise move' + (removed === 1 ? '' : 's'));
+  renderMoveList();
+  if (typeof revalidate === 'function') revalidate();
 }
 
 /**
@@ -318,24 +362,44 @@ function findSheetCellIndex(sheetCells, moveNum, plyColor) {
  * Copy fix metadata from per-sheet cells onto the merged cells.
  * mergeSheets() creates fresh objects that drop these fields, so this step
  * restores them so rebuildFromOcrCells() can pick them up.
+ *
+ * IMPORTANT — per-key field merge, not "first sheet wins":
+ * syncCorrectionsToOcrCells only sets _correctedMove on a per-sheet cell when
+ * corr.move differs from cells[i].move. So if ONE sheet's raw OCR happens to
+ * match the corrected text (e.g. sheet2 wrote "Re8" while sheet1 misread as
+ * "Ke8" and validation corrected to "Re8"), only the OTHER sheet's cell ends
+ * up with _correctedMove. If we use a "first sheet wins" scheme and the sheet
+ * WITHOUT _correctedMove happens to get indexed first (it has _status so it
+ * isn't skipped), the _correctedMove from the other sheet is silently lost
+ * and the move reverts to raw OCR on re-merge.
+ *
+ * The fix: merge fields independently — for each key, take _correctedMove
+ * from whichever sheet has it, _fixOriginal from whichever has it, etc.
+ * For _status, prefer fixed > locked > ok when they differ.
  */
 function _copySheetMetadataToMerged(merged, sheet1, sheet2) {
-  // Build metadata index from both sheets keyed by (num, color)
   var meta = {};
+  var _STATUS_PRIORITY = { fixed: 3, locked: 2, ok: 1 };
+
   function indexSheet(cells) {
     if (!cells) return;
     for (var i = 0; i < cells.length; i++) {
       var c = cells[i];
-      if (!c._status && !c._correctedMove) continue;
+      if (!c._status && !c._correctedMove && !c._fixOriginal && !c._originalOcr && !c._ocrAlt) continue;
       var key = c.num + '_' + c.color;
-      // First sheet wins (both were synced from same state.moves, so same values)
-      if (!meta[key]) {
-        meta[key] = {};
-        if (c._status) meta[key]._status = c._status;
-        if (c._fixOriginal) meta[key]._fixOriginal = c._fixOriginal;
-        if (c._originalOcr) meta[key]._originalOcr = c._originalOcr;
-        if (c._ocrAlt) meta[key]._ocrAlt = true;
-        if (c._correctedMove) meta[key]._correctedMove = c._correctedMove;
+      if (!meta[key]) meta[key] = {};
+      // _correctedMove: take from whichever sheet has it. If both sheets have
+      // different values (shouldn't normally happen — both sync from the same
+      // state.moves), the later-indexed sheet wins, matching how status sync
+      // has always worked.
+      if (c._correctedMove) meta[key]._correctedMove = c._correctedMove;
+      if (c._fixOriginal && !meta[key]._fixOriginal) meta[key]._fixOriginal = c._fixOriginal;
+      if (c._originalOcr && !meta[key]._originalOcr) meta[key]._originalOcr = c._originalOcr;
+      if (c._ocrAlt) meta[key]._ocrAlt = true;
+      if (c._status) {
+        var existing = _STATUS_PRIORITY[meta[key]._status] || 0;
+        var incoming = _STATUS_PRIORITY[c._status] || 0;
+        if (incoming > existing) meta[key]._status = c._status;
       }
     }
   }
@@ -360,8 +424,16 @@ function _copySheetMetadataToMerged(merged, sheet1, sheet2) {
  * Rebuild state.fixedPlies and state.approvedPlies from current state.moves.
  * Called after structural changes in dual mode where ply indices shift and
  * the old arrays become stale.
+ *
+ * @param {number} [changePly] - Ply where the structural edit happened. When
+ *   provided, confirmedPly is clamped to changePly (so moves before the edit
+ *   stay confirmed and re-validation walks forward from the change point
+ *   instead of from move 1). When omitted, confirmedPly is preserved as-is —
+ *   the previous "always reset to 0" behavior caused validation to jump back
+ *   to the earliest still-broken move on every re-merge, losing the user's
+ *   working position.
  */
-function _rebuildFixedPliesFromMoves() {
+function _rebuildFixedPliesFromMoves(changePly) {
   var fixed = [];
   var approved = [];
   if (!state.moves) return;
@@ -380,16 +452,29 @@ function _rebuildFixedPliesFromMoves() {
   });
   state.fixedPlies = fixed;
   state.approvedPlies = approved;
-  // Reset confirmedPly — structural change can affect the whole game
-  state.confirmedPly = 0;
+  if (typeof changePly === 'number' && changePly >= 0) {
+    var prev = state.confirmedPly || 0;
+    state.confirmedPly = Math.min(prev, changePly);
+  }
+  // else: leave confirmedPly alone — caller didn't tell us where the edit
+  // happened, so we can't know what to invalidate.
 }
 
 /**
  * Re-merge dual sheets and revalidate after a structural change.
+ *
+ * @param {number} [changePly] - Ply where the structural edit happened.
+ *   Threaded into _rebuildFixedPliesFromMoves to clamp confirmedPly so
+ *   re-validation resumes near the change point instead of restarting at 0.
  */
-function reMergeAndRevalidate() {
+function reMergeAndRevalidate(changePly) {
   if (!state.ocrCellsSheet1 || !state.ocrCellsSheet2) return;
   if (!window.MergeSheets) return;
+
+  // Snapshot the user's approved fixes BEFORE the re-merge wipes metadata
+  // at/after the change point. We restore them by content matching after
+  // revalidate so a structural shift doesn't lose downstream work.
+  var fixSnapshot = _snapshotApprovedFixesByContent();
 
   // Re-merge
   var whiteMoves = state.ocrCellsSheet1;
@@ -413,11 +498,311 @@ function reMergeAndRevalidate() {
   // Rebuild from merged cells (restores wStatus/bStatus from _status on cells)
   rebuildFromOcrCells();
 
+  // Restore approved fixes by content matching against the new move sequence.
+  // Runs BEFORE _rebuildFixedPliesFromMoves so the rebuilt arrays include the
+  // restored fixes.
+  var restored = _restoreApprovedFixesByContent(fixSnapshot, changePly);
+
   // Rebuild tracking arrays from the restored statuses
-  _rebuildFixedPliesFromMoves();
+  _rebuildFixedPliesFromMoves(changePly);
+
+  // Push confirmedPly past the highest restored fix so the user resumes after
+  // their preserved work, not before it.
+  if (restored.maxRestoredPly >= 0) {
+    state.confirmedPly = Math.max(state.confirmedPly || 0, restored.maxRestoredPly + 1);
+  }
 
   renderMoveList();
   revalidate();
+
+  // Re-run the structural pipeline (noise gate first, then alignment) after
+  // every structural edit. If noise reappears (rare — usually only after very
+  // odd manual edits), the noise banner takes precedence again.
+  if (window.SheetAlignment) {
+    window.SheetAlignment.runStructuralChecks();
+  }
+
+  // Structural edits invalidate any stored algorithm results: those were
+  // computed against a different OCR sequence (different ply positions,
+  // different content at the change region), so applying them now would
+  // place fixes at wrong logical plies. Symptom this guards against:
+  // user applies NW gap-insert, switches games, switches back — auto-
+  // enter Review fires with the stale pre-NW Greedy picked and stages
+  // its old fixes (e.g. 44.W → Rg5) over the freshly-merged Ra6. That
+  // leaks algorithm proposals into state.moves with no Review approval.
+  //
+  // In batch mode: orchestrator.requeue resets per-game aggregate AND
+  // fires onGameReset, which clears batchState.reconstructResults +
+  // game.reconstructPicked + the side panels via BatchPanelBridge —
+  // so subsequent selectGame can no longer auto-enter on stale data,
+  // and the algorithms re-run on the new OCR. rerunCurrentGame skips
+  // the 1.5s fix-debounce because a structural edit isn't a "burst of
+  // fixes" — we want the invalidation to land immediately.
+  //
+  // Outside batch mode: still null the interactive globals + clear
+  // panels so the Review buttons can't fire on stale results.
+  if (typeof window !== 'undefined') {
+    window.greedyResult = null;
+    window.beamResult = null;
+    window.dijkstraResult = null;
+  }
+  ['greedy', 'beam', 'dijkstra'].forEach(function(panel) {
+    if (typeof clearPanelLog === 'function') {
+      try { clearPanelLog(panel); } catch (e) { /* non-fatal */ }
+    }
+  });
+  if (window.BatchGameList && window.BatchGameList.batchState &&
+      window.BatchGameList.batchState.active &&
+      typeof window.BatchGameList.rerunCurrentGame === 'function') {
+    try { window.BatchGameList.rerunCurrentGame(); } catch (e) {
+      console.warn('[shift-ops] rerunCurrentGame after structural edit failed:', e);
+    }
+  } else if (typeof runAllSearches === 'function') {
+    // Interactive mode parity with batch: a structural edit invalidates
+    // every prior algorithm result (different ply positions, different
+    // content at the change region), so kick off Greedy/Beam/Dijkstra
+    // automatically rather than leaving the user staring at a stale Review
+    // panel and having to click Rerun All themselves.
+    try { runAllSearches(); } catch (e) {
+      console.warn('[shift-ops] runAllSearches after structural edit failed:', e);
+    }
+  }
+}
+
+/**
+ * Snapshot user-approved fixes by their move text, keyed by old ply position.
+ * Each entry records what the move *resolved to* (the corrected text the user
+ * accepted), so we can find the same move in the new sequence after a
+ * structural shift moves it to a different position.
+ */
+function _snapshotApprovedFixesByContent() {
+  var fixes = [];
+  if (!state.moves) return fixes;
+  var ply = 0;
+  state.moves.forEach(function(m) {
+    if (m.white) {
+      // Capture three categories that need preserving across re-merge:
+      //   - 'fixed': explicit user fix (Apply button)
+      //   - 'locked': merge-agreement lock
+      //   - 'ok' + wOcrAlt: auto-corrected via OCR alternative (raw OCR
+      //     was illegal, validate picked an alternative). The new merge
+      //     can flip its top-1 default after structural edits, dropping
+      //     the auto-correction; without snapshotting these, validation
+      //     re-breaks at moves that previously worked.
+      var isApproved = (m.wStatus === 'fixed' || m.wStatus === 'locked' ||
+                        (m.wStatus === 'ok' && m.wOcrAlt));
+      if (isApproved && m.white) {
+        // wAlgoProposed marks cells whose 'fixed' came from confirming an
+        // algorithm suggestion (vs. a typed override or OCR-alt rescue).
+        // _beginReviewEdit walks back algo-proposed cells when the user
+        // diverges; without carrying this flag, a survived fix would lose
+        // its origin marker and the downstream-revert would skip it.
+        fixes.push({ oldPly: ply, color: 'w', text: m.white,
+                     status: m.wStatus, original: m.wOriginal || null,
+                     ocrAlt: !!m.wOcrAlt,
+                     algoProposed: !!m.wAlgoProposed });
+      }
+      ply++;
+    }
+    if (m.black) {
+      var isApprovedB = (m.bStatus === 'fixed' || m.bStatus === 'locked' ||
+                         (m.bStatus === 'ok' && m.bOcrAlt));
+      if (isApprovedB && m.black) {
+        fixes.push({ oldPly: ply, color: 'b', text: m.black,
+                     status: m.bStatus, original: m.bOriginal || null,
+                     ocrAlt: !!m.bOcrAlt,
+                     algoProposed: !!m.bAlgoProposed });
+      }
+      ply++;
+    }
+  });
+  return fixes;
+}
+
+/**
+ * Re-apply snapshotted approved fixes by content matching against state.moves.
+ * For each prior fix, search a window of nearby plies in the new sequence for
+ * a same-color cell whose text matches the snapshotted text. If found, restore
+ * the wStatus/bStatus/wOriginal/bOriginal so revalidate preserves the fix.
+ *
+ * Search window: ±6 plies around the expected new position. The expected new
+ * position is oldPly itself for fixes BEFORE changePly (no shift), and a
+ * widened range AROUND oldPly for fixes at/after changePly (we don't know the
+ * exact shift amount, so search broadly).
+ */
+function _restoreApprovedFixesByContent(fixes, changePly) {
+  var result = { restored: 0, lost: 0, maxRestoredPly: -1 };
+  if (!fixes || !fixes.length || !state.moves) return result;
+  var changeP = (typeof changePly === 'number') ? changePly : 0;
+
+  // Index new moves by ply for fast lookup.
+  var byPly = [];
+  var ply = 0;
+  state.moves.forEach(function(m) {
+    if (m.white) { byPly.push({ m: m, color: 'w' }); ply++; }
+    if (m.black) { byPly.push({ m: m, color: 'b' }); ply++; }
+  });
+
+  var lostDetails = [];
+  var restoredDetails = [];
+  var overriddenDetails = [];
+  fixes.forEach(function(f) {
+    var beforeChange = f.oldPly < changeP;
+    // Tight window for unaffected fixes; broader sweep for shifted ones.
+    // Widened the post-change window to ±10 (was -6/+8) so cascaded shifts
+    // from earlier edits don't drop fixes that landed slightly farther.
+    var lo, hi;
+    if (beforeChange) { lo = Math.max(0, f.oldPly - 2); hi = Math.min(byPly.length - 1, f.oldPly + 2); }
+    else { lo = Math.max(0, f.oldPly - 10); hi = Math.min(byPly.length - 1, f.oldPly + 10); }
+
+    // PASS 1 — search for content match in the window. Succeeds when the
+    // user-confirmed text matches the freshly-merged top SAN at a same-
+    // color ply in the window (typically the unmodified case where merge
+    // just produced what the user already saw).
+    var foundAt = -1;
+    for (var p = lo; p <= hi; p++) {
+      var entry = byPly[p];
+      if (!entry || entry.color !== f.color) continue;
+      var text = (entry.color === 'w') ? entry.m.white : entry.m.black;
+      if (text === f.text) { foundAt = p; break; }
+    }
+
+    // PASS 2 (BEFORE-CHANGE ONLY) — content match failed. The user
+    // confirmed a SAN that diverges from what the new merge produced
+    // (e.g. confirmed 4.W=c4 over an OCR top of e4 — the entire point of
+    // confirming a fix). For plies BEFORE the structural-edit change
+    // point, oldPly maps to the same logical cell in the new sequence
+    // (no shift), so it's safe to force the user's text at oldPly.
+    // Without this, every override-style confirmation gets silently
+    // dropped on every re-merge and the user re-walks the whole game.
+    //
+    // Restricted to beforeChange because at/after the change point,
+    // oldPly can refer to a different logical ply (NW gap insert, etc.).
+    // Force-applying there put algorithm-confirmed text at wrong
+    // positions and produced the synthetic-green-dot bug; PASS 2 stays
+    // disabled for that region. Confirmations after the change point
+    // that lose their content match are dropped — the user reviews the
+    // structurally-changed region against the new merge.
+    var overridden = false;
+    if (foundAt < 0 && beforeChange) {
+      if (f.oldPly < byPly.length) {
+        var cand = byPly[f.oldPly];
+        if (cand && cand.color === f.color) {
+          foundAt = f.oldPly;
+          overridden = true;
+        }
+      }
+    }
+
+    if (foundAt < 0) {
+      result.lost++;
+      var atOld = byPly[f.oldPly];
+      var atOldText = atOld ? ((atOld.color === 'w') ? atOld.m.white : atOld.m.black) : null;
+      lostDetails.push({ oldPly: f.oldPly, color: f.color, text: f.text,
+                         window: lo + '..' + hi,
+                         atOldPosNow: atOldText });
+      return;
+    }
+    var entry = byPly[foundAt];
+    if (entry.color === 'w') {
+      entry.m.wStatus = f.status;
+      if (overridden) {
+        entry.m.wOriginal = entry.m.wOriginal || entry.m.white;
+        entry.m.white = f.text;
+      }
+      if (f.original && !entry.m.wOriginal) entry.m.wOriginal = f.original;
+      if (f.ocrAlt) entry.m.wOcrAlt = true;
+      if (f.algoProposed) entry.m.wAlgoProposed = true;
+    } else {
+      entry.m.bStatus = f.status;
+      if (overridden) {
+        entry.m.bOriginal = entry.m.bOriginal || entry.m.black;
+        entry.m.black = f.text;
+      }
+      if (f.original && !entry.m.bOriginal) entry.m.bOriginal = f.original;
+      if (f.ocrAlt) entry.m.bOcrAlt = true;
+      if (f.algoProposed) entry.m.bAlgoProposed = true;
+    }
+    result.restored++;
+    if (foundAt > result.maxRestoredPly) result.maxRestoredPly = foundAt;
+    if (overridden) {
+      overriddenDetails.push({ ply: foundAt, color: f.color, text: f.text });
+    } else if (foundAt !== f.oldPly) {
+      restoredDetails.push({ oldPly: f.oldPly, newPly: foundAt, color: f.color, text: f.text });
+    }
+  });
+
+  if (typeof log === 'function' && (result.restored || result.lost)) {
+    log('🔁 Restored ' + result.restored + '/' + (result.restored + result.lost) +
+        ' approved fixes after structural edit' +
+        (result.lost ? ' (' + result.lost + ' could not be re-located)' : ''));
+    restoredDetails.slice(0, 8).forEach(function(d) {
+      var oldMoveNum = Math.floor(d.oldPly / 2) + 1;
+      var newMoveNum = Math.floor(d.newPly / 2) + 1;
+      log('   → Moved: ' + oldMoveNum + '.' + d.color.toUpperCase() +
+          ' (ply ' + d.oldPly + ') → ' + newMoveNum + '.' + d.color.toUpperCase() +
+          ' (ply ' + d.newPly + ') text="' + d.text + '"');
+    });
+    overriddenDetails.slice(0, 8).forEach(function(d) {
+      var moveNum = Math.floor(d.ply / 2) + 1;
+      log('   ⚡ Override (before change): ' + moveNum + '.' + d.color.toUpperCase() +
+          ' (ply ' + d.ply + ') forced to "' + d.text + '" (user choice over merge default)');
+    });
+    lostDetails.forEach(function(d) {
+      var moveNum = Math.floor(d.oldPly / 2) + 1;
+      var label = moveNum + '.' + d.color.toUpperCase();
+      log('   ✗ Lost: ' + label + ' (old ply ' + d.oldPly + ') wanted "' + d.text +
+          '"; search window plies ' + d.window +
+          '; at old position now: ' +
+          (d.atOldPosNow === null ? '(missing)' : '"' + d.atOldPosNow + '"'));
+    });
+  }
+  return result;
+}
+
+/**
+ * Clear correction-related metadata from per-sheet cells at or after a given
+ * move number. Call this AFTER splice+renumber but BEFORE reMergeAndRevalidate
+ * on any structural edit.
+ *
+ * Why this is needed: syncCorrectionsToOcrCells stores fields like
+ * _correctedMove on per-sheet cells based on what state.moves held at the
+ * time of the call — i.e., relative to the PRE-edit merged sequence. After
+ * a structural edit shifts one sheet's content, the (num, color) keys at
+ * and beyond the change point now refer to a DIFFERENT logical move in the
+ * new merged sequence. The other sheet's cells didn't move, so their
+ * _correctedMove (set against the old merge) silently overrides the new
+ * merged value via _copySheetMetadataToMerged + rebuildFromOcrCells —
+ * causing moves at/after the change point to display the OLD merged text
+ * instead of the freshly-merged content.
+ *
+ * The clean fix is to drop that stale metadata and let revalidation re-
+ * derive any corrections against the new merged context. User-applied
+ * fixes (status='fixed') after the change point are sacrificed too, since
+ * the move at that position is no longer the one the user fixed.
+ *
+ * Cells BEFORE the change point are untouched — moves before the edit
+ * are sacred (they're stable and their corrections are still meaningful).
+ *
+ * @param {number} changeMoveNum - All cells with cell.num >= this lose
+ *   correction metadata. Pass `Math.floor(changePly / 2) + 1` if you have
+ *   a ply rather than a move number.
+ */
+function clearStaleMetadataFromMoveNum(changeMoveNum) {
+  function clearCells(cells) {
+    if (!cells) return;
+    for (var i = 0; i < cells.length; i++) {
+      if (cells[i].num >= changeMoveNum) {
+        delete cells[i]._correctedMove;
+        delete cells[i]._fixOriginal;
+        delete cells[i]._originalOcr;
+        delete cells[i]._ocrAlt;
+        delete cells[i]._status;
+      }
+    }
+  }
+  clearCells(state.ocrCellsSheet1);
+  clearCells(state.ocrCellsSheet2);
 }
 
 /**
@@ -456,7 +841,10 @@ function deleteDualPly(moveNum, plyColor, sheetColor) {
 
   sheet.splice(idx, 1);
   renumberSheetCells(sheet);
-  reMergeAndRevalidate();
+  var changePly = (moveNum - 1) * 2 + (plyColor === 'w' ? 0 : 1);
+  // Drop stale per-sheet metadata at/after the change point — see helper docs.
+  clearStaleMetadataFromMoveNum(moveNum);
+  reMergeAndRevalidate(changePly);
 }
 
 /**
@@ -527,7 +915,10 @@ function insertDualPly(moveNum, plyColor, sheetColor, position) {
   sheet.splice(insertAt, 0, cell);
   renumberSheetCells(sheet);
   _backfillPlaceholdersFromOtherSheet(sheet, sheetColor);
-  reMergeAndRevalidate();
+  var changePly = (moveNum - 1) * 2 + (plyColor === 'w' ? 0 : 1);
+  // Drop stale per-sheet metadata at/after the change point — see helper docs.
+  clearStaleMetadataFromMoveNum(moveNum);
+  reMergeAndRevalidate(changePly);
 }
 
 // =====================
@@ -582,6 +973,12 @@ function showMoveContextMenu(e, ply, moveNum, color) {
   // Header
   html += '<div class="px-3 py-1.5 text-gray-400 text-xs font-semibold border-b border-gray-600">' + moveLabel + '</div>';
 
+  // "Delete from here onward" first — it's the most-used bulk action
+  // (chopping trailing OCR noise) and belongs at the top of the menu.
+  html += _menuItem('Delete from here onward', '✂', 'delete-onward');
+  html += _menuItem('Edit move', '✏', 'edit-move');
+  html += _menuSeparator();
+
   if (isDual) {
     // Dual-sheet mode: per-ply operations on BOTH sheets
     html += '<div class="px-3 py-1 text-gray-500 text-xs">White\'s sheet</div>';
@@ -600,10 +997,6 @@ function showMoveContextMenu(e, ply, moveNum, color) {
     html += _menuItem('Insert move before', '⬆', 'insert-before');
     html += _menuItem('Insert move after', '⬇', 'insert-after');
   }
-
-  // Common: delete from here onward (both modes)
-  html += _menuSeparator();
-  html += _menuItem('Delete from here onward', '✂', 'delete-onward');
 
   _ctxMenu.innerHTML = html;
 
@@ -643,6 +1036,9 @@ function handleContextMenuAction(action, ply, moveNum, color) {
       break;
     case 'delete-onward':
       showDeleteConfirmation(ply);
+      break;
+    case 'edit-move':
+      enterEditMode(moveNum, color);
       break;
     case 'dual-delete-w':
       showDualDeleteConfirmation(moveNum, color, 'w');

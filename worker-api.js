@@ -253,6 +253,13 @@ class ZugwiseAPI {
         return this._send('similarity', { text1, text2 });
     }
 
+    // Batch similarity: score many candidates against one OCR text in a
+    // single worker round-trip. Use for edit-mode's legal-move sort (30+
+    // candidates) — the per-call version is too slow for that use case.
+    async getSimilarityBatch(ocrText, candidates) {
+        return this._send('similarity-batch', { ocrText, candidates });
+    }
+
     /**
      * Check candidates for tactical absurdity using Python quiescence search.
      * @param {Array<string>} moves - Current move list

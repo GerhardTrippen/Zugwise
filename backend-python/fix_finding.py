@@ -19,14 +19,13 @@ from helpers import piece_value, piece_name, ply_to_str, try_move, play_until_st
 from similarity import move_similarity
 from absurdity import (find_all_absurdities, find_check_symbol_mismatches,
                        find_duplicate_pawn_moves, find_duplicate_pawn_moves_in_ocr,
-                       is_piece_genuinely_hanging)
+                       is_piece_genuinely_hanging, is_apparently_hanging,
+                       find_free_captures, find_free_captures_with_check)
 from lenient_normalize import normalize_lenient_move
 from collections import Counter
 # === EARLY STOPPING (January 2026) ===
 from play import play_until_absurd_or_stuck
 USE_EARLY_STOPPING = True
-
-print("=== NEW VERSION OF FIX_FINDING.PY LOADED ===")
 
 # =============================================================================
 # OCR CANDIDATE PATTERN ANALYSIS
@@ -716,8 +715,17 @@ def find_blocker_candidates(
             if not original_move:
                 continue
 
+            # Best-of-N across all candidate readings (dual-sheet aware) so
+            # this heuristic doesn't gate a viable earlier ply when sheet 2's
+            # alternative would clear the 0.50 threshold and the merged top
+            # wouldn't. The fallback to move_similarity preserves single-sheet
+            # behavior.
+            ocr_m_at_ply = ocr_lookup.get(ply) if ocr_lookup else None
             for clear_move in clearing_moves:
-                sim = move_similarity(original_move, clear_move)
+                if ocr_m_at_ply and ocr_m_at_ply.candidates:
+                    sim, _ = _best_sim_across_candidates(ocr_m_at_ply.candidates, clear_move)
+                else:
+                    sim = move_similarity(original_move, clear_move)
                 if sim >= 0.50:  # Reasonable similarity threshold
                     candidates.append({
                         'ply': ply,
@@ -857,12 +865,18 @@ def find_destination_occupant_candidates(
         if not valid:
             continue
 
+        # Best-of-N across all candidate readings (dual-sheet aware): see
+        # twin site in find_blocker_candidates above for rationale.
+        ocr_m_at_ply = ocr_lookup.get(arrival_ply) if ocr_lookup else None
         # Find legal moves that DON'T land on dest_square
         for legal_move in alt_board.legal_moves:
             if legal_move.to_square == dest_square:
                 continue  # Skip moves that still go to the blocked square
             legal_san = alt_board.san(legal_move)
-            sim = move_similarity(original_move, legal_san)
+            if ocr_m_at_ply and ocr_m_at_ply.candidates:
+                sim, _ = _best_sim_across_candidates(ocr_m_at_ply.candidates, legal_san)
+            else:
+                sim = move_similarity(original_move, legal_san)
             if sim >= 0.50:
                 candidates.append({
                     'ply': arrival_ply,
@@ -881,6 +895,123 @@ def find_destination_occupant_candidates(
     if verbose and best_by_ply:
         for ply, cand in sorted(best_by_ply.items()):
             print(f"   [OCCUPANT] Candidate: {ply_to_str(ply)} '{cand['original']}' -> '{cand['alternative']}' (sim={cand['similarity']:.0%})")
+
+    return list(best_by_ply.values())
+
+
+def find_empty_capture_target_candidates(
+    moves: List[str],
+    stuck_ply: int,
+    stuck_move: str,
+    ocr_lookup: Dict[int, OCRMove],
+    verbose: bool = False
+) -> List[dict]:
+    """
+    If stuck_move is a capture but the destination square is EMPTY (nothing to capture),
+    check neighboring squares for an enemy piece that should have been on the destination.
+    Trace backward to find the move that placed it on the wrong square.
+
+    The capture SAN is correct; the victim is displaced. Adding the arrival ply to
+    the search lets normal single-ply search find the fix.
+
+    Example: Nxf5 is illegal because f5 is empty. Enemy pawn is on f6.
+    Move 24.B "f6" placed it there — should have been "f5".
+    Adding ply 24.B to search → single-ply search finds f6→f5 → Nxf5 works.
+    """
+    if not stuck_move or 'x' not in stuck_move or stuck_ply >= len(moves):
+        return []
+
+    clean = stuck_move.replace('+', '').replace('#', '')
+    if 'x' not in clean:
+        return []
+
+    x_pos = clean.index('x')
+    dest_str = clean[x_pos+1:]
+    if len(dest_str) < 2 or dest_str[0] not in 'abcdefgh' or dest_str[1] not in '12345678':
+        return []
+    dest_square_name = dest_str[:2]
+
+    board = chess.Board()
+    for i in range(stuck_ply):
+        m = try_move(board, moves[i])
+        if m:
+            board.push(m)
+        else:
+            return []
+
+    color = board.turn
+    enemy_color = not color
+    dest_sq = chess.parse_square(dest_square_name)
+
+    # Destination must be EMPTY. Occupied means it's an occupant/blocker case,
+    # handled by other heuristics.
+    if board.piece_at(dest_sq) is not None:
+        return []
+
+    dest_file = chess.square_file(dest_sq)
+    dest_rank = chess.square_rank(dest_sq)
+
+    if verbose:
+        print(f"   [EMPTY-CAP] '{stuck_move}' captures on {dest_square_name} but square is empty")
+
+    candidates = []
+    for df, dr in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
+        nf = dest_file + df
+        nr = dest_rank + dr
+        if not (0 <= nf < 8 and 0 <= nr < 8):
+            continue
+        neighbor_sq = chess.square(nf, nr)
+        neighbor_piece = board.piece_at(neighbor_sq)
+        if neighbor_piece is None or neighbor_piece.color != enemy_color:
+            continue
+
+        neighbor_name = chess.square_name(neighbor_sq)
+
+        trace_board = chess.Board()
+        arrival_ply = None
+        for i in range(stuck_ply):
+            m = try_move(trace_board, moves[i])
+            if m:
+                if m.to_square == neighbor_sq:
+                    arrival_ply = i
+                trace_board.push(m)
+            else:
+                break
+
+        if arrival_ply is None:
+            if verbose:
+                print(f"      [EMPTY-CAP] {neighbor_piece.symbol()} on {neighbor_name} "
+                      f"is from initial position — skipping")
+            continue
+
+        original_move = moves[arrival_ply]
+        corrected_move = original_move.replace(neighbor_name, dest_square_name)
+
+        if corrected_move == original_move:
+            continue
+
+        sim = move_similarity(original_move, corrected_move)
+
+        candidates.append({
+            'ply': arrival_ply,
+            'original': original_move,
+            'alternative': corrected_move,
+            'similarity': sim,
+            'neighbor_square': neighbor_name,
+            'target_square': dest_square_name,
+            'neighbor_piece': neighbor_piece.symbol(),
+        })
+
+        if verbose:
+            print(f"      [EMPTY-CAP] {neighbor_piece.symbol()} on {neighbor_name} "
+                  f"arrived at ply {ply_to_str(arrival_ply)} via '{original_move}' "
+                  f"→ should be '{corrected_move}' (sim={sim:.0%})")
+
+    best_by_ply = {}
+    for cand in candidates:
+        ply = cand['ply']
+        if ply not in best_by_ply or cand['similarity'] > best_by_ply[ply]['similarity']:
+            best_by_ply[ply] = cand
 
     return list(best_by_ply.values())
 
@@ -986,21 +1117,26 @@ def generate_fix_explanation(fix: dict, ocr_lookup: Dict[int, OCRMove] = None) -
 # HANGING PIECE CHECK FOR FIXES
 # =============================================================================
 
-def is_piece_hanging_after_move(board: chess.Board, move: chess.Move) -> Tuple[bool, int]:
+def is_piece_hanging_after_move(board: chess.Board, move: chess.Move,
+                                fast_mode: bool = False) -> Tuple[bool, int]:
     """
     Check if the moved piece is hanging after the move.
     Returns (is_hanging: bool, piece_value: int).
 
     Uses is_piece_genuinely_hanging() from absurdity.py as SINGLE SOURCE OF TRUTH.
 
-    FIXED: If the move is a capture, the piece is not considered "hanging"
-    because it just won material (or at worst traded). Even if it can be
-    recaptured, the trade might be favorable or equal.
+    fast_mode=False (default): full quiescence — sees cross-board compensation
+        (e.g. Bxa6 looks hanging to bxa6, but Rxc6 wins back the c6 knight).
+        Used by the verify pass on the top-N candidates.
+    fast_mode=True: SEE-at-destination for captures, fast layers for
+        non-captures. Used in the per-candidate scoring loop, paired with a
+        single full-quiescence FP-guard call only when the fast path flags
+        is_hanging=True. Mirrors the absurdity FP-guard pattern.
+
+    If the move is a capture, the piece is not considered "hanging" because
+    it just won material (or at worst traded). Even if it can be recaptured,
+    the trade might be favorable or equal.
     """
-    # If this is a capture, evaluate the trade.
-    # Capturing equal or higher value = fine (fair trade or better).
-    # Capturing LESS value = check if our piece gets recaptured (bad trade).
-    # Example: Bxb7 (bishop=3 takes pawn=1), queen recaptures = bad, net loss of 2.
     if board.is_capture(move):
         captured_piece = board.piece_at(move.to_square)
         captured_val = piece_value(captured_piece) if captured_piece else 0
@@ -1011,7 +1147,6 @@ def is_piece_hanging_after_move(board: chess.Board, move: chess.Move) -> Tuple[b
         if captured_val >= moving_val:
             return False, 0
 
-        # Captured less value - check if we're now hanging after the capture
         test_board = board.copy()
         test_board.push(move)
         to_square = move.to_square
@@ -1019,33 +1154,37 @@ def is_piece_hanging_after_move(board: chess.Board, move: chess.Move) -> Tuple[b
         if our_piece is None:
             return False, 0
 
-        opponent = test_board.turn
-        # Check: can opponent LEGALLY capture our piece?
-        # Using legal_moves instead of is_attacked_by correctly handles:
-        # - King can't capture on defended square (mutual defense, e.g. Q+B both attack b7)
-        # - King can't capture when in check (gives-check captures like Qxb7+)
-        # - Pinned pieces can't capture
-        legal_captures_on_sq = [m for m in test_board.legal_moves if m.to_square == to_square]
+        if fast_mode:
+            # SEE-at-destination: legal recaptures only, lowest-value attacker
+            # check. Cheap O(attackers) — no quiescence. Misses cross-board
+            # compensation; the per-candidate caller pairs this with a
+            # fast_mode=False confirm when this returns hanging.
+            legal_captures_on_sq = [m for m in test_board.legal_moves
+                                    if m.to_square == to_square]
+            if not legal_captures_on_sq:
+                return False, 0
+            if test_board.is_attacked_by(our_piece.color, to_square):
+                min_attacker_val = 99
+                for cap_move in legal_captures_on_sq:
+                    att_piece = test_board.piece_at(cap_move.from_square)
+                    if att_piece:
+                        min_attacker_val = min(min_attacker_val, piece_value(att_piece))
+                if min_attacker_val >= moving_val:
+                    return False, 0
+            net_loss = moving_val - captured_val
+            if net_loss >= 2:
+                return True, net_loss
+            return False, 0
 
-        if not legal_captures_on_sq:
-            return False, 0  # No legal recapture possible
-
-        # Check if adequately defended against legal captures
-        if test_board.is_attacked_by(our_piece.color, to_square):
-            # Defended - check if lowest LEGAL capturer is lower value (losing exchange)
-            min_attacker_val = 99
-            for cap_move in legal_captures_on_sq:
-                att_piece = test_board.piece_at(cap_move.from_square)
-                if att_piece:
-                    min_attacker_val = min(min_attacker_val, piece_value(att_piece))
-            if min_attacker_val >= moving_val:
-                return False, 0  # Only attacked by equal/higher value AND defended
-
-        # Our piece is hanging after the capture - bad trade
-        net_loss = moving_val - captured_val
-        if net_loss >= 2:  # Significant material loss
-            return True, net_loss
-
+        # Full quiescence so cross-board compensation is taken into account.
+        is_hanging, _, _ = is_piece_genuinely_hanging(
+            test_board, to_square, our_piece,
+            move_just_played=move,
+            fast_mode=False,
+            debug=False,
+        )
+        if is_hanging:
+            return True, moving_val - captured_val
         return False, 0
 
     test_board = board.copy()
@@ -1067,12 +1206,13 @@ def is_piece_hanging_after_move(board: chess.Board, move: chess.Move) -> Tuple[b
                     return True, piece_val  # Pawn hanging for free
         return False, 0
 
-    # Use SINGLE SOURCE OF TRUTH from absurdity.py
-    # fast_mode=True for performance in fix-finding
+    # Use SINGLE SOURCE OF TRUTH from absurdity.py.
+    # fast_mode is propagated: True skips the trap check, False runs full
+    # quiescence. Per-candidate callers use True + a confirm pass.
     is_hanging, net_gain, reason = is_piece_genuinely_hanging(
         test_board, to_square, piece,
         move_just_played=move,
-        fast_mode=True,
+        fast_mode=fast_mode,
         debug=False
     )
 
@@ -1494,7 +1634,11 @@ def compute_future_capture_bonus(candidate_san: str, fix_ply: int, moves: List[s
         ocr_dest = extract_destination(ocr_text)
         is_same_color = (ply % 2 == 0) == fix_color_is_white
 
-        # Departure check: same-color, same piece type moves AWAY from dest
+        # Departure check uses top_move only — it's a positive corroboration
+        # signal in the same direction as a destination match (the piece was
+        # at our dest and moved away), so dual-sheet awareness is unnecessary
+        # here and confining it to top_move keeps the +4 from firing on a
+        # low-confidence alternative.
         if is_same_color and extract_piece_type(ocr_text) == fix_piece:
             if ocr_dest and ocr_dest != dest:
                 # Piece has left the fix square — stop scanning
@@ -1509,32 +1653,46 @@ def compute_future_capture_bonus(candidate_san: str, fix_ply: int, moves: List[s
                               f"{ocr_dest} at {ply_to_str(ply)} (not reachable) -> 0")
                     return 0
 
-        # Check if this move references our destination square
-        if ocr_dest != dest:
+        # Destination match: check top_move first, then alternatives above
+        # the dual-sheet confidence threshold. Sheet 2's reading at this ply
+        # may mention our destination square even when the merged top
+        # doesn't — without this, dual-sheet input throws away half the
+        # corroboration signal.
+        matched_text = ocr_text if ocr_dest == dest else None
+        if matched_text is None and ocr_move.candidates:
+            for alt_text, alt_conf in ocr_move.candidates[1:]:
+                if (alt_conf >= _SIM_ANCHOR_CONF_THRESHOLD and alt_text
+                        and extract_destination(alt_text) == dest):
+                    matched_text = alt_text
+                    if verbose:
+                        print(f"      [FUTURE-CAPTURE] {candidate_san} -> {dest}: alt-candidate '{alt_text}' "
+                              f"@ {alt_conf:.2f} mentions dest at {ply_to_str(ply)}")
+                    break
+        if matched_text is None:
             continue
 
         # Found a reference! Is it a capture?
         is_opponent = not is_same_color
-        is_capture = 'x' in ocr_text
+        is_capture = 'x' in matched_text
 
         if is_opponent and is_capture:
             if verbose:
                 print(f"      [FUTURE-CAPTURE] {candidate_san} -> {dest}: opponent captures at "
-                      f"{ply_to_str(ply)} '{ocr_text}' -> +8")
+                      f"{ply_to_str(ply)} '{matched_text}' -> +8")
             return 8
         elif not is_opponent and not is_capture:
             # Only penalize if same piece type returns to the square
             # Different piece type landing here is neutral (stop scanning)
-            ocr_piece = extract_piece_type(ocr_text)
+            ocr_piece = extract_piece_type(matched_text)
             if ocr_piece == fix_piece:
                 if verbose:
                     print(f"      [FUTURE-CAPTURE] {candidate_san} -> {dest}: same-color same-piece moves to "
-                          f"{ply_to_str(ply)} '{ocr_text}' -> -4")
+                          f"{ply_to_str(ply)} '{matched_text}' -> -4")
                 return -4
             else:
                 if verbose:
                     print(f"      [FUTURE-CAPTURE] {candidate_san} -> {dest}: different piece {ocr_piece} moves to "
-                          f"{ply_to_str(ply)} '{ocr_text}' -> 0 (neutral)")
+                          f"{ply_to_str(ply)} '{matched_text}' -> 0 (neutral)")
                 return 0
         else:
             # Same-color capture or opponent non-capture — neutral, stop looking
@@ -1690,11 +1848,19 @@ def find_check_blocking_fixes(
                 continue  # Must at least get past stuck point
 
             completes = (test_reach >= len(moves))
-            char_sim = move_similarity(original_ocr, candidate_san)
-
-            # OCR confidence
+            # OCR confidence — also acts as the candidate-pool gate below.
             ocr_move = ocr_lookup.get(fix_ply)
             ocr_conf = ocr_move.top_confidence if ocr_move else 0.5
+            # Best-of-N similarity (dual-sheet aware): a check-blocking
+            # candidate that matches sheet 2's reading exactly shouldn't be
+            # penalized for not matching the merged top. Phase 3 doesn't
+            # display sim_source to the UI so the UI-consistency tradeoff
+            # that pinned `_search_single_ply_for_fixes` to the top-only
+            # anchor doesn't apply here.
+            if ocr_move and ocr_move.candidates:
+                char_sim, _ = _best_sim_across_candidates(ocr_move.candidates, candidate_san)
+            else:
+                char_sim = move_similarity(original_ocr, candidate_san)
 
             # Absurdity count (simplified — count how many absurdities in play-forward)
             absurdity_count = 0
@@ -1729,6 +1895,11 @@ def find_check_blocking_fixes(
                 'reach': test_reach,
                 'completes': completes,
                 'reach_improvement': reach_improvement,
+                # Phase 3 (check-blocking) is a backtracking phase — fixes
+                # land on plies < stuck_ply where the player could have
+                # blocked the check. Metadata mirrors Phase 1/2.
+                'is_backtrack': fix_ply < stuck_ply,
+                'origin_stuck_ply': stuck_ply,
                 'char_sim': char_sim,
                 'ocr_conf': ocr_conf,
                 'ocr_candidate_bonus': 0,
@@ -1755,6 +1926,19 @@ def find_check_blocking_fixes(
                 'similarity': round(char_sim * 100),
                 'num_changes': sum(1 for a, b in zip(original_ocr, candidate_san) if a != b) +
                                abs(len(original_ocr) - len(candidate_san)),
+                # Score breakdown for the fix-details panel. Phase-3 scoring
+                # is simpler than Phase 1/2 so the component list is a subset.
+                'score_components': {
+                    'sim': round(char_sim * 40, 1),
+                    'hi_sim': 25 if char_sim >= 0.90 else 0,
+                    'reach': min(reach_improvement * 10, 50),
+                    'reach_tb': max(reach_improvement - 5, 0),
+                    'reach10': 30 if reach_improvement >= 10 and fix_ply >= stuck_ply else 0,
+                    'complete': 5 if completes and absurdity_count <= 1 else 0,
+                    'ocr_c': round(ocr_conf * 15, 1),
+                    'fut_cap': future_bonus,
+                },
+                'sim_source': original_ocr,
             })
 
         if verbose and candidates_found > 0:
@@ -2088,6 +2272,30 @@ def _precompute_backtrack_context(
 
     ctx['occupant_candidates'] = occupant_candidates
 
+    # EMPTY CAPTURE TARGET HEURISTIC
+    # If stuck move is a capture but the destination square is empty,
+    # an earlier move may have placed the capture victim on the wrong square.
+    # Find that earlier move and add its ply to the search.
+    empty_capture_candidates = []
+    if stuck_move and 'x' in stuck_move:
+        empty_capture_candidates = find_empty_capture_target_candidates(
+            moves, blocker_stuck_ply, stuck_move, ocr_lookup, verbose=verbose)
+        for cand in empty_capture_candidates:
+            extended_search_plies.add(cand['ply'])
+
+        if verbose:
+            if empty_capture_candidates:
+                print(f"   [EMPTY-CAP] Found {len(empty_capture_candidates)} candidate(s) - adding plies to search:")
+                for cand in empty_capture_candidates:
+                    print(f"      -> {ply_to_str(cand['ply'])} '{cand['original']}' -> "
+                          f"'{cand['alternative']}' (sim={cand['similarity']:.0%}) "
+                          f"[{cand['neighbor_piece']} displaced from "
+                          f"{cand['target_square']} to {cand['neighbor_square']}]")
+            else:
+                print(f"   [EMPTY-CAP] No empty capture target candidates for '{stuck_move}'")
+
+    ctx['empty_capture_candidates'] = empty_capture_candidates
+
     # Find suspicious plies (low OCR confidence)
     suspicious_plies = set()
     for ply in range(min_ply, effective_stuck_ply):
@@ -2328,6 +2536,53 @@ def find_lenient_candidates(
     return results
 
 
+# Confidence threshold for treating an OCRMove candidate as a valid
+# similarity anchor. Anchors below this are ignored so random low-conf
+# lenient alternatives can't boost a spurious fix. Dual-sheet games
+# typically have the top-2 candidates well above 0.5 (merged sum can
+# exceed either sheet's raw conf). Single-sheet games typically have
+# only the top candidate above 0.5, making this a no-op for them.
+_SIM_ANCHOR_CONF_THRESHOLD = 0.5
+
+
+def _best_sim_across_candidates(
+    candidates,
+    candidate_san: str,
+    conf_threshold: float = _SIM_ANCHOR_CONF_THRESHOLD,
+):
+    """
+    Best-of-N similarity between `candidate_san` and every OCR reading in
+    `candidates` whose confidence meets the threshold.
+
+    In dual-sheet mode the two sheets can disagree at a ply (one reads
+    "Rfc1", the other "Rxd7"). Each is a valid OCR anchor — penalizing a
+    fix for low similarity to one sheet's reading when it matches the
+    other sheet's perfectly is exactly the "the algorithms only see one
+    sheet" bug. Taking the max treats both sheets as equal-citizens.
+
+    Falls back to the top candidate alone if none pass the threshold, so
+    single-sheet behavior and noisy-OCR edge cases are unchanged.
+
+    Returns (best_similarity, best_matching_ocr_text).
+    """
+    if not candidates:
+        return 0.0, ''
+    eligible = [(t, c) for t, c in candidates if t and c >= conf_threshold]
+    if not eligible:
+        top_text = candidates[0][0] if candidates[0] else ''
+        if not top_text:
+            return 0.0, ''
+        return move_similarity(top_text, candidate_san), top_text
+    best_sim = 0.0
+    best_text = eligible[0][0]
+    for text, _conf in eligible:
+        s = move_similarity(text, candidate_san)
+        if s > best_sim:
+            best_sim = s
+            best_text = text
+    return best_sim, best_text
+
+
 def _search_single_ply_for_fixes(
     fix_ply: int,
     board: chess.Board,
@@ -2426,6 +2681,13 @@ def _search_single_ply_for_fixes(
     # If only one legal move exists, the move is completely forced — no penalties should apply
     forced_move = position_is_check and len(legal_moves_list) == 1
     best_capture_gain = 0 if position_is_check else find_best_capture_gain(board)
+    # Quiescence-verified free captures available at this ply.
+    # Computed once per ply (expensive), used per candidate.
+    # Gate: only invoke quiescence when best_capture_gain >= 3 (cheap check).
+    # If no captures worth >= 3 exist, find_free_captures would return empty anyway.
+    # Using find_free_captures (quiescence-backed) not detect_missed_free_capture
+    # (simple check) — critical distinction: traps like Rxe3/g8=Q must NOT fire.
+    free_caps_at_ply = find_free_captures(board, board.turn) if best_capture_gain >= 3 else []
 
     if verbose:
         sample_sans = [board.san(m) for m in legal_moves_list[:8]]
@@ -2479,7 +2741,14 @@ def _search_single_ply_for_fixes(
                 print(f"   [REACH DEBUG]   Failed at ply {test_reach}: move='{test_moves[test_reach]}'")
                 print(f"   [REACH DEBUG]   Position FEN: {test_board.fen()}")
                 print(f"   [REACH DEBUG]   Legal moves: {[test_board.san(m) for m in list(test_board.legal_moves)[:10]]}")
+        # Similarity anchor: the DISPLAYED OCR text (merged top). Using
+        # best-of-N across all alternatives above a threshold produced
+        # confusing UIs where a fix's shown sim was actually against a
+        # hidden alternative — e.g. 'Rxe5 → Ne8 sim=90%' driven by an alt
+        # like 'Nxe8'. Consistent rule: if we're searching fixes for X,
+        # similarity is computed against X.
         char_sim = move_similarity(original_ocr, candidate_san)
+        sim_source = original_ocr
         ocr_conf = ocr_m.get_confidence(candidate_san) if ocr_m else 0.0
 
         # === Calculate absurdity count early (needed for check-enabling bonus) ===
@@ -2498,6 +2767,87 @@ def _search_single_ply_for_fixes(
         # Filter is no longer needed — start_ply=fix_ply already skips earlier plies
         # But keep filtering for safety (no-op since all results are >= fix_ply)
         absurdities_result = [a for a in absurdities_result if a.ply >= fix_ply]
+
+        # Drop pre-existing piece-left-hanging absurdities. Two cases:
+        # (1) AT fix_ply: hanging piece was already on hanging_square in `board`
+        #     (the position BEFORE the candidate). The candidate didn't put it
+        #     there; an earlier move did. (Original case from feb38ad.)
+        # (2) AT plies > fix_ply (downstream): same piece on same square in
+        #     `board`, AND already hanging there in `board`. This catches the
+        #     "Bxd1 leaves bishop hanging on d1, Rad8 doesn't address it but
+        #     also doesn't cause it" case the user reported. The "already
+        #     hanging in baseline" check (is_apparently_hanging on board) is
+        #     what distinguishes pre-existing structural absurdities from
+        #     candidate-caused new ones (e.g. line-opening attacks where the
+        #     piece was on the square but wasn't attacked until candidate).
+        if absurdities_result:
+            _ab_mover_color = chess.WHITE if (fix_ply % 2 == 0) else chess.BLACK
+            _filtered_absurds = []
+            for a in absurdities_result:
+                if a.absurdity_type == 'piece_left_hanging':
+                    try:
+                        _sq = chess.parse_square(a.hanging_square)
+                        _piece_before = board.piece_at(_sq)
+                        # Case 1: at fix_ply, mover-color match (the side this
+                        # candidate is for). Same logic as before.
+                        if (a.ply == fix_ply and _piece_before is not None
+                                and _piece_before.color == _ab_mover_color):
+                            if verbose:
+                                print(f"      [PRE-EXISTING] {candidate_san} skips abs at "
+                                      f"{a.hanging_square} ({a.hanging_piece} was already there)")
+                            continue
+                        # Case 2: at later ply, piece must be the same AND
+                        # already hanging in board (Layer-1 fast check, no
+                        # quiescence). Color match is implicit via the same
+                        # absurdity-mover convention.
+                        if a.ply > fix_ply and _piece_before is not None:
+                            _ab_color = chess.WHITE if (a.ply % 2 == 0) else chess.BLACK
+                            if (_piece_before.color == _ab_color
+                                    and is_apparently_hanging(board, _sq, _piece_before)):
+                                if verbose:
+                                    print(f"      [PRE-EXISTING-LATE] {candidate_san} skips abs at "
+                                          f"{a.hanging_square} (ply {a.ply}: "
+                                          f"{a.hanging_piece} already hanging at fix_ply)")
+                                continue
+                    except Exception:
+                        pass
+                _filtered_absurds.append(a)
+            absurdities_result = _filtered_absurds
+
+
+        # Re-verify any absurdity AT fix_ply with full quiescence. fast_mode=True
+        # over-flags non-queen pieces that have cross-board compensation (e.g.
+        # Bxa6 in 3rr1k1/1pp3pp/pnn5/3ppb2/8/1P2PNB1/P3BPPP/2RR2K1: bishop
+        # apparently hangs to bxa6 but Rxc6 wins it back). The verify pass at
+        # the end of _postprocess_phase2_fixes only re-checks top-N, so a
+        # candidate ranked just outside the cut keeps the false-positive
+        # penalty. Re-check only the specific hanging piece (not a full
+        # find_all_absurdities sweep) to keep the cost to one quiescence
+        # call per false-positive piece.
+        fix_ply_absurds = [a for a in absurdities_result if a.ply == fix_ply]
+        if fix_ply_absurds:
+            test_board_for_recheck = board.copy()
+            recheck_move = try_move(test_board_for_recheck, test_moves[fix_ply])
+            if recheck_move is not None:
+                test_board_for_recheck.push(recheck_move)
+                kept_at_fix_ply = []
+                for a in fix_ply_absurds:
+                    try:
+                        sq = chess.parse_square(a.hanging_square)
+                        piece = test_board_for_recheck.piece_at(sq)
+                        if piece is None:
+                            continue  # piece is gone — definitely not hanging
+                        is_hang, _, _ = is_piece_genuinely_hanging(
+                            test_board_for_recheck, sq, piece,
+                            move_just_played=recheck_move,
+                            fast_mode=False,
+                        )
+                        if is_hang:
+                            kept_at_fix_ply.append(a)
+                    except Exception:
+                        kept_at_fix_ply.append(a)  # on error, be conservative
+                absurdities_result = [a for a in absurdities_result if a.ply != fix_ply] + kept_at_fix_ply
+
         # If the move at fix_ply is forced (only legal move in check), don't penalize
         # absurdities AT that ply — the player had no choice
         if forced_move:
@@ -2637,7 +2987,14 @@ def _search_single_ply_for_fixes(
             is_hanging, hanging_value = False, 0
             pawn_hang_count = 0
         else:
-            is_hanging, hanging_value = is_piece_hanging_after_move(board, legal_move)
+            # Fast path only. is_hanging / hanging_value are ONLY used as
+            # the "[WARN]HANG" display label (hanging_penalty is fixed at 0,
+            # so no scoring impact). The verify pass in
+            # _postprocess_phase2_fixes re-runs is_piece_hanging_after_move
+            # at full quiescence for top-N candidates and corrects their
+            # labels. Non-top-N candidates may carry a fast-mode false
+            # positive on the label, but they're not picked by Greedy.
+            is_hanging, hanging_value = is_piece_hanging_after_move(board, legal_move, fast_mode=True)
             # When in check, pawns hanging elsewhere are collateral — can't help them
             pawn_hang_count = 0 if position_is_check else count_hanging_pawns_after_move(board, legal_move)
 
@@ -2748,46 +3105,62 @@ def _search_single_ply_for_fixes(
                     break
 
         # === UNIFIED SCORING ===
-        # Hanging penalty scaled by piece value
-        hanging_penalty = hanging_value * 10 if is_hanging else 0
-
-        # Pawn hanging penalty: -10 per undefended pawn (modest demerit)
-        # But offset by captured material — if we capture a pawn and leave one
-        # hanging, it's roughly a wash (e.g. Bxd5 captures d5 pawn but f5 hangs)
-        pawn_hanging_penalty = pawn_hang_count * 10
-        if pawn_hanging_penalty > 0 and board.is_capture(legal_move):
-            captured_piece = board.piece_at(legal_move.to_square)
-            if captured_piece:
-                capture_offset = piece_value(captured_piece) * 10
-                pawn_hanging_penalty = max(0, pawn_hanging_penalty - capture_offset)
-
-        # Missed capture penalty: if there's a clearly winning capture available
-        # and this move doesn't take it, penalize proportionally
+        # REMOVED: hanging_penalty, pawn_hanging_penalty, missed_capture_penalty, winning_capture_bonus
+        # These are chess quality signals (is this a good move?) not reconstruction
+        # signals (did the player write this move?). They caused correct high-similarity
+        # fixes to lose to low-similarity captures of high-value pieces.
+        # Absurdity detection (with quiescence search) already handles truly implausible moves.
+        hanging_penalty = 0
+        # Reach + similarity already handle uncertainty correctly.
+        pawn_hanging_penalty = 0
         missed_capture_penalty = 0
         winning_capture_bonus = 0
-        our_capture_val = 0
-        if board.is_capture(legal_move):
-            captured = board.piece_at(legal_move.to_square)
-            if captured:
-                our_capture_val = piece_value(captured)
-        if best_capture_gain >= 2:
-            missed = best_capture_gain - our_capture_val
-            if missed >= 2:
-                missed_capture_penalty = missed * 10
-            # Winning capture bonus: reward moves that TAKE the best available capture
-            if our_capture_val >= 3 and missed <= 0:
-                winning_capture_bonus = our_capture_val * 5
-        # SEE bonus: if capturing a piece worth >= 3 and simple analysis missed it,
-        # use Static Exchange Evaluation to check if the exchange actually wins material
-        # (e.g., Qxc4 where queen gets recaptured but bishop takes back)
-        if winning_capture_bonus == 0 and our_capture_val >= 3 and board.is_capture(legal_move):
-            see_val = see_capture_value(board, legal_move)
-            if see_val >= 2:
-                winning_capture_bonus = see_val * 5
-                if verbose:
-                    print(f"      [SEE] {candidate_san} wins {see_val} material by exchange (bonus=+{winning_capture_bonus})")
 
-        # Absurdity penalty scaled by piece values at risk
+        # Missed genuinely-free capture penalty (reconstruction signal, not chess quality)
+        # A player who ignores an uncontested free rook or queen almost certainly
+        # wrote something different. Quiescence-verified so traps don't fire.
+        missed_free_cap_penalty = 0
+        if free_caps_at_ply:
+            candidate_move_obj = try_move(board, candidate_san)
+            if candidate_move_obj:
+                takes_free = any(
+                    candidate_move_obj.to_square == fc.to_square
+                    for fc, _, _ in free_caps_at_ply
+                )
+                if not takes_free:
+                    best_free_val = max(val for _, _, val in free_caps_at_ply)
+                    missed_free_cap_penalty = best_free_val * 10
+
+        # Opponent free capture with check penalty (mirror of mfc, opposite direction)
+        # After the fix move, does the opponent have a quiescence-verified free
+        # capture that also gives check? A free capture with check on the king
+        # is an immediate forcing threat no human would allow.
+        # Gate: only at stuck ply — for backtrack fixes many plies earlier,
+        # the opponent's immediate response is less relevant to reconstruction.
+        opp_free_cap_penalty = 0
+        if not forced_move and fix_ply >= stuck_ply:
+            ofc_move = try_move(board, candidate_san)
+            if ofc_move:
+                board.push(ofc_move)
+                try:
+                    # Fast depth for per-candidate scoring; verify pass in
+                    # _postprocess_phase2_fixes re-checks top-N at depth 10.
+                    ofc_caps = find_free_captures_with_check(board, board.turn, max_depth=6)
+                    if ofc_caps:
+                        best_ofc_val = max(val for _, _, val in ofc_caps)
+                        opp_free_cap_penalty = best_ofc_val * 8 + 15
+                        if verbose:
+                            print(f"      [OFC] After {candidate_san}, opponent has free capture "
+                                  f"with check worth {best_ofc_val} -> penalty -{opp_free_cap_penalty}")
+                except Exception:
+                    pass
+                board.pop()
+
+        # Absurdity penalty scaled by piece values at risk.
+        # Note: bad-trade absurdities (SEE-verified losing exchanges where the
+        # destination is defended-but-outgunned) are now emitted by
+        # detect_absurdity_at_ply with absurdity_type='bad_trade' and folded
+        # into this penalty — no parallel scoring signal.
         absurdity_penalty = calculate_absurdity_penalty(absurdities_result)
 
         # === CLEARS DESTINATION BONUS ===
@@ -2833,7 +3206,9 @@ def _search_single_ply_for_fixes(
             absurdity_penalty -                                  # Scaled by piece value!
             hanging_penalty -
             pawn_hanging_penalty -                               # -10 per undefended pawn
-            missed_capture_penalty                               # Penalty for ignoring free material
+            missed_capture_penalty -                             # Penalty for ignoring free material
+            missed_free_cap_penalty -                             # Penalty for ignoring quiescence-verified free piece
+            opp_free_cap_penalty                                 # Penalty for allowing opponent free capture with check
         )
 
         # BONUS: Fix resolves a duplicate pawn situation
@@ -2932,6 +3307,8 @@ def _search_single_ply_for_fixes(
             'pwn_h': -pawn_hanging_penalty,
             'win_cap': winning_capture_bonus,
             'miss_c': -missed_capture_penalty,
+            'mfc': -missed_free_cap_penalty,
+            'ofc': -opp_free_cap_penalty,
             'zero_r': -zero_reach_penalty,
             'dist': -distance_penalty,
             'stuck': stuck_bonus,
@@ -2942,9 +3319,21 @@ def _search_single_ply_for_fixes(
             'ply': fix_ply,
             'san': candidate_san,
             'ocr': original_ocr,
+            # Which OCR candidate produced the char_sim value above. Usually
+            # equals 'ocr' (= top_move); differs in dual-sheet when sheet-2's
+            # reading matched the fix better than sheet-1's. Debug/UX only.
+            'sim_source': sim_source,
             'reach': test_reach,
             'completes': completes,
             'reach_improvement': reach_improvement,
+            # Backtracking metadata: when fix_ply < stuck_ply, the candidate
+            # is a backtrack proposal — the algorithm got stuck at
+            # origin_stuck_ply and is offering to repair an earlier move
+            # instead of the stuck one. UI uses this to display "stuck at X
+            # (red), proposing fix at Y (yellow)" so the user understands
+            # the fix isn't because Y itself is broken.
+            'is_backtrack': fix_ply < stuck_ply,
+            'origin_stuck_ply': stuck_ply,
             'char_sim': char_sim,
             'ocr_conf': ocr_conf,
             'ocr_candidate_bonus': ocr_candidate_bonus,
@@ -3193,8 +3582,15 @@ def find_deep_backtrack_fixes(
             ocr_m = ocr_lookup.get(bf['ply'])
             original_ocr = ocr_m.top_move if ocr_m else bf['original']
 
-            # Calculate character similarity
-            char_sim = move_similarity(bf['original'], bf['alternative'])
+            # Calculate character similarity. Best-of-N across all candidate
+            # readings whose confidence meets the dual-sheet threshold so a
+            # piece-confusion swap (R<->K, B<->R) that matches sheet 2's
+            # reading exactly isn't penalized for not matching sheet 1's
+            # merged top. Falls back to top-only on single-sheet input.
+            if ocr_m and ocr_m.candidates:
+                char_sim, _ = _best_sim_across_candidates(ocr_m.candidates, bf['alternative'])
+            else:
+                char_sim = move_similarity(bf['original'], bf['alternative'])
 
             # Calculate unified_score using the SAME formula as regular fixes
             # (Don't use bf['score'] which has a different scale)
@@ -3216,6 +3612,65 @@ def find_deep_backtrack_fixes(
             absurdities_result = find_all_absurdities(test_moves[:absurdity_check_limit], verbose=False, fast_mode=True,
                                                        start_ply=fix_ply)
             absurdities_result = [a for a in absurdities_result if a.ply >= fix_ply]
+
+            # Same fast_mode false-positive guard as the main path: re-check
+            # each apparent-hanging piece individually with full quiescence
+            # rather than re-running find_all_absurdities.
+            fix_ply_absurds = [a for a in absurdities_result if a.ply == fix_ply]
+            if fix_ply_absurds:
+                pc_recheck_board = chess.Board()
+                pc_valid = True
+                for i in range(fix_ply):
+                    if i < len(test_moves):
+                        m = try_move(pc_recheck_board, test_moves[i])
+                        if m:
+                            pc_recheck_board.push(m)
+                        else:
+                            pc_valid = False
+                            break
+                if pc_valid:
+                    # Drop pre-existing piece-left-hanging absurdities AT fix_ply.
+                    # Same narrow filter as in _search_single_ply_for_fixes.
+                    _ab_mover_color = chess.WHITE if (fix_ply % 2 == 0) else chess.BLACK
+                    _pre_filtered = []
+                    for a in fix_ply_absurds:
+                        if a.absurdity_type == 'piece_left_hanging':
+                            try:
+                                _sq = chess.parse_square(a.hanging_square)
+                                _piece_before = pc_recheck_board.piece_at(_sq)
+                                if (_piece_before is not None
+                                        and _piece_before.color == _ab_mover_color):
+                                    if verbose:
+                                        print(f"      [PRE-EXISTING] piece-confusion {bf['alternative']} "
+                                              f"skips abs at {a.hanging_square} "
+                                              f"({a.hanging_piece} was already there)")
+                                    continue
+                            except Exception:
+                                pass
+                        _pre_filtered.append(a)
+                    fix_ply_absurds = _pre_filtered
+
+                    pc_recheck_move = try_move(pc_recheck_board, test_moves[fix_ply])
+                    if pc_recheck_move is not None:
+                        pc_recheck_board.push(pc_recheck_move)
+                        pc_kept = []
+                        for a in fix_ply_absurds:
+                            try:
+                                sq = chess.parse_square(a.hanging_square)
+                                piece = pc_recheck_board.piece_at(sq)
+                                if piece is None:
+                                    continue
+                                is_hang, _, _ = is_piece_genuinely_hanging(
+                                    pc_recheck_board, sq, piece,
+                                    move_just_played=pc_recheck_move,
+                                    fast_mode=False,
+                                )
+                                if is_hang:
+                                    pc_kept.append(a)
+                            except Exception:
+                                pc_kept.append(a)
+                        absurdities_result = [a for a in absurdities_result if a.ply != fix_ply] + pc_kept
+
             absurdity_count = len(absurdities_result)
             absurdity_penalty = calculate_absurdity_penalty(absurdities_result)
 
@@ -3231,33 +3686,59 @@ def find_deep_backtrack_fixes(
                         board_for_hang.push(m)
                 swap_move = try_move(board_for_hang, bf['alternative'])
                 if swap_move:
-                    is_hanging, hanging_value = is_piece_hanging_after_move(board_for_hang, swap_move)
+                    # Fast path only — display-label only (no scoring impact),
+                    # verify pass re-checks at full quiescence for top-N.
+                    is_hanging, hanging_value = is_piece_hanging_after_move(
+                        board_for_hang, swap_move, fast_mode=True
+                    )
                     # When in check, pawns hanging elsewhere are collateral
                     if not board_for_hang.is_check():
                         pawn_hang_count = count_hanging_pawns_after_move(board_for_hang, swap_move)
             except:
                 pass
 
-            hanging_penalty = hanging_value * 10 if is_hanging else 0
-            pawn_hanging_penalty = pawn_hang_count * 10
-            # Offset pawn hanging penalty by captured material (same as main path)
-            if pawn_hanging_penalty > 0 and swap_move and board_for_hang.is_capture(swap_move):
-                cap_p = board_for_hang.piece_at(swap_move.to_square)
-                if cap_p:
-                    pawn_hanging_penalty = max(0, pawn_hanging_penalty - piece_value(cap_p) * 10)
-
-            # Missed capture penalty for piece confusion path
-            # Skip when in check — can't freely capture when responding to check
+            # REMOVED: hanging_penalty, pawn_hanging_penalty, missed_capture_penalty (chess quality signals)
+            hanging_penalty = 0
+            pawn_hanging_penalty = 0
             missed_capture_penalty = 0
-            try:
-                if board_for_hang.is_check():
-                    pc_capture_gain = 0
-                else:
-                    pc_capture_gain = find_best_capture_gain(board_for_hang)
-                if pc_capture_gain >= 2 and swap_move and not board_for_hang.is_capture(swap_move):
-                    missed_capture_penalty = pc_capture_gain * 10
-            except:
-                pass
+
+            # Missed genuinely-free capture penalty for piece confusion path
+            # Gate: only invoke quiescence when simple check finds captures worth >= 3
+            missed_free_cap_penalty = 0
+            if swap_move:
+                try:
+                    pc_bcg = 0 if board_for_hang.is_check() else find_best_capture_gain(board_for_hang)
+                    if pc_bcg >= 3:
+                        pc_free_caps = find_free_captures(board_for_hang, board_for_hang.turn)
+                        if pc_free_caps:
+                            takes_free = any(
+                                swap_move.to_square == fc.to_square
+                                for fc, _, _ in pc_free_caps
+                            )
+                            if not takes_free:
+                                best_free_val = max(val for _, _, val in pc_free_caps)
+                                missed_free_cap_penalty = best_free_val * 10
+                except:
+                    pass
+
+            # Opponent free capture with check penalty for piece confusion path
+            # Gate: only at stuck ply (same rationale as main path)
+            opp_free_cap_penalty = 0
+            if swap_move and fix_ply >= stuck_ply:
+                board_for_hang.push(swap_move)
+                try:
+                    # Fast depth for per-candidate scoring (see main path comment).
+                    ofc_caps = find_free_captures_with_check(board_for_hang, board_for_hang.turn, max_depth=6)
+                    if ofc_caps:
+                        best_ofc_val = max(val for _, _, val in ofc_caps)
+                        opp_free_cap_penalty = best_ofc_val * 8 + 15
+                except Exception:
+                    pass
+                board_for_hang.pop()
+
+            # Bad-trade absurdities (SEE-verified losing exchanges) are now
+            # emitted by detect_absurdity_at_ply and counted in absurdity_penalty
+            # above — no separate scoring signal here.
 
             # Clears destination bonus for piece confusion path
             stuck_dest_square = ctx.get('stuck_dest_square')
@@ -3285,7 +3766,9 @@ def find_deep_backtrack_fixes(
                 absurdity_penalty -                                  # Penalty for absurdities!
                 hanging_penalty -                                    # Penalty for hanging piece
                 pawn_hanging_penalty -                               # -10 per undefended pawn
-                missed_capture_penalty                               # Penalty for ignoring free material
+                missed_capture_penalty -                             # Penalty for ignoring free material
+                missed_free_cap_penalty -                             # Penalty for ignoring quiescence-verified free piece
+                opp_free_cap_penalty                                 # Penalty for allowing opponent free capture with check
             )
 
             fix = {
@@ -3295,6 +3778,12 @@ def find_deep_backtrack_fixes(
                 'reach': bf.get('new_stuck_ply') or total_moves,
                 'completes': completes,
                 'reach_improvement': reach_improvement,
+                # Piece-confusion fixes are by definition backtracking (they
+                # only fire on plies before stuck_ply where both R/K or B/R
+                # were legal). Mark accordingly so review UI shows the
+                # stuck ply in red and this fix's ply in yellow.
+                'is_backtrack': bf['ply'] < stuck_ply,
+                'origin_stuck_ply': stuck_ply,
                 'char_sim': char_sim,
                 'ocr_conf': ocr_conf,
                 'ocr_candidate_bonus': ocr_candidate_bonus,
@@ -3462,15 +3951,25 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
         fixes = sorted(fixes, key=lambda f: f['unified_score'], reverse=True)
 
     # === VERIFY TOP CANDIDATES (full tactical verification) ===
-    # Re-check absurdities with full quiescence on ALL top candidates (not just abs==1).
-    # Also check for mate-in-1 and major material loss by opponent's reply.
-    # This runs ONCE here at the top level, not inside find_deep_backtrack_fixes.
+    # Re-check absurdities with full quiescence, plus mate-in-1 / hanging /
+    # ofc tactical checks. The full quiescence path is expensive enough
+    # (per-candidate × per-ply Layer-2 quiescence in tactical positions)
+    # that we only run it for the top 5 — Greedy/Beam/Dijkstra only ever
+    # pick top-1, so candidates 6..N can keep their fast-mode scores.
+    # This caps verify-pass cost at 5 candidates' worth of quiescence
+    # work even when verify_top_n is set higher for ranking purposes.
+    DEEP_VERIFY_N = 5
     verified_count = 0
-    for f in fixes[:verify_top_n]:
+    for verify_idx, f in enumerate(fixes[:verify_top_n]):
         fix_ply = f['ply']
         test_moves = moves[:fix_ply] + [f['san']] + moves[fix_ply + 1:]
         test_reach = f['reach']
         absurdity_check_limit = min(test_reach, stuck_ply + 1)
+
+        # Skip the heavy verify work for candidates outside the deep-verify
+        # window. They keep their fast-mode score; they're not picked anyway.
+        if verify_idx >= DEEP_VERIFY_N:
+            continue
 
         # --- Re-check absurdities with full quiescence (fast_mode=False) ---
         verified_absurdities = find_all_absurdities(
@@ -3479,6 +3978,49 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
         )
         # Filter: only count absurdities at or after fix_ply
         verified_absurdities = [a for a in verified_absurdities if a.ply >= fix_ply]
+
+        # Apply the downstream-only (Case 2) pre-existing-and-already-hanging
+        # filter. We deliberately DON'T filter at a.ply == fix_ply here: verify
+        # pass re-checks fix_ply with full quiescence, so any fix_ply absurdity
+        # that survives quiescence is a real one — not a fast_mode false
+        # positive. The downstream filter handles the user-reported case (an
+        # inherited hanging piece flagged at fix_ply+2 because the candidate's
+        # tactical counter at fix_ply has played out by then).
+        if verified_absurdities:
+            try:
+                _vb = chess.Board()
+                _vb_valid = True
+                for _vi in range(fix_ply):
+                    _vmove_str = test_moves[_vi] if _vi < len(test_moves) else None
+                    if _vmove_str:
+                        _vmove = try_move(_vb, _vmove_str)
+                        if _vmove:
+                            _vb.push(_vmove)
+                        else:
+                            _vb_valid = False
+                            break
+                    else:
+                        _vb_valid = False
+                        break
+                if _vb_valid:
+                    _kept_verified = []
+                    for a in verified_absurdities:
+                        if (a.ply > fix_ply
+                                and a.absurdity_type == 'piece_left_hanging'):
+                            try:
+                                _sq = chess.parse_square(a.hanging_square)
+                                _piece_before = _vb.piece_at(_sq)
+                                _ab_color = chess.WHITE if (a.ply % 2 == 0) else chess.BLACK
+                                if (_piece_before is not None
+                                        and _piece_before.color == _ab_color
+                                        and is_apparently_hanging(_vb, _sq, _piece_before)):
+                                    continue
+                            except Exception:
+                                pass
+                        _kept_verified.append(a)
+                    verified_absurdities = _kept_verified
+            except Exception:
+                pass
 
         if len(verified_absurdities) != f.get('absurdity_count', 0):
             old_count = f.get('absurdity_count', 0)
@@ -3489,6 +4031,12 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
             f['absurdity_count'] = new_count
             f['absurdity_penalty'] = new_penalty
             f['unified_score'] = f['unified_score'] + old_penalty - new_penalty
+            # Sync score_components so the UI breakdown reflects the verified
+            # penalty. Without this, the breakdown keeps showing the stale
+            # fast-mode `abs_pen-30` even after verify cleared the absurdity,
+            # making the user think the score was penalized when it wasn't.
+            if 'score_components' in f and isinstance(f['score_components'], dict):
+                f['score_components']['abs_pen'] = -new_penalty
             verified_count += 1
 
             if verbose:
@@ -3515,6 +4063,24 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
             if valid:
                 candidate_move = try_move(verify_board, f['san'])
                 if candidate_move:
+                    # Re-evaluate is_hanging with full quiescence. Initial scoring
+                    # called is_piece_hanging_after_move which (post-fix) uses
+                    # quiescence too, but during streaming the field could have
+                    # been set from a stale path; recheck to be sure the
+                    # "hanging!" annotation reflects the verified state.
+                    new_hang, new_hang_val = is_piece_hanging_after_move(
+                        verify_board, candidate_move
+                    )
+                    if bool(new_hang) != bool(f.get('is_hanging', False)) or \
+                       new_hang_val != f.get('hanging_value', 0):
+                        if verbose:
+                            print(f"   [VERIFY] {ply_to_str(fix_ply)} '{f['san']}': "
+                                  f"is_hanging {f.get('is_hanging', False)}->{new_hang} "
+                                  f"(value {f.get('hanging_value', 0)}->{new_hang_val})")
+                        f['is_hanging'] = new_hang
+                        f['hanging_value'] = new_hang_val if new_hang else 0
+                        verified_count += 1
+
                     # Track what the candidate move captures (for trade detection)
                     candidate_captured_val = 0
                     if verify_board.is_capture(candidate_move):
@@ -3523,6 +4089,35 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
                             candidate_captured_val = piece_value(cap_piece)
                     candidate_to_sq = candidate_move.to_square
                     verify_board.push(candidate_move)
+
+                    # Re-verify ofc (opponent free capture with check) at full
+                    # quiescence depth. Initial scoring used max_depth=6 — the
+                    # original bug we're guarding against (deep exchanges like
+                    # Rxg7+ Rxg7 Bxg7 ...) is depth=6 FALSELY flagging a non-
+                    # free capture as free, i.e. fast-mode said ofc>0 when it
+                    # should be 0. So we only need to deep-verify candidates
+                    # that fast-mode flagged with ofc>0 — going deeper on
+                    # ofc=0 candidates won't flip them (depth=10 sees more
+                    # refutations, not more free captures). Limit to top 5
+                    # since Greedy only picks the top-1 anyway; top-5 is ample
+                    # margin for the verify pass to swap them around.
+                    old_ofc_penalty = -(f.get('score_components', {}).get('ofc', 0))
+                    if fix_ply >= stuck_ply and verify_idx < 5 and old_ofc_penalty > 0:
+                        try:
+                            deep_ofc_caps = find_free_captures_with_check(
+                                verify_board, verify_board.turn, max_depth=10
+                            )
+                            new_ofc_penalty = (max(v for _, _, v in deep_ofc_caps) * 8 + 15) if deep_ofc_caps else 0
+                            if new_ofc_penalty != old_ofc_penalty:
+                                f['unified_score'] = f['unified_score'] + old_ofc_penalty - new_ofc_penalty
+                                if 'score_components' in f:
+                                    f['score_components']['ofc'] = -new_ofc_penalty
+                                if verbose:
+                                    print(f"   [VERIFY] {ply_to_str(fix_ply)} '{f['san']}': "
+                                          f"ofc {old_ofc_penalty}->{new_ofc_penalty}, score adjusted")
+                                verified_count += 1
+                        except Exception:
+                            pass
 
                     # Check 1: Does opponent have mate-in-1?
                     mate_penalty = 0
@@ -3569,120 +4164,83 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
                             f['score_components']['v_mate'] = -mate_penalty
                         verified_count += 1
 
-                    # Check 2: Opponent wins major material in 1 move
-                    # But account for OUR best reply — only RELATED compensation:
-                    # - Recapture on the same square (direct trade)
-                    # - Promotion (with or without capture) — always relevant
-                    # Unrelated captures elsewhere don't count (they were available before too).
-                    worst_net_loss = 0  # Worst case material loss after opp capture + our reply
-                    for opp_move in verify_board.legal_moves:
-                        if verify_board.is_capture(opp_move):
-                            captured = verify_board.piece_at(opp_move.to_square)
-                            if not captured:
-                                continue
-                            opp_capture_val = piece_value(captured)
-                            if opp_capture_val < 3:
-                                continue  # Skip pawn captures, too noisy
-
-                            opp_capture_sq = opp_move.to_square
-
-                            # Simulate opponent's capture
-                            verify_board.push(opp_move)
-
-                            # Find our best RELATED reply:
-                            # - Recapture on same square (trade)
-                            # - Any promotion (with or without capture)
-                            our_best_recovery = 0
-                            for our_reply in verify_board.legal_moves:
-                                reply_gain = 0
-                                is_recapture = (our_reply.to_square == opp_capture_sq and
-                                                verify_board.is_capture(our_reply))
-                                is_promotion = our_reply.promotion is not None
-
-                                if not is_recapture and not is_promotion:
-                                    continue  # Skip unrelated captures
-
-                                if verify_board.is_capture(our_reply):
-                                    target = verify_board.piece_at(our_reply.to_square)
-                                    if target:
-                                        reply_gain += piece_value(target)
-                                if is_promotion:
-                                    reply_gain += 8  # queen(9) - pawn(1) = 8
-                                if reply_gain > our_best_recovery:
-                                    our_best_recovery = reply_gain
-
-                            verify_board.pop()
-
-                            # Net loss = what they captured minus what we recover
-                            net_loss = opp_capture_val - our_best_recovery
-                            # If opponent recaptures on the square we just captured on,
-                            # it's a trade — offset by what our candidate move captured
-                            if opp_move.to_square == candidate_to_sq and candidate_captured_val > 0:
-                                net_loss = max(0, net_loss - candidate_captured_val)
-                            if net_loss > worst_net_loss:
-                                worst_net_loss = net_loss
-
-                    if worst_net_loss >= 3:
-                        # Check minimum material loss across ALL legal moves
-                        # Only penalize the EXCESS over the best alternative
-                        verify_board.pop()  # undo candidate move
-                        min_loss_all = worst_net_loss  # default: assume this move is typical
-                        for alt_move in verify_board.legal_moves:
-                            verify_board.push(alt_move)
-                            alt_worst = 0
-                            for opp_m2 in verify_board.legal_moves:
-                                if verify_board.is_capture(opp_m2):
-                                    cap2 = verify_board.piece_at(opp_m2.to_square)
-                                    if not cap2 or piece_value(cap2) < 3:
-                                        continue
-                                    opp_cap_sq2 = opp_m2.to_square
-                                    opp_val2 = piece_value(cap2)
-                                    verify_board.push(opp_m2)
-                                    best_rec2 = 0
-                                    for our_r2 in verify_board.legal_moves:
-                                        is_recap2 = (our_r2.to_square == opp_cap_sq2 and verify_board.is_capture(our_r2))
-                                        is_promo2 = our_r2.promotion is not None
-                                        if not is_recap2 and not is_promo2:
-                                            continue
-                                        rg2 = 0
-                                        if verify_board.is_capture(our_r2):
-                                            t2 = verify_board.piece_at(our_r2.to_square)
-                                            if t2:
-                                                rg2 += piece_value(t2)
-                                        if is_promo2:
-                                            rg2 += 8
-                                        if rg2 > best_rec2:
-                                            best_rec2 = rg2
-                                    verify_board.pop()
-                                    nl2 = opp_val2 - best_rec2
-                                    if nl2 > alt_worst:
-                                        alt_worst = nl2
-                            verify_board.pop()
-                            if alt_worst < min_loss_all:
-                                min_loss_all = alt_worst
-                                if min_loss_all == 0:
-                                    break  # Found a move with no loss
-                        verify_board.push(candidate_move)  # re-push
-
-                        # Only penalize the EXCESS material loss
-                        excess_loss = worst_net_loss - min_loss_all
-                        if excess_loss >= 3:
-                            material_penalty = excess_loss * 10
-                            f['unified_score'] -= material_penalty
-                            f['verify_material_penalty'] = material_penalty
-                            if 'score_components' in f:
-                                f['score_components']['v_mat'] = -material_penalty
-                            verified_count += 1
-                            if verbose:
-                                print(f"   [VERIFY] {ply_to_str(fix_ply)} '{f['san']}': "
-                                      f"opponent wins material (net loss {worst_net_loss}, best alt loss {min_loss_all}, excess {excess_loss}) -> penalty -{material_penalty}")
-                        elif verbose and worst_net_loss >= 3:
-                            print(f"   [VERIFY] {ply_to_str(fix_ply)} '{f['san']}': "
-                                  f"material loss {worst_net_loss} but unavoidable (best alt loss {min_loss_all}) — no penalty")
+                    # === CHECK 2 DISABLED (April 2026) ===
+                    # Removed: "Opponent wins major material" penalty.
+                    # Reason: Penalizes fixes for pre-existing tactical vulnerabilities
+                    # they didn't create (e.g., Christine game 37.B b3 gets -50 for
+                    # a pinned rook that was already hanging before Black moved).
+                    # This check is redundant with Check 1 (absurdity re-check) and
+                    # EAD's bad_trade detection, which already catch fixes that
+                    # genuinely blunder material.
+                    # See VERIFY-CHECK2-REMOVAL.md for full analysis.
+                    # === END CHECK 2 DISABLED ===
         except Exception:
             pass  # If position can't be rebuilt, skip tactical checks
 
-    if verified_count > 0:
+    # === EXTENDED OFC RE-VERIFY (ranks DEEP_VERIFY_N..verify_top_n) ===
+    # The verify loop above caps the expensive deep tactical work (mate-in-1,
+    # hanging, trade) at top-DEEP_VERIFY_N. OFC re-verify rides along inside
+    # that cap, so candidates at rank 6..verify_top_n keep their fast-mode
+    # OFC penalty even when depth=10 would clear it.
+    #
+    # Why this matters: fast-mode OFC at depth=6 has a known class of false
+    # positives — captures-with-check followed by a deep recapture chain
+    # (e.g., 47.Rxg7+ Kxg7 48.Rxg5+ hxg5 49.fxg5 ...). At depths 4/6/8 the
+    # static-exchange evaluator returns +1 for the capturer; only depth=10
+    # converges to the correct 0 (or negative). When the true correct fix
+    # (Ng5 in the report) drops to rank 6+ because of a -23 false-positive
+    # penalty, the top-5 cap can't rescue it, Greedy picks a worse candidate
+    # (Nf6 or similar), and the user reports "ofc-23 fired on a move that
+    # actually wins material on every recapture line."
+    #
+    # OFC re-verify is itself cheap: find_free_captures_with_check only runs
+    # quiescence on captures that give check, which is typically zero or one
+    # in any given position. The board rebuild is also milliseconds. Doing
+    # this for the extra 10 candidates costs at most ~100ms even in tactical
+    # positions — far less than bumping fast-mode depth to 10 (which slowed
+    # Greedy enough that we backed it out).
+    ofc_extended = 0
+    for vi in range(DEEP_VERIFY_N, min(verify_top_n, len(fixes))):
+        f = fixes[vi]
+        fix_ply = f['ply']
+        if fix_ply < stuck_ply:
+            continue
+        old_ofc = -(f.get('score_components', {}).get('ofc', 0))
+        if old_ofc <= 0:
+            continue
+        try:
+            vb = chess.Board()
+            ok = True
+            for i in range(fix_ply):
+                mi = moves[i] if i < len(moves) else None
+                if not mi:
+                    ok = False
+                    break
+                mo = try_move(vb, mi)
+                if not mo:
+                    ok = False
+                    break
+                vb.push(mo)
+            if not ok:
+                continue
+            cm = try_move(vb, f['san'])
+            if not cm:
+                continue
+            vb.push(cm)
+            deep = find_free_captures_with_check(vb, vb.turn, max_depth=10)
+            new_ofc = (max(v for _, _, v in deep) * 8 + 15) if deep else 0
+            if new_ofc != old_ofc:
+                f['unified_score'] = f['unified_score'] + old_ofc - new_ofc
+                if 'score_components' in f:
+                    f['score_components']['ofc'] = -new_ofc
+                ofc_extended += 1
+                if verbose:
+                    print(f"   [VERIFY-OFC-EXT] {ply_to_str(fix_ply)} '{f['san']}' "
+                          f"(rank {vi+1}): ofc {old_ofc}->{new_ofc}, score adjusted")
+        except Exception:
+            pass
+
+    if verified_count > 0 or ofc_extended > 0:
         fixes.sort(key=lambda x: -x['unified_score'])
 
     # === MARK "KEEP AS-IS" FIXES (for UI display) ===
@@ -3998,19 +4556,46 @@ class BacktrackSearchState:
             )
             if backtrack_fixes:
                 for bf in backtrack_fixes:
+                    # Best-of-N similarity (dual-sheet aware). See twin site
+                    # in find_fixes_two_phase for rationale.
+                    _bf_ocr_m = self.ocr_lookup.get(bf['ply'])
+                    if _bf_ocr_m and _bf_ocr_m.candidates:
+                        _bf_char_sim, _ = _best_sim_across_candidates(_bf_ocr_m.candidates, bf['alternative'])
+                    else:
+                        _bf_char_sim = move_similarity(bf['original'], bf['alternative'])
+                    _bf_reach_imp = bf['plies_gained']
+                    _bf_completes = bf.get('new_stuck_ply') is None
+                    _bf_ocr_conf = bf['ocr_conf']
                     fix = {
                         'ply': bf['ply'],
                         'san': bf['alternative'],
                         'ocr': bf['original'],
                         'reach': bf.get('new_stuck_ply') or len(self.moves),
-                        'completes': bf.get('new_stuck_ply') is None,
-                        'reach_improvement': bf['plies_gained'],
-                        'char_sim': move_similarity(bf['original'], bf['alternative']),
-                        'ocr_conf': bf['ocr_conf'],
+                        'completes': _bf_completes,
+                        'reach_improvement': _bf_reach_imp,
+                        # Piece-confusion fixes are by definition backtracking
+                        # — same metadata as in find_fixes_two_phase so the
+                        # streaming/Pyodide path produces identical fix dicts
+                        # and the review UI gets the same red/yellow display.
+                        'is_backtrack': bf['ply'] < self.effective_stuck_ply,
+                        'origin_stuck_ply': self.effective_stuck_ply,
+                        'char_sim': _bf_char_sim,
+                        'ocr_conf': _bf_ocr_conf,
                         'unified_score': bf['score'] if 'score' in bf else 50,
                         'absurdity_count': 0,
                         'absurdity_penalty': 0,
                         'type': 'piece_confusion',
+                        # Score breakdown for the fix-details panel. Piece-
+                        # confusion scoring is light (no absurdity/quiescence
+                        # pass), so the component list is a subset of Phase 1.
+                        'score_components': {
+                            'sim': round(_bf_char_sim * 40, 1),
+                            'hi_sim': 25 if _bf_char_sim >= 0.90 else 0,
+                            'reach': min(_bf_reach_imp * 10, 50),
+                            'complete': 5 if _bf_completes else 0,
+                            'ocr_c': round(_bf_ocr_conf * 15, 1),
+                        },
+                        'sim_source': bf['original'],
                     }
                     self.fixes.append(fix)
                 self.fixes.sort(key=lambda x: -x['unified_score'])

@@ -59,6 +59,7 @@
           <button id="btn-download-ocr-sheet1" class="text-xs px-2 py-1 bg-green-800 hover:bg-green-700 rounded hidden" title="Download White's OCR data">⬇ OCR White</button>
           <button id="btn-download-ocr-sheet2" class="text-xs px-2 py-1 bg-green-800 hover:bg-green-700 rounded hidden" title="Download Black's OCR data">⬇ OCR Black</button>
           <button id="btn-reocr" class="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded hidden" title="Re-OCR with manual corner selection">🎯 Re-OCR</button>
+          <button id="btn-reset-reconstruct" class="text-xs px-2 py-1 bg-gray-700 hover:bg-red-900 rounded hidden" title="Discard all fixes and re-run reconstruction from the original OCR (no re-OCR)">↺ Reset</button>
           <button id="btn-change-input" class="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded" title="Load different game">🔄 Change</button>
         </div>
         <button id="btn-toggle-help" class="text-xs text-gray-400 hover:text-blue-400 flex items-center gap-1" title="Show usage tips">
@@ -90,33 +91,19 @@
           <button class="input-tab px-3 py-1.5 rounded text-sm bg-blue-600 text-white" data-mode="upload">📷 Image</button>
           <button class="input-tab px-3 py-1.5 rounded text-sm bg-gray-700 text-gray-300" data-mode="pgn">📋 PGN</button>
           <button class="input-tab px-3 py-1.5 rounded text-sm bg-gray-700 text-gray-300" data-mode="ocr">📤 OCR Text</button>
+          <button class="input-tab px-3 py-1.5 rounded text-sm bg-gray-700 text-gray-300" data-mode="batch">📁 Batch</button>
           <div class="flex-1"></div>
-          <button id="btn-demo" class="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 rounded text-sm font-medium">🎮 Demo</button>
         </div>
         <div id="mode-upload" class="input-content">
-          <!-- Simple single-image upload (existing behavior) -->
-          <div id="simple-upload" class="mb-4">
-            <!-- Sheet Profile Selector -->
-            <div id="profile-bar" class="flex items-center gap-2 mb-2 text-sm">
-              <label class="text-gray-400">Profile:</label>
-              <select id="profile-select" class="bg-gray-700 text-white rounded px-2 py-1 text-sm flex-1 max-w-xs"></select>
-              <button id="btn-edit-profile" class="text-gray-300 hover:text-white text-sm" title="Edit profiles">&#9998;</button>
-              <span id="profile-summary" class="text-gray-400 text-xs ml-2"></span>
-            </div>
-            <!-- Simple mode: single player row of 3 page boxes (rendered by sheets.js) -->
-            <div id="simple-sheets"></div>
+          <!-- Sheet Profile Selector -->
+          <div id="profile-bar" class="flex items-center gap-2 mb-2 text-sm">
+            <label class="text-gray-400">Profile:</label>
+            <select id="profile-select" class="bg-gray-700 text-white rounded px-2 py-1 text-sm flex-1 max-w-md"></select>
+            <button id="btn-edit-profile" class="text-gray-300 hover:text-white text-sm" title="Edit profiles">&#9998;</button>
+            <span id="profile-summary" class="text-gray-400 text-xs ml-2"></span>
           </div>
-
-          <!-- Toggle for advanced multi-sheet mode -->
-          <div class="flex items-center justify-center">
-            <button id="btn-toggle-multisheet" class="text-sm text-blue-400 hover:text-blue-300 flex items-center gap-1">
-              <span id="multisheet-toggle-icon">&#9660;</span>
-              <span id="multisheet-toggle-text">Advanced: Both players / Multiple sheets</span>
-            </button>
-          </div>
-
-          <!-- Multi-sheet uploader (hidden by default) -->
-          <div id="sheets-uploader" class="hidden mt-4">
+          <!-- Unified sheet uploader (rendered by sheets.js) -->
+          <div id="sheets-uploader">
             <!-- Content will be rendered by sheets.js -->
           </div>
         </div>
@@ -129,11 +116,11 @@
           <div id="pgn-dual-input" class="hidden">
             <div class="grid grid-cols-2 gap-3">
               <div>
-                <label class="text-xs text-gray-400 mb-1 block">&#9812; White's moves:</label>
+                <label class="text-xs text-gray-400 mb-1 block">&#9818; White's moves:</label>
                 <textarea id="pgn-input-white" placeholder="1. e4&#10;2. Nf3&#10;3. Bc4" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-sm"></textarea>
               </div>
               <div>
-                <label class="text-xs text-gray-400 mb-1 block">&#9818; Black's moves:</label>
+                <label class="text-xs text-gray-400 mb-1 block">&#9812; Black's moves:</label>
                 <textarea id="pgn-input-black" placeholder="1... e5&#10;2... Nc6&#10;3... Bc5" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-sm"></textarea>
               </div>
             </div>
@@ -162,11 +149,11 @@
           <div id="ocr-dual-input" class="hidden">
             <div class="grid grid-cols-2 gap-3">
               <div>
-                <label class="text-xs text-gray-400 mb-1 block">&#9812; White's moves:</label>
+                <label class="text-xs text-gray-400 mb-1 block">&#9818; White's moves:</label>
                 <textarea id="ocr-input-white" placeholder="1. e4&#10;2. Nf3&#10;3. Bc4" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-xs"></textarea>
               </div>
               <div>
-                <label class="text-xs text-gray-400 mb-1 block">&#9818; Black's moves:</label>
+                <label class="text-xs text-gray-400 mb-1 block">&#9812; Black's moves:</label>
                 <textarea id="ocr-input-black" placeholder="1. e5&#10;2. Nc6&#10;3. Bc5" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-xs"></textarea>
               </div>
             </div>
@@ -185,10 +172,82 @@
           </div>
           <button id="btn-load-ocr" class="mt-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm">Load OCR</button>
         </div>
+        <!-- Batch mode input -->
+        <div id="mode-batch" class="input-content hidden">
+          <div class="space-y-3">
+            <!-- Step 1: Sheet profile -->
+            <div>
+              <div class="flex items-center gap-1 mb-1">
+                <label class="text-xs text-gray-400">Step 1: Scoresheet profile</label>
+                <button class="batch-help-btn w-4 h-4 rounded-full bg-gray-600 hover:bg-blue-500 text-[10px] leading-4 text-center text-gray-300 hover:text-white" data-help="profile" title="Help: Scoresheet profiles">?</button>
+              </div>
+              <div class="flex items-center gap-2">
+                <select id="batch-profile-select" class="bg-gray-700 text-white rounded px-2 py-1 text-sm flex-1 max-w-md"></select>
+                <button id="btn-batch-edit-profile" class="text-gray-300 hover:text-white text-sm" title="Edit profiles">&#9998;</button>
+                <span id="batch-profile-summary" class="text-gray-400 text-xs"></span>
+              </div>
+            </div>
+            <!-- Step 2: Scan folder -->
+            <div>
+              <div class="flex items-center gap-1 mb-1">
+                <label class="text-xs text-gray-400">Step 2: Scoresheet scans</label>
+                <button class="batch-help-btn w-4 h-4 rounded-full bg-gray-600 hover:bg-blue-500 text-[10px] leading-4 text-center text-gray-300 hover:text-white" data-help="scans" title="Help: Scan folder structure">?</button>
+              </div>
+              <div class="flex items-center gap-2">
+                <button id="btn-batch-folder" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-sm">Select Scan Folder</button>
+                <input type="file" id="batch-file-input" webkitdirectory multiple accept="image/*,.pdf" class="hidden">
+                <button id="btn-batch-files" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm" title="Fallback: select individual files">Select Files</button>
+                <span id="batch-folder-status" class="text-xs text-gray-500"></span>
+              </div>
+            </div>
+            <!-- Step 3: Tournament file (optional) — auto-loaded from scan folder if present -->
+            <div>
+              <div class="flex items-center gap-1 mb-1">
+                <label class="text-xs text-gray-400">Step 3: Tournament data (optional)</label>
+                <button class="batch-help-btn w-4 h-4 rounded-full bg-gray-600 hover:bg-blue-500 text-[10px] leading-4 text-center text-gray-300 hover:text-white" data-help="tournament" title="Help: Tournament files">?</button>
+              </div>
+              <div class="flex items-center gap-2">
+                <button id="btn-batch-tournament" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm">Load Tournament File</button>
+                <input type="file" id="batch-tournament-input" accept=".xls,.xlsx,.sjson,.json" class="hidden">
+                <span id="batch-tournament-status" class="text-xs text-gray-500"></span>
+              </div>
+            </div>
+            <!-- Step 4: Round selection -->
+            <div id="batch-round-selector" class="hidden">
+              <div class="flex items-center gap-1 mb-1">
+                <label class="text-xs text-gray-400">Step 4: Select round</label>
+                <button class="batch-help-btn w-4 h-4 rounded-full bg-gray-600 hover:bg-blue-500 text-[10px] leading-4 text-center text-gray-300 hover:text-white" data-help="round" title="Help: Round selection">?</button>
+              </div>
+              <div class="flex items-center gap-2">
+                <select id="batch-round-select" class="bg-gray-700 text-gray-200 rounded px-2 py-1 text-sm border border-gray-600">
+                  <option value="">-- Select Round --</option>
+                </select>
+                <button id="btn-batch-start" class="px-3 py-1.5 bg-green-600 hover:bg-green-500 rounded text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed" disabled>Start Batch OCR</button>
+                <button id="btn-batch-cancel" class="px-3 py-1.5 bg-red-700 hover:bg-red-600 rounded text-sm hidden">Cancel</button>
+                <button id="btn-batch-export-round" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm hidden" title="Concatenate all verified games in this round into one PGN file">Export Round PGN</button>
+                <button id="btn-batch-export-csv" class="px-3 py-1.5 bg-gray-600 hover:bg-gray-500 rounded text-sm hidden" title="Save a CSV report of reconstruction diagnostics">Export CSV</button>
+                <button id="btn-batch-dashboard" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm hidden" title="Show compact color-grid dashboard for this round">Dashboard</button>
+              </div>
+            </div>
+            <div id="batch-summary" class="text-xs text-gray-400 hidden"></div>
+          </div>
+        </div>
+        <!-- Batch help modal -->
+        <div id="batch-help-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div class="bg-gray-800 border border-gray-600 rounded-lg shadow-xl max-w-lg w-full mx-4 max-h-[80vh] overflow-y-auto">
+            <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+              <h3 id="batch-help-title" class="text-sm font-semibold text-gray-200"></h3>
+              <button id="btn-batch-help-close" class="text-gray-400 hover:text-white text-lg">&times;</button>
+            </div>
+            <div id="batch-help-content" class="px-4 py-3 text-sm text-gray-300 space-y-2"></div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
   <main id="main-content" class="flex-1 max-w-7xl mx-auto px-6 py-6 w-full">
+    <!-- Batch mode game list sidebar -->
+    <div id="batch-game-list" class="hidden bg-gray-800 rounded-lg border border-gray-700 mb-4 max-h-64 overflow-y-auto text-gray-200"></div>
     <div id="main-grid" class="grid grid-cols-12 gap-6">
       <div id="panel-board" class="col-span-4">
         <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
@@ -217,7 +276,11 @@
           </div>
           <!-- Full Game Search (under board) -->
           <div class="mt-4 pt-3 border-t border-gray-700">
-            <div class="text-xs text-gray-500 mb-2">Algorithm Lab:</div>
+            <div class="flex items-center gap-2 mb-2">
+              <span class="text-sm font-medium text-gray-200">Algorithm Lab</span>
+              <button id="btn-rerun-all" class="text-xs px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-gray-300">&#8635; Rerun All</button>
+              <button id="btn-cancel-all" class="text-xs px-2 py-0.5 bg-gray-700 hover:bg-red-900 rounded text-gray-300">&#10005; Cancel All</button>
+            </div>
             <!-- Search Progress - Stacked panels (visible once any search starts) -->
             <div id="search-progress" class="hidden space-y-2">
               <!-- Greedy panel -->
@@ -225,12 +288,12 @@
                 <div class="flex items-center justify-between px-2 py-1 border-b border-gray-600">
                   <div class="flex items-center gap-1.5">
                     <span class="text-xs font-medium text-green-400">Greedy</span>
-                    <button id="btn-greedy-search" title="Rerun greedy search" class="text-gray-500 hover:text-green-400 disabled:opacity-30 disabled:cursor-not-allowed" disabled>&#8635;</button>
+                    <button id="btn-greedy-search" title="Rerun Greedy search" class="text-gray-500 hover:text-green-400 disabled:opacity-30 disabled:cursor-not-allowed" disabled>&#8635;</button>
                   </div>
                   <div class="flex items-center gap-2">
                     <span id="greedy-status" class="text-xs text-gray-400">Idle</span>
                     <button id="btn-cancel-greedy" class="text-xs text-red-400 hover:text-red-300 hidden">&#10005;</button>
-                    <button id="btn-apply-greedy" class="text-xs px-1.5 py-0.5 bg-green-700 hover:bg-green-600 rounded hidden">Apply</button>
+                    <button id="btn-review-greedy" class="text-xs px-1.5 py-0.5 bg-blue-700 hover:bg-blue-600 rounded hidden" title="Walk through fixes one by one">Review</button>
                   </div>
                 </div>
                 <div class="px-2 py-1">
@@ -244,18 +307,18 @@
               <div class="bg-gray-700 rounded border border-gray-600 flex flex-col">
                 <div class="flex items-center justify-between px-2 py-1 border-b border-gray-600">
                   <div class="flex items-center gap-1.5">
-                    <span class="text-xs font-medium text-blue-400">Beam</span>
-                    <button id="btn-beam-search" title="Rerun beam search" class="text-gray-500 hover:text-blue-400 disabled:opacity-30 disabled:cursor-not-allowed" disabled>&#8635;</button>
+                    <span class="text-xs font-medium text-sky-400">Beam</span>
+                    <button id="btn-beam-search" title="Rerun Beam search" class="text-gray-500 hover:text-sky-400 disabled:opacity-30 disabled:cursor-not-allowed" disabled>&#8635;</button>
                   </div>
                   <div class="flex items-center gap-2">
                     <span id="beam-status" class="text-xs text-gray-400">Idle</span>
                     <button id="btn-cancel-beam" class="text-xs text-red-400 hover:text-red-300 hidden">&#10005;</button>
-                    <button id="btn-apply-beam" class="text-xs px-1.5 py-0.5 bg-green-700 hover:bg-green-600 rounded hidden">Apply</button>
+                    <button id="btn-review-beam" class="text-xs px-1.5 py-0.5 bg-blue-700 hover:bg-blue-600 rounded hidden" title="Walk through fixes one by one">Review</button>
                   </div>
                 </div>
                 <div class="px-2 py-1">
                   <div class="w-full bg-gray-600 rounded-full h-1">
-                    <div id="beam-progress-bar" class="bg-blue-500 h-1 rounded-full transition-all" style="width: 0%"></div>
+                    <div id="beam-progress-bar" class="bg-sky-500 h-1 rounded-full transition-all" style="width: 0%"></div>
                   </div>
                 </div>
                 <div id="beam-log" class="px-2 pb-2 overflow-y-auto max-h-32 text-xs font-mono text-gray-300 space-y-0.5"></div>
@@ -270,7 +333,7 @@
                   <div class="flex items-center gap-2">
                     <span id="dijkstra-status" class="text-xs text-gray-400">Idle</span>
                     <button id="btn-cancel-dijkstra" class="text-xs text-red-400 hover:text-red-300 hidden">&#10005;</button>
-                    <button id="btn-apply-dijkstra" class="text-xs px-1.5 py-0.5 bg-purple-700 hover:bg-purple-600 rounded hidden">Apply</button>
+                    <button id="btn-review-dijkstra" class="text-xs px-1.5 py-0.5 bg-blue-700 hover:bg-blue-600 rounded hidden" title="Walk through fixes one by one">Review</button>
                   </div>
                 </div>
                 <div class="px-2 py-1">
@@ -314,6 +377,23 @@
       <div id="panel-moves" class="col-span-4">
         <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 h-full flex flex-col">
           <h2 class="text-lg font-semibold mb-3 text-gray-200 flex items-center gap-2">Moves<span id="scoresheet-links" class="flex items-center gap-1"></span></h2>
+          <!-- Pairing header (round/board/date + players + result, populated when a batch game with pairing data is open) -->
+          <div id="game-header" class="hidden mb-3 p-2 bg-gray-700/40 rounded border border-gray-600 text-sm">
+            <div id="game-header-roundinfo" class="text-xs text-gray-400 whitespace-nowrap mb-1"></div>
+            <div id="game-header-players" class="flex items-center justify-between gap-3">
+              <div class="flex-1 min-w-0">
+                <div class="flex items-baseline gap-2 text-gray-200 truncate">
+                  <span class="text-base leading-none" title="White">&#9818;</span>
+                  <span id="game-header-white" class="truncate"></span>
+                </div>
+                <div class="flex items-baseline gap-2 text-gray-200 truncate">
+                  <span class="text-base leading-none" title="Black">&#9812;</span>
+                  <span id="game-header-black" class="truncate"></span>
+                </div>
+              </div>
+              <div id="game-header-result" class="font-mono text-base text-gray-100 whitespace-nowrap"></div>
+            </div>
+          </div>
           <div id="ocr-context-panel" class="hidden mb-3 p-1 bg-gray-700 rounded border border-gray-600">
             <div id="ocr-context-content" class="font-mono text-sm overflow-hidden"></div>
           </div>
@@ -380,9 +460,6 @@
           <label class="flex items-center text-gray-300 text-sm">
             <input type="checkbox" id="set-piece_N_B" class="mr-2"> N / B (Knight/Bishop)
           </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-piece_Q_O" class="mr-2"> Q / O (Queen/Castling)
-          </label>
         </div>
       </div>
 
@@ -400,66 +477,6 @@
         </div>
       </div>
 
-      <!-- File Confusions -->
-      <div class="mb-6">
-        <h3 class="text-lg font-semibold text-green-400 mb-2">File Confusions</h3>
-        <div class="grid grid-cols-2 gap-2">
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-file_a_g" class="mr-2"> a / g (common)
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-file_a_d" class="mr-2"> a / d
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-file_b_d" class="mr-2"> b / d
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-file_e_c" class="mr-2"> e / c
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-file_b_h" class="mr-2"> b / h
-          </label>
-        </div>
-      </div>
-
-      <!-- Rank Confusions -->
-      <div class="mb-6">
-        <h3 class="text-lg font-semibold text-yellow-400 mb-2">Rank Confusions</h3>
-        <div class="grid grid-cols-2 gap-2">
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-rank_1_7" class="mr-2"> 1 / 7
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-rank_2_7" class="mr-2"> 2 / 7
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-rank_3_8" class="mr-2"> 3 / 8
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-rank_4_5" class="mr-2"> 4 / 5
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-rank_1_4" class="mr-2"> 1 / 4
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-rank_6_8" class="mr-2"> 6 / 8
-          </label>
-        </div>
-      </div>
-
-      <!-- Other Options -->
-      <div class="mb-6">
-        <h3 class="text-lg font-semibold text-purple-400 mb-2">Other Quick Fixes</h3>
-        <div class="space-y-2">
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-fix_capture_notation" class="mr-2"> Fix capture notation (add/remove x)
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-fix_combined" class="mr-2"> Try combined fixes (piece+file, etc.)
-          </label>
-        </div>
-      </div>
-
       <!-- Fix-Finding Pipeline -->
       <div class="mb-6">
         <h3 class="text-lg font-semibold text-orange-400 mb-2">Fix-Finding Pipeline</h3>
@@ -470,8 +487,8 @@
               <input type="checkbox" id="set-enable_quick_fixes" class="mr-2"> Layer 1: Quick Fixes
             </label>
             <p class="text-xs text-gray-500 mt-1 ml-5">
-              Try OCR alternatives and character similarity swaps (R/K, a/g, 3/8, etc.)
-              Auto-applies if exactly ONE fix is legal.
+              Searches OCR alternatives and character similarity swaps (R/K, a/g, 3/8, etc.) and surfaces matching legal fixes as clickable suggestions.
+              The toggles below opt specific categories into auto-applying when exactly one fix is legal.
             </p>
             <div class="ml-5 mt-2 space-y-2">
               <label class="flex items-start text-gray-300 text-sm">
@@ -520,28 +537,6 @@
               </p>
             </div>
           </div>
-        </div>
-      </div>
-
-      <!-- Display Options -->
-      <div class="mb-6">
-        <h3 class="text-lg font-semibold text-gray-400 mb-2">Display</h3>
-        <div class="space-y-2">
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-show_debug_output" class="mr-2"> Show debug output
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            <input type="checkbox" id="set-show_ocr_confidence" class="mr-2"> Show OCR confidence
-          </label>
-          <label class="flex items-center text-gray-300 text-sm">
-            Alternatives to show:
-            <select id="set-show_alternatives_count" class="ml-2 bg-gray-700 text-white rounded px-2 py-1 text-sm">
-              <option value="1">1</option>
-              <option value="3">3</option>
-              <option value="5">5</option>
-              <option value="10">10</option>
-            </select>
-          </label>
         </div>
       </div>
 
@@ -626,18 +621,37 @@
   <script src="worker-api.js"></script>
   <script src="js/settings.js"></script>
   <script src="js/sheet-profiles.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/batch-pdf.js"></script>
   <script src="js/merge-sheets.js"></script>
+  <script src="js/sheet-alignment.js"></script>
+  <script src="js/sheet-nw-alignment.js"></script>
   <script src="js/sheets.js"></script>
   <script src="js/board.js"></script>
   <script src="js/navigation.js"></script>
   <script src="js/ui.js"></script>
-  <script src="js/utils.js"></script>
   <script src="js/fixes.js"></script>
   <script src="js/shift-ops.js"></script>
   <script src="js/ocr.js"></script>
   <script src="js/validation.js"></script>
   <script src="search-manager.js"></script>
   <script src="js/beam.js"></script>
+  <script src="js/batch-naming.js"></script>
+  <script src="js/batch-ocr-queue.js"></script>
+  <script src="js/batch-triage.js"></script>
+  <script src="js/batch-nw-autoapply.js"></script>
+  <script src="js/batch-autoapply-review.js"></script>
+  <script src="js/batch-reconstruct-queue.js"></script>
+  <script src="js/batch-reconstruct-orchestrator.js"></script>
+  <script src="js/batch-panel-bridge.js"></script>
+  <script src="js/batch-tournament.js"></script>
+  <script src="js/batch-folder-store.js"></script>
+  <script src="js/batch-grid-robust.js"></script>
+  <script src="js/batch-zip.js"></script>
+  <script src="js/batch-export.js"></script>
+  <script src="js/verification-ui.js"></script>
+  <script src="js/batch-dashboard.js"></script>
+  <script src="js/batch-game-list.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

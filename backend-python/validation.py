@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 
 from helpers import (
     try_move, count_changes, get_semantic_changes, infer_move_squares,
-    piece_value
+    piece_value, _is_valid_move_notation
 )
 from absurdity import would_capture_be_bad, is_piece_adequately_defended, is_piece_genuinely_hanging
 from play import is_bad_trade_move, check_piece_hanging
@@ -71,6 +71,33 @@ def is_move_absurd(board: chess.Board, move: chess.Move) -> bool:
         return False
     finally:
         board.pop()
+
+
+def describe_suggested_move_warning(board: chess.Board, move: chess.Move) -> Optional[str]:
+    """
+    Run the same EAD checks we'd apply if the move were actually played, but
+    speculatively — return a human-readable warning string if the move creates
+    an absurdity, None otherwise. Used to warn users before they accept a
+    similarity-based pending_confirmation (the move wasn't pushed, so the
+    regular check_ead_after_move path never ran).
+
+    Covers: bad_trade (before push), piece hanging after push (moved piece
+    and any other piece of side_that_moved).
+    """
+    # Bad trade check (captures where we lose net material, and non-captures
+    # where the moved piece walks into a losing exchange)
+    is_bad, loss, explanation = is_bad_trade_move(board, move)
+    if is_bad and loss >= 2:
+        return f"Bad trade: {explanation}"
+
+    # Hanging check (after the move is played)
+    test_board = board.copy()
+    test_board.push(move)
+    hang = check_piece_hanging(test_board, move)
+    if hang:
+        _sq_name, _piece_val, hang_explanation = hang
+        return hang_explanation
+    return None
 
 
 def validate_moves(
@@ -149,7 +176,7 @@ def validate_moves(
         is_bad, loss, explanation = is_bad_trade_move(board, move_obj)
         board.push(move_obj)
 
-        if is_bad and loss >= 3 and not is_forced:
+        if is_bad and loss >= 2 and not is_forced:
             print(f"[EAD] Ply {ply} BAD TRADE: {explanation}")
             return True, "bad_trade", f"Bad trade: {explanation}"
 
@@ -329,6 +356,16 @@ def validate_moves(
                             break  # Alternatives sorted by confidence, no point continuing
                         try:
                             parsed = board.parse_san(alt_move)
+                            # Reject phantom notation (e.g., "Rd7+" when not check, "Qxd6" when d6 empty).
+                            # python-chess's parse_san silently accepts these; we don't.
+                            if not _is_valid_move_notation(alt_move, parsed, board):
+                                continue
+                            # Reject alts that represent a semantic change vs the primary
+                            # (piece swap, removing +/#/x). In dual-sheet mode this means the
+                            # two sheets disagree on the piece/capture — the user should confirm,
+                            # not have one sheet silently override the other.
+                            if get_semantic_changes(san, alt_move):
+                                continue
                             if is_move_absurd(board, parsed):
                                 continue
                             # Legal and not absurd — play it
@@ -381,6 +418,13 @@ def validate_moves(
                             parsed = board.parse_san(alt_move)
                             if alt_conf < OCR_ALT_MIN_CONFIDENCE:
                                 continue
+                            # Reject phantom notation (e.g., "Rd7+" when not check).
+                            if not _is_valid_move_notation(alt_move, parsed, board):
+                                continue
+                            # Reject alts that represent a semantic change vs the primary
+                            # (piece swap, removing +/#/x) — those need user confirmation.
+                            if get_semantic_changes(san, alt_move):
+                                continue
                             if is_move_absurd(board, parsed):
                                 continue
                             valid_alts.append((alt_move, alt_conf, parsed))
@@ -390,6 +434,30 @@ def validate_moves(
                     # One-or-nothing: only auto-apply if exactly ONE legal alt
                     if len(valid_alts) == 1:
                         best_alt, best_conf, best_move = valid_alts[0]
+
+                        # Two-change correction needs user confirmation, even
+                        # when reached via the OCR-alt path. Without this gate
+                        # the OCR-alt path silently applied any single legal
+                        # alt regardless of character distance, so e.g. a
+                        # Kf3 → Kg1 alt (file+rank, 2 changes) sneaked through
+                        # without surfacing as a pending confirmation. Mirror
+                        # Step 3's gating: ≥2 changes → pending_confirmation.
+                        # Semantic swaps (piece change, removed +/#/x) are
+                        # already filtered upstream by get_semantic_changes.
+                        corrected_san = board.san(best_move)
+                        num_changes = count_changes(san, corrected_san)
+                        if num_changes >= 2:
+                            absurd_warning = describe_suggested_move_warning(board, best_move)
+                            pending_confirmation = {
+                                'ply': i,
+                                'original': san,
+                                'suggested': corrected_san,
+                                'num_changes': num_changes,
+                                'semantic_reasons': [],
+                                'absurd_warning': absurd_warning,
+                            }
+                            raise ValueError(f"Needs confirmation: {san} -> {corrected_san}")
+
                         board.push(best_move)
 
                         should_stop, ead_reason, ead_info = check_ead_after_move(i, best_move, best_alt)
@@ -431,12 +499,14 @@ def validate_moves(
                     # Exception: forced K/R substitution (no rooks left) always auto-applies
                     if (not similarity_autofix or num_changes >= 2 or semantic_reasons) and \
                        not is_forced_piece_substitution(board, san, corrected_san):
+                        absurd_warning = describe_suggested_move_warning(board, move)
                         pending_confirmation = {
                             'ply': i,
                             'original': san,
                             'suggested': corrected_san,
                             'num_changes': num_changes,
                             'semantic_reasons': semantic_reasons,
+                            'absurd_warning': absurd_warning,
                         }
                         raise ValueError(f"Needs confirmation: {san} -> {corrected_san}")
                     else:
@@ -475,12 +545,14 @@ def validate_moves(
                         if not similarity_autofix and not reasons:
                             reasons = [f"similarity autofix disabled"]
                         print(f"  [CONFIRM] ply {i}: '{san}' -> '{corrected_san}' requires confirmation: {reasons}")
+                        absurd_warning = describe_suggested_move_warning(board, move)
                         pending_confirmation = {
                             'ply': i,
                             'original': san,
                             'suggested': corrected_san,
                             'num_changes': count_changes(san, corrected_san),
                             'semantic_reasons': semantic_reasons,
+                            'absurd_warning': absurd_warning,
                         }
                         raise ValueError(f"Needs confirmation: {san} -> {corrected_san}")
 

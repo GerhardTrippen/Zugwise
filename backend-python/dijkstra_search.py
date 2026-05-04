@@ -44,7 +44,7 @@ from helpers import (
     create_ocr_lookup, moves_to_ocr_moves
 )
 from absurdity import find_all_absurdities
-from fix_finding import find_deep_backtrack_fixes
+from fix_finding import find_deep_backtrack_fixes, _postprocess_phase2_fixes
 from play import play_until_absurd_or_stuck
 
 # Flag to enable/disable EAD in full game search
@@ -136,7 +136,10 @@ def run_dijkstra_search(
     lam: float = LAMBDA,
     verbose: bool = False,
     cancel_flag: Dict = None,
-    on_progress: Callable[[DijkstraProgress], None] = None
+    on_progress: Callable[[DijkstraProgress], None] = None,
+    confirmed_ply: int = 0,
+    locked_plies: Set[int] = None,
+    max_backtrack: int = 5,
 ) -> ReconstructionResult:
     """
     Dijkstra search on game reconstructions with regret-based costs.
@@ -173,6 +176,7 @@ def run_dijkstra_search(
     _tiebreaker = 0
 
     cancel_flag = cancel_flag or {"cancelled": False}
+    locked_plies = locked_plies or set()
     start_time = time.time()
 
     # Build OCR lookup if not provided
@@ -202,11 +206,15 @@ def run_dijkstra_search(
         print(f"DIJKSTRA SEARCH (λ={lam}, threshold={regret_threshold})")
         print("=" * 60)
 
-    # Check if already valid
+    # Check if already valid. Zero-tolerance for residual absurdities
+    # (mirrors frontend search-worker, see "Qe4 incident"). User-locked
+    # plies are skipped because the user has already accepted them.
     initial_reach = _get_reach(moves, total_plies)
     if initial_reach >= total_plies:
         absurdities = find_all_absurdities(moves)
-        if len(absurdities) <= 2:
+        _seed_locked = set(locked_plies) if locked_plies else set()
+        residual = [a for a in absurdities if a.ply not in _seed_locked]
+        if len(residual) == 0:
             return ReconstructionResult(
                 status="VALID", path=moves, fixes=[],
                 elapsed=time.time() - start_time, method="dijkstra"
@@ -246,18 +254,30 @@ def run_dijkstra_search(
         node = heapq.heappop(queue)
         paths_explored += 1
 
-        # Find where this path gets stuck
+        # Find where this path gets stuck. Approved-plies set: locked_plies
+        # ∪ range(confirmed_ply) so EAD skips both user-confirmed cells and
+        # every ply below the review frontier (matches validation.py's
+        # `if i < start_ply` prefix skip). Same rationale as greedy.
+        _approved = set(locked_plies) if locked_plies else set()
+        if confirmed_ply and confirmed_ply > 0:
+            _approved |= set(range(int(confirmed_ply)))
         if USE_EAD_IN_SEARCH:
             stuck_at, stop_reason, absurdity_info = play_until_absurd_or_stuck(
-                node.moves, severity_threshold=3, persistence_threshold=2
+                node.moves, severity_threshold=3, persistence_threshold=2,
+                approved_plies=_approved
             )
         else:
             stuck_at, _ = play_until_stuck(node.moves)
 
-        # Check if this path completes the game
+        # Check if this path completes the game. Zero-tolerance for residual
+        # absurdities (mirrors frontend search-worker, see "Qe4 incident").
+        # If residual absurdities remain on plies this path hasn't fixed,
+        # retarget stuck_at to the earliest one and fall through to the
+        # expansion block so this node can branch on a fix there.
         if stuck_at >= total_plies:
             absurdities = find_all_absurdities(node.moves)
-            if len(absurdities) <= 2:
+            residual = [a for a in absurdities if a.ply not in node.fixed_plies]
+            if len(residual) == 0:
                 elapsed = time.time() - start_time
                 if verbose:
                     print(f"\n✅ SOLVED: cost={node.cost:.0f}, "
@@ -274,6 +294,11 @@ def run_dijkstra_search(
                     status="SOLVED", path=node.moves, fixes=node.fixes,
                     elapsed=elapsed, method="dijkstra"
                 )
+            else:
+                stuck_at = min(a.ply for a in residual)
+                if verbose:
+                    print(f"   [{step}] [RESIDUAL] retarget stuck to "
+                          f"{ply_to_str(stuck_at)} ({len(residual)} absurdity/ies)")
 
         # Track best partial result (furthest reach)
         if stuck_at > _get_reach(best_partial.moves, total_plies):
@@ -286,12 +311,40 @@ def run_dijkstra_search(
                       f"reach={ply_to_str(stuck_at)} — max fixes reached")
             continue
 
-        # Find fixes at this stuck point
+        # Find fixes at this stuck point. Same bounded window as greedy above:
+        # anchor at stuck_at, cap lookback at max_backtrack, unlock stuck_at
+        # itself, respect user frontier when fresh. Without the cap a fresh
+        # batch call with confirmed_ply=0 would let Dijkstra explore fixes
+        # 15+ plies back from the stuck point. max_backtrack mirrors the
+        # user's Deep Search Depth setting in the UI.
+        _frontier = 0 if stuck_at < confirmed_ply else confirmed_ply
+        effective_min_ply = max(_frontier, stuck_at - max_backtrack)
+        effective_min_ply = max(0, min(effective_min_ply, stuck_at))
+        effective_locked = set(locked_plies) if locked_plies else set()
+        effective_locked.discard(stuck_at)
         fixes = find_deep_backtrack_fixes(
             node.moves, stuck_at, ocr_lookup,
-            verbose=False, fixed_plies=node.fixed_plies
+            verbose=False, fixed_plies=node.fixed_plies,
+            locked_plies=effective_locked, min_ply=effective_min_ply
         )
         fixes = [f for f in fixes if f['ply'] not in node.fixed_plies]
+        # Same verify-pass rationale as Greedy/Beam in full_game_search.py.
+        # Dijkstra branches based on a regret threshold against fixes[0]'s
+        # score; without verification, a false-positive OFC-demoted
+        # candidate would be priced as if it were a worse path than it
+        # actually is, distorting the cost ordering. verify_top_n=5 covers
+        # the candidates that typically fall inside the regret window.
+        fixes = _postprocess_phase2_fixes(
+            fixes, node.moves, stuck_at, verbose=False, verify_top_n=5
+        )
+        # Defensive: strip any fix that violates the effective frontier so
+        # a node expanded in dijkstra never branches into a locked or
+        # pre-confirmed ply, even if find_deep_backtrack_fixes's heuristic
+        # extended_search_plies reach below min_ply.
+        if effective_min_ply > 0 or effective_locked:
+            fixes = [f for f in fixes
+                     if f.get('ply', 0) >= effective_min_ply
+                     and f.get('ply', 0) not in effective_locked]
 
         if not fixes:
             if verbose:
