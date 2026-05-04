@@ -234,6 +234,30 @@ function truncateTrailingNoise(keepCount) {
     removed = state.ocrCells.length - keepCount;
     state.ocrCells.splice(keepCount);
     renumberOcrCells(state.ocrCells);
+
+    // Truncate per-sheet arrays too. In dual-sheet mode these are the
+    // source of truth for re-merge — splicing only state.ocrCells leaves
+    // the per-sheet data un-truncated, so any subsequent re-merge
+    // (Apply & Re-merge, alignment, game switch + restore) rebuilds
+    // state.ocrCells from per-sheet and the deleted cells reappear.
+    // Reported: trash button after checkmate removed 2 trailing noise
+    // plies, sidebar showed 57/57 ✓, but the moves came back
+    // repeatedly and Greedy kept proposing fixes for the resurrected
+    // plies. Mirrors the (moveNum, color)-boundary filter used in
+    // deleteMovesFromPly.
+    var truncMoveNum = Math.floor(keepCount / 2) + 1;
+    var truncIsBlack = keepCount % 2 === 1;
+    function _truncateSheet(cells) {
+      if (!cells) return cells;
+      return cells.filter(function(c) {
+        if (c.num < truncMoveNum) return true;
+        if (c.num === truncMoveNum && truncIsBlack && c.color === 'w') return true;
+        return false;
+      });
+    }
+    if (state.ocrCellsSheet1) state.ocrCellsSheet1 = _truncateSheet(state.ocrCellsSheet1);
+    if (state.ocrCellsSheet2) state.ocrCellsSheet2 = _truncateSheet(state.ocrCellsSheet2);
+
     rebuildFromOcrCells();
   } else {
     var plyCount = 0;
@@ -258,6 +282,29 @@ function truncateTrailingNoise(keepCount) {
   log('🗑️ Trimmed ' + removed + ' trailing noise move' + (removed === 1 ? '' : 's'));
   renderMoveList();
   if (typeof revalidate === 'function') revalidate();
+
+  // Refresh structural pipeline (alignment cache, noise count) — the
+  // per-cell delete-from-here path runs this; the trash-button path
+  // didn't, which left stale alignment suggestions in place.
+  if (window.SheetAlignment &&
+      typeof window.SheetAlignment.runStructuralChecks === 'function') {
+    try { window.SheetAlignment.runStructuralChecks(); } catch (e) {
+      console.warn('[shift-ops] runStructuralChecks after truncate failed:', e);
+    }
+  }
+
+  // Sync the batch-mode caches with the truncated state — without this,
+  // batchState.ocrResults[gameId] keeps the pre-truncation length (the
+  // sidebar counter and the round-export totalMoves both pull from this)
+  // and batchState.reconstructResults[gameId] keeps the stale Greedy
+  // SOLVED list with dangling plies. Mirrors the call from
+  // deleteMovesFromPly.
+  if (window.BatchGameList &&
+      typeof window.BatchGameList.syncAfterTruncation === 'function') {
+    try { window.BatchGameList.syncAfterTruncation(); } catch (e) {
+      console.warn('[Batch] syncAfterTruncation after truncate failed:', e);
+    }
+  }
 }
 
 /**

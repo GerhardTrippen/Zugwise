@@ -835,14 +835,34 @@ function initBatchHandlers() {
       if (!window.BatchExport) { log('BatchExport module not loaded'); return; }
       btnExportRound.disabled = true;
       try {
-        var out = await window.BatchExport.exportAndSaveRoundPgn(undefined, {
-          includeUnverified: true
-        });
-        if (out.count === 0) {
+        // Verified games go to the main round PGN — that's what the
+        // operator uploads to chess-results.com or similar.
+        var verifiedOut = await window.BatchExport.exportAndSaveRoundPgn(
+          undefined, { includeUnverified: false });
+
+        // Non-verified games (Greedy ran but the user hasn't reviewed,
+        // or only confirmed a prefix) go to a sibling _incomplete.pgn.
+        // Move list is truncated to the user's confirmed prefix so we
+        // never publish algorithm-staged moves as if they were valid.
+        // Result is `*` and a [Termination] tag flags the file as WIP.
+        // Reported case: B7 had Greedy proposals all the way through,
+        // none reviewed by the user, and the previous "include
+        // unverified" path shipped a PGN with repeated moves and
+        // physically impossible positions — better to mark it
+        // incomplete with zero moves than to publish nonsense.
+        var incompleteOut = await window.BatchExport.exportAndSaveRoundIncompletePgn(
+          undefined, {});
+
+        if (verifiedOut.count === 0 && incompleteOut.count === 0) {
           log('No games to export in this round yet');
-        } else {
-          log('Exported ' + out.count + ' game(s) to ' + out.filename +
-              ' (' + out.savedTo + ')');
+        }
+        if (verifiedOut.count > 0) {
+          log('Exported ' + verifiedOut.count + ' verified game(s) to ' +
+              verifiedOut.filename + ' (' + verifiedOut.savedTo + ')');
+        }
+        if (incompleteOut.count > 0) {
+          log('Exported ' + incompleteOut.count + ' incomplete game(s) to ' +
+              incompleteOut.filename + ' (' + incompleteOut.savedTo + ')');
         }
       } catch (e) {
         log('Export failed: ' + (e && e.message ? e.message : e));

@@ -22,7 +22,16 @@ var BatchExport = (function() {
 
   var PGN_SEVEN_TAG = ['Event', 'Site', 'Date', 'Round', 'White', 'Black', 'Result'];
   var PGN_OPTIONAL_TAGS = ['Board', 'Section', 'WhiteElo', 'BlackElo',
-                           'WhiteTitle', 'BlackTitle', 'ECO', 'Source'];
+                           'WhiteTitle', 'BlackTitle', 'ECO', 'Source',
+                           'Termination'];
+
+  // Termination tag value used for the incomplete-PGN export. Standard PGN
+  // (§9.8.1) defines a small set of values (abandoned, normal, time forfeit,
+  // unterminated, ...) — for our case "unterminated" is closest, but a more
+  // descriptive custom value is preferable since most readers preserve the
+  // raw string and a Zugwise-specific note tells the operator exactly why
+  // the result is `*`.
+  var TERMINATION_INCOMPLETE = 'Reconstruction incomplete (Zugwise)';
 
   // =========================================================================
   // PGN generation
@@ -33,10 +42,16 @@ var BatchExport = (function() {
    * @param {Object} game - Batch game entry (used for Result fallback + gameId)
    * @param {Array<string>} moves - Flat SAN list
    * @param {Object} headers - From BatchTournament.buildPgnHeaders (or hand-built)
+   * @param {Object} [opts]
+   * @param {string} [opts.endComment] - Inline {comment} placed before the
+   *   result token. Used by the incomplete export to mark where
+   *   reconstruction stopped, e.g. "Reconstruction stopped at ply N —
+   *   review pending" or "No moves verified".
    * @returns {string}
    */
-  function generatePgn(game, moves, headers) {
+  function generatePgn(game, moves, headers, opts) {
     headers = headers || {};
+    opts = opts || {};
     var lines = [];
 
     // Seven-tag roster in required order.
@@ -67,6 +82,10 @@ var BatchExport = (function() {
       if (safeMoves[i + 1]) moveText += ' ' + safeMoves[i + 1];
       moveText += ' ';
       if (moveNum % 5 === 0) moveText += '\n';
+    }
+    if (opts.endComment) {
+      // Strip braces from user input — PGN comments cannot contain braces.
+      moveText += '{' + String(opts.endComment).replace(/[{}]/g, '') + '} ';
     }
     moveText += headers.Result || '*';
     lines.push(moveText.trim());
@@ -158,6 +177,144 @@ var BatchExport = (function() {
     }
     var savedTo = await saveText(out.pgn, out.filename, 'application/x-chess-pgn');
     return { count: out.count, filename: out.filename, savedTo: savedTo };
+  }
+
+  // =========================================================================
+  // Incomplete-game PGN export
+  // =========================================================================
+
+  /**
+   * Export non-verified games with a known prefix into a separate
+   * `_incomplete.pgn` file. The result is `*`, a `[Termination]` tag flags
+   * the file as work-in-progress, and an end-of-line comment tells the
+   * reader where the reconstruction stopped.
+   *
+   * Move list is truncated to the user's confirmed prefix
+   * (wStatus/bStatus === 'fixed' || 'locked'). Non-confirmed plies —
+   * including everything an algorithm staged but the user never touched —
+   * are dropped: shipping algorithm-staged moves as if they were valid
+   * produces nonsense PGNs (reported case: B7 had Greedy proposals all the
+   * way through, none reviewed; the resulting PGN had repeated moves and
+   * physically impossible positions).
+   *
+   * Per-ply confirmation status only exists in state.moves for the
+   * currently-loaded game. Other games in the batch fall back to a
+   * zero-move PGN — header + Termination + `*`. That's still useful
+   * (preserves pairing metadata) and won't propagate misinformation.
+   *
+   * @param {number} [round] - Defaults to batchState.selectedRound
+   * @param {Object} [options] - {tournamentData, site}
+   * @returns {Promise<{pgn:string, filename:string, count:number}>}
+   */
+  async function exportRoundIncompletePgn(round, options) {
+    options = options || {};
+    var bgl = window.BatchGameList;
+    if (!bgl || !bgl.batchState) {
+      throw new Error('BatchGameList not available');
+    }
+    var bs = bgl.batchState;
+    round = round != null ? round : bs.selectedRound;
+    if (round == null) throw new Error('No round selected');
+
+    var tournamentData = options.tournamentData ||
+      (window._batchTournamentData || null);
+
+    // Collect non-verified games in this round that have made it past OCR.
+    // Skip games that haven't been processed at all — including a header-
+    // only entry for a game with no OCR cells is just clutter.
+    var games = [];
+    var sections = {};
+    bs.games.forEach(function(g) {
+      if (g.round !== round) return;
+      var isVerified = (g.status === 'verified' || g.status === 'exported');
+      if (isVerified) return;
+      var hasResult = !!(bs.reconstructResults && bs.reconstructResults[g.gameId] &&
+                         bs.reconstructResults[g.gameId].picked);
+      var hasOcr = (g.ocrCellCount || 0) > 0;
+      if (!hasResult && !hasOcr) return;
+      games.push(g);
+      if (g.section) sections[g.section] = true;
+    });
+    games.sort(function(a, b) {
+      if ((a.section || '') !== (b.section || '')) {
+        return (a.section || '').localeCompare(b.section || '');
+      }
+      return (a.board || 0) - (b.board || 0);
+    });
+
+    var pgns = [];
+    games.forEach(function(g) {
+      var moves = _confirmedPrefixForGame(g, bs);
+      var headers = _headersForGame(g, tournamentData, options);
+
+      // Override Result and add Termination — the reconstruction is not
+      // complete, so the standard `*` "unknown" result is correct
+      // regardless of what the pairing data said about the actual game.
+      var hdrs = {};
+      Object.keys(headers).forEach(function(k) { hdrs[k] = headers[k]; });
+      hdrs.Result = '*';
+      hdrs.Termination = TERMINATION_INCOMPLETE;
+
+      var endComment = (moves.length === 0)
+        ? 'No moves verified — algorithm output not reviewed'
+        : ('Reconstruction stopped at ply ' + moves.length + ' — review pending');
+
+      pgns.push(generatePgn(g, moves, hdrs, { endComment: endComment }));
+    });
+
+    var filename = _buildRoundFilename(round, tournamentData, Object.keys(sections));
+    filename = filename.replace(/\.pgn$/i, '_incomplete.pgn');
+    var fullPgn = pgns.join('\n');
+
+    return {
+      pgn: fullPgn,
+      filename: filename,
+      count: pgns.length,
+      sections: Object.keys(sections)
+    };
+  }
+
+  async function exportAndSaveRoundIncompletePgn(round, options) {
+    var out = await exportRoundIncompletePgn(round, options);
+    if (out.count === 0) {
+      return { count: 0, filename: out.filename, savedTo: null };
+    }
+    var savedTo = await saveText(out.pgn, out.filename, 'application/x-chess-pgn');
+    return { count: out.count, filename: out.filename, savedTo: savedTo };
+  }
+
+  /**
+   * Last-confirmed-prefix lookup. Walks state.moves for the
+   * currently-loaded game; returns the prefix of state.sans up to and
+   * including the highest ply with status 'fixed' or 'locked'. Returns
+   * [] if the game isn't currently loaded (per-ply status only lives in
+   * state.moves) or no plies have been confirmed.
+   */
+  function _confirmedPrefixForGame(game, bs) {
+    if (!game || game.gameId !== bs.currentGameId) return [];
+    if (typeof state === 'undefined' || !Array.isArray(state.moves)) return [];
+
+    var lastConfirmedPly = -1;
+    var ply = 0;
+    state.moves.forEach(function(m) {
+      if (m.white) {
+        if (m.wStatus === 'fixed' || m.wStatus === 'locked') {
+          lastConfirmedPly = ply;
+        }
+        ply++;
+      }
+      if (m.black) {
+        if (m.bStatus === 'fixed' || m.bStatus === 'locked') {
+          lastConfirmedPly = ply;
+        }
+        ply++;
+      }
+    });
+
+    if (lastConfirmedPly < 0) return [];
+    return Array.isArray(state.sans)
+      ? state.sans.slice(0, lastConfirmedPly + 1)
+      : [];
   }
 
   // =========================================================================
@@ -447,6 +604,8 @@ var BatchExport = (function() {
     generatePgn: generatePgn,
     exportRoundPgn: exportRoundPgn,
     exportAndSaveRoundPgn: exportAndSaveRoundPgn,
+    exportRoundIncompletePgn: exportRoundIncompletePgn,
+    exportAndSaveRoundIncompletePgn: exportAndSaveRoundIncompletePgn,
     exportErrorReportCsv: exportErrorReportCsv,
     exportAndSaveErrorCsv: exportAndSaveErrorCsv,
     exportRoundBundle: exportRoundBundle,
