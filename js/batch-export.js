@@ -21,9 +21,16 @@ var BatchExport = (function() {
   'use strict';
 
   var PGN_SEVEN_TAG = ['Event', 'Site', 'Date', 'Round', 'White', 'Black', 'Result'];
-  var PGN_OPTIONAL_TAGS = ['Board', 'Section', 'WhiteElo', 'BlackElo',
-                           'WhiteTitle', 'BlackTitle', 'ECO', 'Source',
-                           'Termination'];
+  // Note: no 'Board' tag — board number is embedded in the compound Round
+  // ("R.B" form, PGN §9.5). Order roughly mirrors the ChessBase convention:
+  // Section, ratings/IDs/titles, ECO, PlyCount, then Event* metadata.
+  var PGN_OPTIONAL_TAGS = ['Section',
+                           'WhiteElo', 'BlackElo',
+                           'WhiteTitle', 'BlackTitle',
+                           'WhiteCfcId', 'BlackCfcId',
+                           'ECO', 'PlyCount',
+                           'EventDate', 'EventType', 'EventRounds', 'EventCountry',
+                           'Source', 'Termination'];
 
   // Termination tag value used for the incomplete-PGN export. Standard PGN
   // (§9.8.1) defines a small set of values (abandoned, normal, time forfeit,
@@ -52,29 +59,46 @@ var BatchExport = (function() {
   function generatePgn(game, moves, headers, opts) {
     headers = headers || {};
     opts = opts || {};
+    var safeMoves = Array.isArray(moves) ? moves : [];
+
+    // Final guard for EVERY export path (round / incomplete / combined /
+    // single-game / verified): a Zugwise PGN must never contain an illegal
+    // move. Idempotent and a no-op on a genuinely legal game; only an
+    // actually-illegal continuation gets trimmed. Callers that show a
+    // "stopped at ply N" comment truncate first so their N stays accurate —
+    // this is belt-and-suspenders for the verified path that doesn't.
+    safeMoves = _truncateToLegalPrefix(safeMoves);
+
+    // Local copy so we can inject computed tags (PlyCount) without mutating
+    // the caller's headers object.
+    var hdrs = {};
+    Object.keys(headers).forEach(function(k) { hdrs[k] = headers[k]; });
+    if (!hdrs.PlyCount && safeMoves.length > 0) {
+      hdrs.PlyCount = String(safeMoves.length);
+    }
+
     var lines = [];
 
     // Seven-tag roster in required order.
     PGN_SEVEN_TAG.forEach(function(tag) {
-      lines.push('[' + tag + ' "' + _escapeHeader(headers[tag] || '?') + '"]');
+      lines.push('[' + tag + ' "' + _escapeHeader(hdrs[tag] || '?') + '"]');
     });
 
     // Optional tags (only if present).
     PGN_OPTIONAL_TAGS.forEach(function(tag) {
-      if (headers[tag]) {
-        lines.push('[' + tag + ' "' + _escapeHeader(headers[tag]) + '"]');
+      if (hdrs[tag]) {
+        lines.push('[' + tag + ' "' + _escapeHeader(hdrs[tag]) + '"]');
       }
     });
 
     // Always include Source if not already added above.
-    if (!headers.Source) {
+    if (!hdrs.Source) {
       lines.push('[Source "Zugwise (gerhardtrippen.github.io/zugwise)"]');
     }
 
     lines.push('');
 
     // Move text — 5 full moves per line.
-    var safeMoves = Array.isArray(moves) ? moves : [];
     var moveText = '';
     for (var i = 0; i < safeMoves.length; i += 2) {
       var moveNum = Math.floor(i / 2) + 1;
@@ -87,7 +111,7 @@ var BatchExport = (function() {
       // Strip braces from user input — PGN comments cannot contain braces.
       moveText += '{' + String(opts.endComment).replace(/[{}]/g, '') + '} ';
     }
-    moveText += headers.Result || '*';
+    moveText += hdrs.Result || '*';
     lines.push(moveText.trim());
 
     return lines.join('\n') + '\n';
@@ -95,6 +119,52 @@ var BatchExport = (function() {
 
   function _escapeHeader(v) {
     return String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  }
+
+  /**
+   * Truncate a SAN list at the first move that cannot legally be played from
+   * the initial position. The confirmed-prefix builders slice state.sans to
+   * stuckPly, but when there's no stuck point they fall back to the FULL sans
+   * length — and a polluted tail (post-stuck moves the validator accepted in a
+   * stale line, or unreviewed algorithm output that leaked into sans) then
+   * ships verbatim. That produced PGNs with genuinely illegal continuations,
+   * e.g. B3 "...39.Qxf5+ d3 40.f4 O-O" where O-O is illegal 40 moves in, plus
+   * a wrong "stopped at ply 84" comment.
+   *
+   * chess.js is the same engine the board / navigation already replays
+   * state.sans through, so a legitimately reconstructed game passes untouched.
+   * `sloppy:true` matches the known SAN-leniency gap (chess.js v0.12.0 strict
+   * mode rejects some legal-but-lenient SANs python-chess accepts) so we don't
+   * truncate a good game on notation alone — only genuinely illegal moves cut.
+   * If chess.js isn't loaded, return the input unchanged (conservative).
+   */
+  function _truncateToLegalPrefix(sans) {
+    if (!Array.isArray(sans) || sans.length === 0) return sans || [];
+    if (typeof Chess === 'undefined') return sans;
+    var chess;
+    try { chess = new Chess(); } catch (e) { return sans; }
+    // Re-emit chess.js's canonical SAN for each legal move so the exported
+    // PGN always carries the check '+'/'#' and capture 'x' marks even when the
+    // stored/locked SAN dropped them — e.g. a "Keep as-is" lock of OCR "Nd4"
+    // for the canonical "Nd4+", or "Ra8" for "Rxa8+". Same move, canonical
+    // notation (chess.js parsed exactly this move). Length matches the legal
+    // prefix, so truncation semantics are unchanged.
+    var canonical = [];
+    for (var i = 0; i < sans.length; i++) {
+      var mv = null;
+      try { mv = chess.move(sans[i], { sloppy: true }); } catch (e) { mv = null; }
+      if (!mv) {
+        if (typeof console !== 'undefined') {
+          console.warn('[BatchExport] Truncating PGN at ply ' + i +
+                       ' — "' + sans[i] + '" is not legal from the running ' +
+                       'position; dropped ' + (sans.length - i) +
+                       ' trailing ply(s) to avoid an illegal export.');
+        }
+        return canonical;
+      }
+      canonical.push((mv && mv.san) ? mv.san : sans[i]);
+    }
+    return canonical;
   }
 
   // =========================================================================
@@ -184,23 +254,18 @@ var BatchExport = (function() {
   // =========================================================================
 
   /**
-   * Export non-verified games with a known prefix into a separate
-   * `_incomplete.pgn` file. The result is `*`, a `[Termination]` tag flags
-   * the file as work-in-progress, and an end-of-line comment tells the
-   * reader where the reconstruction stopped.
+   * Export ALL non-verified games in the round into a `_incomplete.pgn` file.
+   * The result is `*`, a `[Termination]` tag flags the file as WIP, and an
+   * end-of-line comment tells the reader where reconstruction stopped.
    *
-   * Move list is truncated to the user's confirmed prefix
-   * (wStatus/bStatus === 'fixed' || 'locked'). Non-confirmed plies —
-   * including everything an algorithm staged but the user never touched —
-   * are dropped: shipping algorithm-staged moves as if they were valid
-   * produces nonsense PGNs (reported case: B7 had Greedy proposals all the
-   * way through, none reviewed; the resulting PGN had repeated moves and
-   * physically impossible positions).
+   * Games with confirmed moves: move list truncated to the user's confirmed
+   * prefix (wStatus/bStatus === 'fixed' || 'locked'). Algorithm-staged but
+   * unreviewed plies are dropped — shipping those produced nonsense PGNs
+   * (repeated moves, impossible positions; see B7 incident).
    *
-   * Per-ply confirmation status only exists in state.moves for the
-   * currently-loaded game. Other games in the batch fall back to a
-   * zero-move PGN — header + Termination + `*`. That's still useful
-   * (preserves pairing metadata) and won't propagate misinformation.
+   * Games not yet loaded / processed: zero-move PGN — headers + Termination
+   * + `{No moves verified} *`. The pairing metadata is already present so
+   * the operator can fill in moves manually without starting from scratch.
    *
    * @param {number} [round] - Defaults to batchState.selectedRound
    * @param {Object} [options] - {tournamentData, site}
@@ -219,19 +284,16 @@ var BatchExport = (function() {
     var tournamentData = options.tournamentData ||
       (window._batchTournamentData || null);
 
-    // Collect non-verified games in this round that have made it past OCR.
-    // Skip games that haven't been processed at all — including a header-
-    // only entry for a game with no OCR cells is just clutter.
+    // Collect ALL non-verified games in this round. Header-only entries for
+    // untouched games are intentional — the pairing metadata (names, ratings,
+    // round, result) is already there so the operator can fill in moves
+    // manually, rather than reconstructing from scratch.
     var games = [];
     var sections = {};
     bs.games.forEach(function(g) {
       if (g.round !== round) return;
       var isVerified = (g.status === 'verified' || g.status === 'exported');
       if (isVerified) return;
-      var hasResult = !!(bs.reconstructResults && bs.reconstructResults[g.gameId] &&
-                         bs.reconstructResults[g.gameId].picked);
-      var hasOcr = (g.ocrCellCount || 0) > 0;
-      if (!hasResult && !hasOcr) return;
       games.push(g);
       if (g.section) sections[g.section] = true;
     });
@@ -247,12 +309,13 @@ var BatchExport = (function() {
       var moves = _confirmedPrefixForGame(g, bs);
       var headers = _headersForGame(g, tournamentData, options);
 
-      // Override Result and add Termination — the reconstruction is not
-      // complete, so the standard `*` "unknown" result is correct
-      // regardless of what the pairing data said about the actual game.
+      // Add Termination to flag reconstruction as incomplete.
+      // Keep the pairing result in Result — the TD recorded 1-0/0-1/½-½
+      // regardless of whether we've reconstructed the moves yet. Only fall
+      // back to '*' when no result is known (e.g. no tournament file loaded).
       var hdrs = {};
       Object.keys(headers).forEach(function(k) { hdrs[k] = headers[k]; });
-      hdrs.Result = '*';
+      if (!hdrs.Result || hdrs.Result === '?') hdrs.Result = '*';
       hdrs.Termination = TERMINATION_INCOMPLETE;
 
       var endComment = (moves.length === 0)
@@ -291,30 +354,115 @@ var BatchExport = (function() {
    * state.moves) or no plies have been confirmed.
    */
   function _confirmedPrefixForGame(game, bs) {
-    if (!game || game.gameId !== bs.currentGameId) return [];
-    if (typeof state === 'undefined' || !Array.isArray(state.moves)) return [];
+    var sans, stuckPly;
 
-    var lastConfirmedPly = -1;
-    var ply = 0;
-    state.moves.forEach(function(m) {
-      if (m.white) {
-        if (m.wStatus === 'fixed' || m.wStatus === 'locked') {
-          lastConfirmedPly = ply;
-        }
-        ply++;
+    if (game && game.gameId === bs.currentGameId) {
+      // Currently loaded game — read live state.
+      if (typeof state === 'undefined' || !state) return [];
+      sans = Array.isArray(state.sans) ? state.sans : [];
+      stuckPly = (state.stuckPly != null) ? state.stuckPly : sans.length;
+    } else {
+      // Non-current game — read from workingState saved on game-switch.
+      var ws = game && game.workingState;
+      if (!ws || !Array.isArray(ws.sans) || ws.sans.length === 0) return [];
+      sans = ws.sans;
+      stuckPly = (ws.stuckPly != null) ? ws.stuckPly : sans.length;
+    }
+
+    // Legality net: when stuckPly is null the slice is the full sans, which can
+    // carry a polluted post-stuck tail. Never ship an illegal continuation.
+    return _truncateToLegalPrefix(sans.slice(0, stuckPly));
+  }
+
+  // =========================================================================
+  // Combined round export (single file: verified + incomplete)
+  // =========================================================================
+
+  /**
+   * Export ALL games in a round into one PGN file.
+   * Verified games appear first with their actual result.
+   * Non-verified games follow with result=* and a [Termination] tag;
+   * their move list is the confirmed prefix (stuckPly cutoff).
+   *
+   * @param {number} [round] - Defaults to batchState.selectedRound
+   * @param {Object} [options] - {tournamentData, site}
+   * @returns {Promise<{pgn, filename, count, verifiedCount, incompleteCount, sections}>}
+   */
+  async function exportRoundCombinedPgn(round, options) {
+    options = options || {};
+    var bgl = window.BatchGameList;
+    if (!bgl || !bgl.batchState) throw new Error('BatchGameList not available');
+    var bs = bgl.batchState;
+    round = round != null ? round : bs.selectedRound;
+    if (round == null) throw new Error('No round selected');
+
+    var tournamentData = options.tournamentData || (window._batchTournamentData || null);
+
+    var games = [];
+    var sections = {};
+    bs.games.forEach(function(g) {
+      if (g.round !== round) return;
+      games.push(g);
+      if (g.section) sections[g.section] = true;
+    });
+    games.sort(function(a, b) {
+      if ((a.section || '') !== (b.section || '')) {
+        return (a.section || '').localeCompare(b.section || '');
       }
-      if (m.black) {
-        if (m.bStatus === 'fixed' || m.bStatus === 'locked') {
-          lastConfirmedPly = ply;
-        }
-        ply++;
+      return (a.board || 0) - (b.board || 0);
+    });
+
+    var pgns = [];
+    var verifiedCount = 0;
+    var incompleteCount = 0;
+
+    games.forEach(function(g) {
+      var isVerified = (g.status === 'verified' || g.status === 'exported');
+      var headers = _headersForGame(g, tournamentData, options);
+
+      if (isVerified) {
+        var moves = _movesForGame(g, bs);
+        pgns.push(generatePgn(g, moves, headers));
+        verifiedCount++;
+      } else {
+        var confirmedMoves = _confirmedPrefixForGame(g, bs);
+        var hdrs = {};
+        Object.keys(headers).forEach(function(k) { hdrs[k] = headers[k]; });
+        if (!hdrs.Result || hdrs.Result === '?') hdrs.Result = '*';
+        hdrs.Termination = TERMINATION_INCOMPLETE;
+        var endComment = (confirmedMoves.length === 0)
+          ? 'No moves verified — algorithm output not reviewed'
+          : 'Reconstruction stopped at ply ' + confirmedMoves.length + ' — review pending';
+        pgns.push(generatePgn(g, confirmedMoves, hdrs, { endComment: endComment }));
+        incompleteCount++;
       }
     });
 
-    if (lastConfirmedPly < 0) return [];
-    return Array.isArray(state.sans)
-      ? state.sans.slice(0, lastConfirmedPly + 1)
-      : [];
+    var filename = _buildRoundFilename(round, tournamentData, Object.keys(sections));
+    return {
+      pgn: pgns.join('\n'),
+      filename: filename,
+      count: pgns.length,
+      verifiedCount: verifiedCount,
+      incompleteCount: incompleteCount,
+      sections: Object.keys(sections)
+    };
+  }
+
+  async function exportAndSaveRoundCombinedPgn(round, options) {
+    var out = await exportRoundCombinedPgn(round, options);
+    if (out.count === 0) {
+      return { count: 0, filename: out.filename, savedTo: null,
+               verifiedCount: 0, incompleteCount: 0 };
+    }
+    var savedTo = await saveText(out.pgn, out.filename, 'application/x-chess-pgn');
+    return {
+      count: out.count,
+      filename: out.filename,
+      savedTo: savedTo,
+      verifiedCount: out.verifiedCount,
+      incompleteCount: out.incompleteCount
+    };
   }
 
   // =========================================================================
@@ -512,7 +660,11 @@ var BatchExport = (function() {
 
     if (folder) {
       try {
-        var fh = await folder.getFileHandle(filename, { create: true });
+        // Route into Zugwise/PGN (BatchPaths); fall back to the base folder.
+        var dir = window.BatchPaths
+          ? (await window.BatchPaths.resolveDir(folder, filename, true)) || folder
+          : folder;
+        var fh = await dir.getFileHandle(filename, { create: true });
         var w = await fh.createWritable();
         await w.write(content);
         await w.close();
@@ -542,17 +694,32 @@ var BatchExport = (function() {
   // =========================================================================
 
   function _movesForGame(game, bs) {
-    // Prefer the picked reconstruction result (the algorithm output the user
-    // reviewed). If none, fall back to whatever live state the current-loaded
-    // game has — covers the single-game case where the user finalized via
-    // the interactive UI rather than via verification.
+    // The user-confirmed move list is authoritative — NOT the raw algorithm
+    // `picked` output. `picked.result.moves` is the algorithm's *proposal*; it
+    // is never rewritten when the user overrides a fix during verification
+    // (e.g. Greedy proposed Qxe7+, the user chose Qf7#). Reading picked here
+    // shipped the algorithm's suggestion in the round PGN even though the
+    // movelist and the single-game .pgn both correctly showed the user's
+    // choice — the "no silent apply" invariant: only user-confirmed fixes
+    // survive into an export.
+    //
+    // Source priority mirrors the single-game export (_buildBatchPgn):
+    //   1. Currently-loaded game  → live state.sans (what the movelist/board show)
+    //   2. Non-current game       → workingState.sans (snapshotted on switch)
+    //   3. Neither (game never opened in verification, e.g. an auto-solved
+    //      game pulled in via includeUnverified) → fall back to picked.
+    if (game.gameId === bs.currentGameId &&
+        typeof state !== 'undefined' && Array.isArray(state.sans) &&
+        state.sans.length > 0) {
+      return state.sans.slice();
+    }
+    if (game.workingState && Array.isArray(game.workingState.sans) &&
+        game.workingState.sans.length > 0) {
+      return game.workingState.sans.slice();
+    }
     var rec = bs.reconstructResults && bs.reconstructResults[game.gameId];
     if (rec && rec.picked && rec.picked.result && rec.picked.result.moves) {
       return rec.picked.result.moves.slice();
-    }
-    if (game.gameId === bs.currentGameId &&
-        typeof state !== 'undefined' && Array.isArray(state.sans)) {
-      return state.sans.slice();
     }
     return [];
   }
@@ -567,21 +734,35 @@ var BatchExport = (function() {
 
     // Minimal inline fallback — no tournament module available.
     var p = game.pairing || null;
+    var roundStr;
+    if (game.round != null && game.board != null) {
+      roundStr = game.round + '.' + game.board;
+    } else if (game.round != null) {
+      roundStr = String(game.round);
+    } else if (game.board != null) {
+      roundStr = '?.' + game.board;
+    } else {
+      roundStr = '?';
+    }
     var h = {
       Event: (tournamentData && tournamentData.event) || 'Tournament',
       Site: options.site || (tournamentData && tournamentData.site) || '?',
-      Date: (p && p.date) ||
+      Date: (p && p.date) || (tournamentData && tournamentData.startDate) ||
             new Date().toISOString().slice(0, 10).replace(/-/g, '.'),
-      Round: game.round != null ? String(game.round) : '?',
+      Round: roundStr,
       White: (p && p.whiteName) || '?',
       Black: (p && p.blackName) || '?',
       Result: (p && p.result) || '*',
       Source: 'Zugwise (gerhardtrippen.github.io/zugwise)'
     };
-    if (game.board != null) h.Board = String(game.board);
     if (game.section) h.Section = game.section;
     if (p && p.whiteRtg) h.WhiteElo = String(p.whiteRtg);
     if (p && p.blackRtg) h.BlackElo = String(p.blackRtg);
+    if (tournamentData) {
+      if (tournamentData.startDate) h.EventDate = tournamentData.startDate;
+      if (tournamentData.country) h.EventCountry = tournamentData.country;
+      h.EventType = 'tourn';
+    }
     return h;
   }
 
@@ -602,10 +783,13 @@ var BatchExport = (function() {
 
   return {
     generatePgn: generatePgn,
+    truncateToLegalPrefix: _truncateToLegalPrefix,
     exportRoundPgn: exportRoundPgn,
     exportAndSaveRoundPgn: exportAndSaveRoundPgn,
     exportRoundIncompletePgn: exportRoundIncompletePgn,
     exportAndSaveRoundIncompletePgn: exportAndSaveRoundIncompletePgn,
+    exportRoundCombinedPgn: exportRoundCombinedPgn,
+    exportAndSaveRoundCombinedPgn: exportAndSaveRoundCombinedPgn,
     exportErrorReportCsv: exportErrorReportCsv,
     exportAndSaveErrorCsv: exportAndSaveErrorCsv,
     exportRoundBundle: exportRoundBundle,

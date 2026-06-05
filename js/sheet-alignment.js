@@ -29,6 +29,10 @@
   // pool overlap against the post-edit state.
   var _previewAfterS1 = null;
   var _previewAfterS2 = null;
+  // Per-render handoff to the AFTER scan panel: which sheet got modified and
+  // which (num, color) cells are placeholder inserts (rendered as "ins" tag
+  // in the scan column to mirror the green-tint in the printed AFTER grid).
+  var _previewAfterMeta = null;
   // Stashed suggestion for the active banner (drives same-sheet duplicate
   // edges in the BEFORE table for delete_duplicate cases).
   var _currentSuggestion = null;
@@ -159,12 +163,22 @@
   var SMOKING_GUN_W = 0.6;  // pool-overlap threshold for white half
   var SMOKING_GUN_B = 0.3;  // pool-overlap threshold for black half (noisier)
 
+  // Structured-overlap thresholds for the B-half fuzzy fallback. Both must
+  // be met for the fallback to fire. 1.6 out of 2.0 max = 80% agreement on
+  // piece-letter AND target-file: catches "Rxf6/Rxf2/Rxf5 vs Rxf7/Rxf1"
+  // (same piece, same file, different rank — typical when the player wrote
+  // the same partial move twice and the OCR pulled different rank guesses)
+  // without firing on legit different-piece or different-file sequences.
+  var SMOKING_GUN_STRUCT_PIECE = 1.6;
+  var SMOKING_GUN_STRUCT_FILE = 1.6;
+
   function findSmokingGuns(cells, sheetTag) {
     var hits = [];
     if (!cells || cells.length < 4) return hits;
 
     var byPly = _indexByPly(cells);
     var maxPly = Math.max.apply(null, Object.keys(byPly).map(Number));
+    var structFn = window.SheetNWAlignment && window.SheetNWAlignment.poolOverlapStructured;
 
     for (var ply = 0; ply + 3 <= maxPly; ply += 2) {
       var w1 = byPly[ply];
@@ -173,35 +187,71 @@
       var b2 = byPly[ply + 3];
       if (!w1 || !b1 || !w2 || !b2) continue;
 
-      // STRICT: top-1 normalized SAN must match on BOTH halves. This is the
-      // primary signal — same handwriting two rows in a row → same OCR top-1.
+      // W-half: top-1 normalized SAN must match EXACTLY. This is the
+      // necessary condition — same handwriting two rows in a row → same
+      // OCR top-1 on the white half. No relaxation here; W exact-match is
+      // the gate that prevents false positives on look-alike but distinct
+      // move sequences.
       var w1Top = _norm(w1.move);
       var w2Top = _norm(w2.move);
       var b1Top = _norm(b1.move);
       var b2Top = _norm(b2.move);
       if (!w1Top || !w2Top || !b1Top || !b2Top) continue;
-      if (w1Top !== w2Top || b1Top !== b2Top) continue;
+      if (w1Top !== w2Top) continue;
 
-      // Pool overlap as supplementary evidence — confirms both rows have
-      // the same OCR confidence pattern, not just the same top pick by
-      // chance. Lower thresholds since top-1 match is the gating signal.
+      // B-half: prefer exact match, but accept high STRUCTURED overlap on
+      // piece + file as a fallback. Real near-duplicates often have the
+      // OCR returning different rank guesses (Rxf6 vs Rxf7) when the
+      // handwriting was unclear; the piece letter + target file stay
+      // consistent because that's what was actually written.
+      var bMatchType = 'exact';
+      var bStruct = null;
+      if (b1Top !== b2Top) {
+        if (!structFn) continue;
+        bStruct = structFn(b1.alternatives, b2.alternatives);
+        if (!bStruct ||
+            bStruct.pieceScore < SMOKING_GUN_STRUCT_PIECE ||
+            bStruct.fileScore  < SMOKING_GUN_STRUCT_FILE) {
+          continue;
+        }
+        bMatchType = 'structured';
+      }
+
+      // Pool overlap on W as supplementary evidence. For the B half: in
+      // the exact-match path, require pool overlap >= SMOKING_GUN_B; in
+      // the structured-match path the structured score IS the evidence,
+      // so we don't double-gate.
       if (!w1.alternatives || !w2.alternatives) continue;
       var ow = poolOverlap(w1.alternatives, w2.alternatives);
       var ob = poolOverlap(b1.alternatives, b2.alternatives);
-      if (ow.score < SMOKING_GUN_W || ob.score < SMOKING_GUN_B) continue;
+      if (ow.score < SMOKING_GUN_W) continue;
+      if (bMatchType === 'exact' && ob.score < SMOKING_GUN_B) continue;
 
       var moveNum = Math.floor(ply / 2) + 1;
-      hits.push({
-        sheet: sheetTag,
-        moveNumDuplicated: moveNum,
-        moveNumRedundant: moveNum + 1,
-        score: ow.score + ob.score,
-        evidence:
+      var evidence;
+      if (bMatchType === 'exact') {
+        evidence =
           'Sheet ' + (sheetTag === 'w' ? "(White's)" : "(Black's)") +
           ' move ' + moveNum + ' (' + (w1.move || '?') + ' / ' + (b1.move || '?') + ')' +
           ' = move ' + (moveNum + 1) + ' (' + (w2.move || '?') + ' / ' + (b2.move || '?') + ')' +
           '; identical top-1 OCR on both halves; pool overlap ' +
-          (ow.score + ob.score).toFixed(2)
+          (ow.score + ob.score).toFixed(2);
+      } else {
+        evidence =
+          'Sheet ' + (sheetTag === 'w' ? "(White's)" : "(Black's)") +
+          ' move ' + moveNum + ' (' + (w1.move || '?') + ' / ' + (b1.move || '?') + ')' +
+          ' ≈ move ' + (moveNum + 1) + ' (' + (w2.move || '?') + ' / ' + (b2.move || '?') + ')' +
+          '; W half identical, B half structured match (piece ' +
+          bStruct.pieceScore.toFixed(2) + ', file ' + bStruct.fileScore.toFixed(2) +
+          '); player likely wrote the same move twice with rank illegible';
+      }
+      hits.push({
+        sheet: sheetTag,
+        moveNumDuplicated: moveNum,
+        moveNumRedundant: moveNum + 1,
+        score: ow.score + (bMatchType === 'exact' ? ob.score : bStruct.combinedScore),
+        bMatchType: bMatchType,
+        evidence: evidence
       });
     }
     return hits;
@@ -714,6 +764,7 @@
     if (el) el.remove();
     _previewAfterS1 = null;
     _previewAfterS2 = null;
+    _previewAfterMeta = null;
     _currentSuggestion = null;
     if (_overlayResizeObserver) {
       try { _overlayResizeObserver.disconnect(); } catch (e) {}
@@ -755,6 +806,25 @@
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  // Shared colgroup for the BEFORE and AFTER printed evidence tables. Locks
+  // column widths so the two tables align column-for-column regardless of
+  // per-row content differences (auto-layout otherwise sizes each table
+  // independently and a longer SAN in one table — e.g., "dxe3" vs "Be1" —
+  // pushes that column wider on one side only).
+  // Six columns: [#, S1.W, S1.B, ·, S2.W, S2.B]. Percentages drive width
+  // off the parent flex slot, so both tables in matching flex-1 slots get
+  // identical column pixel widths.
+  var _EVIDENCE_TABLE_COLGROUP =
+    '<colgroup>' +
+      '<col style="width:7%">' +
+      '<col style="width:23%">' +
+      '<col style="width:23%">' +
+      '<col style="width:2%">' +
+      '<col style="width:23%">' +
+      '<col style="width:22%">' +
+    '</colgroup>';
+  var _EVIDENCE_TABLE_STYLE = 'table-layout:fixed;';
+
   function _renderEvidenceGrid(top) {
     if (!state.ocrCellsSheet1 || !state.ocrCellsSheet2) return '';
     if (typeof top.atMoveNum !== 'number') return '';
@@ -779,6 +849,12 @@
     var deletedSet = top.deletedPlySet || null;
     var killCls = ' bg-red-900/40 text-red-200 line-through';
     var hilightCls = ' bg-orange-900/40 text-orange-100';
+    // Force a uniform row height in top-1 mode so each row aligns 1:1 with
+    // the side-by-side scan panel (also _SCAN_ROW_HEIGHT_PX tall). Top-5
+    // mode stacks five SAN lines per cell and needs the natural larger
+    // row height — leave that branch alone.
+    var rowStyle = _isAllAltsEnabled() ? '' :
+                   ' style="height:' + _SCAN_ROW_HEIGHT_PX + 'px;"';
 
     var rows = [];
     for (var n = lo; n <= hi; n++) {
@@ -810,7 +886,7 @@
       }
 
       rows.push(
-        '<tr>' +
+        '<tr' + rowStyle + '>' +
           '<td class="text-gray-500 pr-2 text-right">' + n + '.</td>' +
           '<td data-c-row="' + n + '" data-c-side="s1" data-c-color="w" class="px-1' + s1Cls + '">' + (w1 || '<span class="text-gray-600">—</span>') + '</td>' +
           '<td data-c-row="' + n + '" data-c-side="s1" data-c-color="b" class="px-1' + s1bCls + '">' + (b1 || '<span class="text-gray-600">—</span>') + markerW + '</td>' +
@@ -842,7 +918,8 @@
     return (
       '<div class="alignment-evidence-wrap mt-2 mb-1 text-[11px] font-mono relative isolate" data-evidence="before">' +
         beforeLabel +
-        '<table class="w-full" id="alignment-evidence-table">' +
+        '<table class="w-full" id="alignment-evidence-table" style="' + _EVIDENCE_TABLE_STYLE + '">' +
+          _EVIDENCE_TABLE_COLGROUP +
           '<thead class="text-gray-400">' +
             '<tr>' +
               '<th></th>' +
@@ -1060,6 +1137,225 @@
     }).join('');
   }
 
+  // Side-by-side scanned-cell preview panel. Shows the same row range as the
+  // BEFORE / AFTER evidence grids, but rendered as cropped scan thumbnails so
+  // the user can verify the OCR's read against the actual handwriting. The
+  // user asked: "in the banner I only see the printed moves and the graph!"
+  // — this closes that gap. Gated to top-1 mode only (top-5 already crowds
+  // the cell text; thumbnails alongside would overflow horizontally).
+  //
+  // Row heights are kept in lockstep with the printed grid so each row of
+  // scans visually corresponds to the same row in the table on the left.
+  // The shared row-height variable is also driven by the image height so
+  // toggling sizes from one place is easy.
+  var _SCAN_ROW_HEIGHT_PX = 22;
+  var _SCAN_IMG_HEIGHT_PX = 18;
+
+  // mode = 'before' (default, uses state.ocrCellsSheet1/2; uses deletedPlySet
+  // for delete highlights) OR 'after' (uses _previewAfterS1/2 if available;
+  // uses newCellKeys for insert-placeholder highlights).
+  function _renderScannedImagesPanel(top, mode) {
+    if (_isAllAltsEnabled()) return '';     // top-5 mode → omit
+
+    var isAfter = mode === 'after';
+    var cells1 = isAfter ? _previewAfterS1 : state.ocrCellsSheet1;
+    var cells2 = isAfter ? _previewAfterS2 : state.ocrCellsSheet2;
+    if (!cells1 || !cells2) return '';
+    if (typeof top.atMoveNum !== 'number') return '';
+
+    var center = top.atMoveNum;
+    var lo, hi;
+    if (isAfter) {
+      // _renderPostApplyEvidence centers on actionPly and spans
+      // (center-2)..(center+3). Mirror that so AFTER rows align with the
+      // AFTER printed grid above us in the flex row.
+      lo = Math.max(1, center - 2);
+      hi = center + 3;
+    } else {
+      lo = Math.max(1, center - EVIDENCE_RADIUS);
+      hi = center + EVIDENCE_RADIUS;
+    }
+    var maxNum1 = 0, maxNum2 = 0;
+    cells1.forEach(function(c) { if (c.num > maxNum1) maxNum1 = c.num; });
+    cells2.forEach(function(c) { if (c.num > maxNum2) maxNum2 = c.num; });
+    var maxAny = Math.max(maxNum1, maxNum2);
+    if (hi > maxAny) hi = maxAny;
+    if (lo > hi) return '';
+
+    // Are there ANY scan images in the range? Bail silently if not — happens
+    // for games loaded without scoresheet-image data, or for an AFTER preview
+    // dominated by inserted placeholders.
+    var anyImg = false;
+    for (var nc = lo; nc <= hi && !anyImg; nc++) {
+      ['w', 'b'].forEach(function(col) {
+        if (anyImg) return;
+        var c1 = _findCellAt(cells1, nc, col);
+        var c2 = _findCellAt(cells2, nc, col);
+        if ((c1 && c1.imageDataUrl) || (c2 && c2.imageDataUrl)) anyImg = true;
+      });
+    }
+    if (!anyImg) return '';
+
+    function _imgCell(cell, extraCls, isDeleted) {
+      var cls = 'px-1 align-middle' + (extraCls || '');
+      var tdStyle = ' style="height:' + _SCAN_ROW_HEIGHT_PX + 'px;line-height:' +
+                    _SCAN_ROW_HEIGHT_PX + 'px;' +
+                    (isDeleted ? 'position:relative;' : '') + '"';
+      // Diagonal strike line overlay for deletes. The red background alone
+      // can be washed out behind a mostly-white scan crop; a thin diagonal
+      // line drawn across the cell makes the deletion unmistakable.
+      var strikeOverlay = isDeleted
+        ? '<span aria-hidden="true" style="position:absolute;left:2px;right:2px;' +
+            'top:0;bottom:0;pointer-events:none;background:linear-gradient(' +
+            'to top right,transparent calc(50% - 1px),rgba(248,113,113,0.9) ' +
+            'calc(50% - 1px),rgba(248,113,113,0.9) calc(50% + 1px),' +
+            'transparent calc(50% + 1px));"></span>'
+        : '';
+      if (!cell) {
+        return '<td class="' + cls + '"' + tdStyle + '>' +
+                 '<span class="text-gray-700 text-[10px]">—</span>' +
+                 strikeOverlay +
+               '</td>';
+      }
+      if (cell._new) {
+        return '<td class="' + cls + ' bg-emerald-900/30"' + tdStyle + '>' +
+                 '<span class="text-emerald-300/80 text-[9px] italic">ins</span>' +
+                 strikeOverlay +
+               '</td>';
+      }
+      if (!cell.imageDataUrl) {
+        // No scan image, but the cell may still carry a real move — typically
+        // the user typed it into an earlier-inserted placeholder. Show that
+        // text (like the printed BEFORE/AFTER grids do) instead of blanking
+        // the row out to "—".
+        var typedMove = cell._correctedMove || cell.move;
+        if (typedMove && typedMove !== '???') {
+          var typedOpacity = isDeleted ? 'opacity:0.55;' : '';
+          return '<td class="' + cls + '"' + tdStyle + '>' +
+                   '<span class="text-sky-300/80 text-[10px] italic" ' +
+                     'style="' + typedOpacity + '" title="user-typed (no scan image)">' +
+                     _esc(typedMove) + '</span>' +
+                   strikeOverlay +
+                 '</td>';
+        }
+        return '<td class="' + cls + '"' + tdStyle + '>' +
+                 '<span class="text-gray-700 text-[10px]">—</span>' +
+                 strikeOverlay +
+               '</td>';
+      }
+      var imgOpacity = isDeleted ? 'opacity:0.55;' : '';
+      var imgStyle = 'height:' + _SCAN_IMG_HEIGHT_PX + 'px;max-width:120px;' +
+                     'display:inline-block;vertical-align:middle;' +
+                     'object-fit:contain;object-position:left center;' +
+                     'image-rendering:auto;background:rgba(255,255,255,0.06);' +
+                     'border-radius:2px;' + imgOpacity;
+      return '<td class="' + cls + '"' + tdStyle + '>' +
+               '<img src="' + cell.imageDataUrl + '" style="' + imgStyle + '" ' +
+                  'alt="' + _esc(cell.move || '') + '" ' +
+                  'title="' + _esc(cell.move || '?') +
+                  ' (' + Math.round((cell.confidence || 0) * 100) + '%)">' +
+               strikeOverlay +
+             '</td>';
+    }
+
+    var suspectSheet = top.sheet;
+    var isInsert = top.action === 'insert';
+    var deletedSet = top.deletedPlySet || null;
+    // For AFTER mode, the meta stash is set by the immediately-preceding
+    // _renderPostApplyEvidence call.
+    var afterMeta = (isAfter && _previewAfterMeta) || null;
+    var newCellKeys = afterMeta ? afterMeta.newCellKeys : null;
+    var afterModifiedSheetTag = afterMeta ? afterMeta.modifiedSheetTag : null;
+    // Stronger red wash than before — paired with the diagonal strike
+    // overlay in _imgCell, the deletion now reads at a glance even when
+    // the underlying scan crop is mostly white.
+    var killCls = ' bg-red-900/50';
+
+    var rows = [];
+    for (var n = lo; n <= hi; n++) {
+      var w1 = _findCellAt(cells1, n, 'w');
+      var b1 = _findCellAt(cells1, n, 'b');
+      var w2 = _findCellAt(cells2, n, 'w');
+      var b2 = _findCellAt(cells2, n, 'b');
+
+      var s1Cls = '', s1bCls = '', s2Cls = '', s2bCls = '';
+      var s1Del = false, s1bDel = false, s2Del = false, s2bDel = false;
+      if (isAfter && newCellKeys) {
+        // Highlight inserted placeholders (mirrors the green tint in the
+        // printed AFTER grid).
+        var newW = !!newCellKeys[n + '_w'];
+        var newB = !!newCellKeys[n + '_b'];
+        if (afterModifiedSheetTag === 's1') {
+          if (newW) s1Cls = ' bg-emerald-900/30';
+          if (newB) s1bCls = ' bg-emerald-900/30';
+        } else if (afterModifiedSheetTag === 's2') {
+          if (newW) s2Cls = ' bg-emerald-900/30';
+          if (newB) s2bCls = ' bg-emerald-900/30';
+        }
+      } else if (!isInsert && deletedSet) {
+        // BEFORE: red wash + diagonal strike on cells to be deleted
+        // (mirrors the line-through in the printed BEFORE grid).
+        if (suspectSheet === 'w') {
+          if (deletedSet[n + '_w']) { s1Cls = killCls; s1Del = true; }
+          if (deletedSet[n + '_b']) { s1bCls = killCls; s1bDel = true; }
+        } else {
+          if (deletedSet[n + '_w']) { s2Cls = killCls; s2Del = true; }
+          if (deletedSet[n + '_b']) { s2bCls = killCls; s2bDel = true; }
+        }
+      }
+
+      rows.push(
+        '<tr style="height:' + _SCAN_ROW_HEIGHT_PX + 'px;">' +
+          '<td class="text-gray-500 pr-1 text-right text-[10px] align-middle"' +
+          ' style="height:' + _SCAN_ROW_HEIGHT_PX + 'px;">' + n + '.</td>' +
+          _imgCell(w1, s1Cls, s1Del) +
+          _imgCell(b1, s1bCls, s1bDel) +
+          '<td class="px-1 text-gray-700 align-middle"' +
+          ' style="height:' + _SCAN_ROW_HEIGHT_PX + 'px;">·</td>' +
+          _imgCell(w2, s2Cls, s2Del) +
+          _imgCell(b2, s2bCls, s2bDel) +
+        '</tr>'
+      );
+    }
+
+    // Two-row header to match the printed BEFORE grid's thead height
+    // (label row + W/B sub-header). The AFTER printed table has no thead,
+    // so the AFTER scan panel skips the header rows too — matching its
+    // sibling's vertical extent.
+    var label = isAfter
+      ? '<div class="text-emerald-300/70 mb-0.5 text-xs">SCANS:</div>'
+      : '<div class="text-orange-300/70 mb-0.5 text-xs">SCANS:</div>';
+    var headerHtml = isAfter
+      ? ''
+      : '<thead class="text-gray-500 text-[10px]">' +
+          '<tr><th></th>' +
+            '<th colspan="2" class="text-left pl-1 font-normal">White\'s</th>' +
+            '<th></th>' +
+            '<th colspan="2" class="text-left pl-1 font-normal">Black\'s</th>' +
+          '</tr>' +
+          // Empty second row to match the BEFORE printed grid's W/B header
+          // line height.
+          '<tr class="text-gray-700"><th></th>' +
+            '<th class="text-left pl-1 font-normal">W</th>' +
+            '<th class="text-left pl-1 font-normal">B</th>' +
+            '<th></th>' +
+            '<th class="text-left pl-1 font-normal">W</th>' +
+            '<th class="text-left pl-1 font-normal">B</th>' +
+          '</tr>' +
+        '</thead>';
+
+    return (
+      '<div class="alignment-scan-panel ' +
+        (isAfter ? 'mt-1' : '') + ' text-[11px] font-mono">' +
+        label +
+        '<table style="border-collapse:collapse;">' +
+          headerHtml +
+          '<tbody>' + rows.join('') + '</tbody>' +
+        '</table>' +
+      '</div>'
+    );
+  }
+
   function _drawAlignmentMatchOverlay() {
     if (!window.SheetNWAlignment || !window.SheetNWAlignment.poolOverlap) return;
     var poolOverlap = window.SheetNWAlignment.poolOverlap;
@@ -1229,11 +1525,25 @@
       var sideKey = (sug.fromSheet === 's1') ? 's1' : 's2';
       var bowDirH = (sideKey === 's1') ? 'left' : 'right';
       // Two same-sheet curves: one in the W column, one in the B column.
+      // For the B column in structured-match cases (dupBScore=0 because no
+      // shared exact SANs), fall back to the structured piece+file score
+      // (dupBStructPF, max ≈ 4.0) normalized into the same 0..2 range as
+      // dupBScore so the line still draws with proportional strength.
       ['w', 'b'].forEach(function(col) {
         var topCell = wrap.querySelector('td[data-c-row="' + sug.dupPrevMoveNum + '"][data-c-side="' + sideKey + '"][data-c-color="' + col + '"]');
         var botCell = wrap.querySelector('td[data-c-row="' + sug.moveNum + '"][data-c-side="' + sideKey + '"][data-c-color="' + col + '"]');
         if (!topCell || !botCell) return;
-        var score = (col === 'w') ? sug.dupWScore : sug.dupBScore;
+        var score;
+        if (col === 'w') {
+          score = sug.dupWScore;
+        } else {
+          score = sug.dupBScore;
+          if ((typeof score !== 'number' || score <= 0) &&
+              sug.dupBMatchType === 'structured' &&
+              typeof sug.dupBStructPF === 'number' && sug.dupBStructPF > 0) {
+            score = sug.dupBStructPF / 2;  // 0..4 → 0..2 scale
+          }
+        }
         if (typeof score !== 'number' || score <= 0) return;
         var pt1 = _anchor(topCell.getBoundingClientRect());
         var pt2 = _anchor(botCell.getBoundingClientRect());
@@ -1467,9 +1777,14 @@
     var afterS2 = (modifiedSheetTag === 's2') ? modified : state.ocrCellsSheet2;
 
     // Stash so the SVG overlay can compute pool overlap on the post-apply
-    // state when drawing edges in the AFTER table.
+    // state when drawing edges in the AFTER table, and so the AFTER scan
+    // panel can find the right cells + highlight inserted placeholders.
     _previewAfterS1 = afterS1;
     _previewAfterS2 = afterS2;
+    _previewAfterMeta = {
+      modifiedSheetTag: modifiedSheetTag,
+      newCellKeys: newCellKeys
+    };
 
     // Don't run past the new sheet ends.
     var maxNumA = 0;
@@ -1477,6 +1792,10 @@
     afterS2.forEach(function(c) { if (c.num > maxNumA) maxNumA = c.num; });
     var afterHi = Math.min(hi, maxNumA);
 
+    // Force matching row height in top-1 mode so AFTER scan-panel rows
+    // align 1:1 with the printed table.
+    var afterRowStyle = _isAllAltsEnabled() ? '' :
+                        ' style="height:' + _SCAN_ROW_HEIGHT_PX + 'px;"';
     var rows = [];
     for (var n = lo; n <= afterHi; n++) {
       var w1 = _cellContentHtml(afterS1, n, 'w', 's1');
@@ -1490,7 +1809,7 @@
       var w2Cls = (newW && modifiedSheetTag === 's2') ? ' bg-emerald-900/40 text-emerald-100' : '';
       var b2Cls = (newB && modifiedSheetTag === 's2') ? ' bg-emerald-900/40 text-emerald-100' : '';
       rows.push(
-        '<tr>' +
+        '<tr' + afterRowStyle + '>' +
           '<td class="text-gray-500 pr-2 text-right">' + n + '.</td>' +
           '<td data-c-row="' + n + '" data-c-side="s1" data-c-color="w" class="px-1' + w1Cls + '">' + (w1 || '<span class="text-gray-600">—</span>') + '</td>' +
           '<td data-c-row="' + n + '" data-c-side="s1" data-c-color="b" class="px-1' + b1Cls + '">' + (b1 || '<span class="text-gray-600">—</span>') + '</td>' +
@@ -1504,7 +1823,8 @@
     return (
       '<div class="alignment-evidence-wrap mt-1 text-[11px] font-mono relative isolate" data-evidence="after">' +
         '<div class="text-emerald-300 mb-0.5 text-xs">→ AFTER apply:</div>' +
-        '<table class="w-full">' +
+        '<table class="w-full" style="' + _EVIDENCE_TABLE_STYLE + '">' +
+          _EVIDENCE_TABLE_COLGROUP +
           '<tbody class="text-gray-200">' + rows.join('') + '</tbody>' +
         '</table>' +
         '<svg class="alignment-match-overlay absolute inset-0 pointer-events-none" style="overflow:visible; z-index:-1"></svg>' +
@@ -2011,6 +2331,14 @@
   // ---------------------------------------------------------------------------
 
   function _runNWAlignmentCheck() {
+    // Gate: batch game-load in progress. _selectGameInner sets this flag
+    // before processAllSheets so runStructuralChecks (fired from inside
+    // mergePlayerMoves) cannot surface a banner before showOcrResults has
+    // had a chance to set pendingNoiseReview=true for noisy games.
+    if (state._suppressAlignmentBanners) {
+      clearAlignmentBanner();
+      return;
+    }
     // Gate on noise just like the old pipeline did.
     if (state.pendingNoiseReview) {
       clearAlignmentBanner();
@@ -2023,52 +2351,264 @@
         return;
       }
     }
+    // Additional gate: the merged-moves noise detectors (the same three
+    // that drive the noise-review panel — suspicious tail / repeating tail /
+    // low-confidence pair). The per-sheet trim-noise check above catches
+    // exact "X X / X X" row duplicates but misses patterns like intra-row
+    // dupes (f4/f4 followed by c4/c4) that still warrant truncation. Run
+    // the merged detectors on state.moves so NW never surfaces while the
+    // sheets still contain noise the user hasn't resolved.
+    //
+    // Position-aware suppression: the gate's original purpose is to keep
+    // the banner from surfacing WHILE the user is in the middle of noise
+    // truncation (yellow review panel up, OCR-pair pass not yet
+    // confirmed). A separate desync was later observed where state.moves
+    // still contained noise after the user truncated via the game list
+    // (batch state and active-game state out of sync). In that case the
+    // alignment work upstream of the noise is genuinely independent of
+    // the trailing junk, so we should let it surface. We suppress only
+    // when the noise tail starts at or near (within NOISE_PROXIMITY_BUFFER
+    // plies of) the user's working position; far-downstream noise no
+    // longer blocks upstream alignment.
+    var NOISE_PROXIMITY_BUFFER = 6;
+    if (window.NoiseDetection &&
+        typeof window.NoiseDetection.isTailNoisy === 'function' &&
+        state.moves && !state.noiseBannerDismissed) {
+      if (window.NoiseDetection.isTailNoisy(state.moves)) {
+        var noiseStartGate = (typeof window.NoiseDetection.tailNoiseStartPly === 'function')
+          ? window.NoiseDetection.tailNoiseStartPly(state.moves)
+          : null;
+        var stuckGate = (typeof state.stuckPly === 'number') ? state.stuckPly : -1;
+        var curGate = (typeof state.currentPly === 'number') ? state.currentPly : -1;
+        var effGate = Math.max(stuckGate, curGate);
+        var farFromNoise = (noiseStartGate !== null &&
+                            effGate >= 0 &&
+                            noiseStartGate > effGate + NOISE_PROXIMITY_BUFFER);
+        if (farFromNoise) {
+          if (typeof log === 'function') {
+            var nsMv = Math.floor(noiseStartGate / 2) + 1 + '.' + (noiseStartGate % 2 === 0 ? 'W' : 'B');
+            var efMv = Math.floor(effGate / 2) + 1 + '.' + (effGate % 2 === 0 ? 'W' : 'B');
+            log('🧭 NW allowed past noise gate: noise tail starts at ' + nsMv +
+                ' (ply ' + noiseStartGate + ') but user is at ' + efMv +
+                ' (ply ' + effGate + ', buffer=' + NOISE_PROXIMITY_BUFFER +
+                '). Upstream alignment work is independent of the tail; ' +
+                'resolve trailing noise after.');
+          }
+          // Fall through to subsequent gates and suggestion extraction.
+        } else {
+          if (typeof log === 'function') {
+            var posTag = (noiseStartGate !== null && effGate >= 0)
+              ? ' (noise@ply ' + noiseStartGate + ', user@ply ' + effGate + ')'
+              : '';
+            log('🧭 NW suppressed: merged-moves noise detector flags trailing noise — ' +
+                'resolve noise (truncate or dismiss) before alignment suggestions surface' +
+                posTag);
+          }
+          clearAlignmentBanner();
+          return;
+        }
+      }
+    }
+    // Per-sheet noise gate via the orchestrator's hasTrailingNoise. That
+    // function has the dup-bypass that handles the case where mergeSheets
+    // silently collapses duplicate (num, color) cells from extra pages,
+    // hiding the genuine tail noise. state.moves alone (passed to
+    // isTailNoisy above) goes through the same merge and inherits the
+    // collapse — so for the 3-PDF case where p3 cells collide with p2's
+    // numbering, neither the prior gate catches it. The per-sheet check
+    // sees the raw 227/223 cells and detects dupes, then runs noise
+    // detection on each sheet independently with position-based pairing.
+    // User report: NW banner surfaced alongside the noise-review panel
+    // because state.moves looked clean while the per-sheet arrays were
+    // still noisy.
+    if (window.BatchReconstructOrchestrator &&
+        typeof window.BatchReconstructOrchestrator.hasTrailingNoise === 'function' &&
+        (state.ocrCellsSheet1 || state.ocrCellsSheet2) &&
+        !state.noiseBannerDismissed) {
+      var _ocrLike = {
+        isDualSheet: !!(state.ocrCellsSheet1 && state.ocrCellsSheet2),
+        sheet1: state.ocrCellsSheet1 || [],
+        sheet2: state.ocrCellsSheet2 || [],
+        ocrCells: state.ocrCells || []
+      };
+      if (window.BatchReconstructOrchestrator.hasTrailingNoise(_ocrLike)) {
+        // Same position-aware suppression principle as the merged-moves
+        // gate above. If the per-sheet detectors see noise far downstream
+        // of the user's working position, the upstream alignment work is
+        // independent and should be allowed. Root cause for this gate
+        // false-firing has been fixed (batch-game-list.js
+        // _rebuildOcrResultFromState now trims sheet1Pages/sheet2Pages on
+        // truncation sync), but this stays as defense in depth — and
+        // mirrors the principle the step-3 gate already follows.
+        var noiseStartS = (typeof window.BatchReconstructOrchestrator.tailNoiseStartPly === 'function')
+          ? window.BatchReconstructOrchestrator.tailNoiseStartPly(_ocrLike)
+          : null;
+        var stuckS = (typeof state.stuckPly === 'number') ? state.stuckPly : -1;
+        var curS = (typeof state.currentPly === 'number') ? state.currentPly : -1;
+        var effS = Math.max(stuckS, curS);
+        var farFromNoiseS = (noiseStartS !== null &&
+                             effS >= 0 &&
+                             noiseStartS > effS + NOISE_PROXIMITY_BUFFER);
+        // Reconstruction-owned tail carve-out. The orchestrator gate reads
+        // RAW OCR cells, which carry no fix/lock status — so a final move
+        // OCR'd at low confidence but then fixed/locked by reconstruction
+        // (and validated) still trips it forever. If every real move ply
+        // from the flagged start to the end of the game is in
+        // state.fixedPlies / lockedPlies, the "noise" is reconstruction-
+        // owned, not unresolved, so let alignment work surface.
+        // (Canonical case B3: 39.W axb6+ conf 0.49 → fixed to Qxf5+.)
+        var tailReconOwned = false;
+        if (noiseStartS !== null && Array.isArray(state.moves) && state.moves.length) {
+          var ownedS = {};
+          (state.fixedPlies || []).forEach(function(p){ ownedS[p] = true; });
+          (state.lockedPlies || []).forEach(function(p){ ownedS[p] = true; });
+          var allOwnedS = true, checkedAnyS = false;
+          for (var mi = 0; mi < state.moves.length; mi++) {
+            var mm = state.moves[mi];
+            var wPlyS = mi * 2, bPlyS = mi * 2 + 1;
+            if (mm.white && wPlyS >= noiseStartS) {
+              checkedAnyS = true;
+              if (!ownedS[wPlyS]) { allOwnedS = false; break; }
+            }
+            if (mm.black && bPlyS >= noiseStartS) {
+              checkedAnyS = true;
+              if (!ownedS[bPlyS]) { allOwnedS = false; break; }
+            }
+          }
+          tailReconOwned = checkedAnyS && allOwnedS;
+        }
+        if (farFromNoiseS || tailReconOwned) {
+          if (typeof log === 'function') {
+            var nsMvS = Math.floor(noiseStartS / 2) + 1 + '.' + (noiseStartS % 2 === 0 ? 'W' : 'B');
+            var efMvS = Math.floor(effS / 2) + 1 + '.' + (effS % 2 === 0 ? 'W' : 'B');
+            if (tailReconOwned) {
+              log('🧭 NW allowed past per-sheet noise gate: flagged tail at ' +
+                  nsMvS + ' (ply ' + noiseStartS + ') is reconstruction-owned ' +
+                  '(every ply from there is fixed/locked) — raw OCR confidence ' +
+                  'is moot, not unresolved noise.');
+            } else {
+              log('🧭 NW allowed past per-sheet noise gate: noise tail starts at ' +
+                  nsMvS + ' (ply ' + noiseStartS + ') but user is at ' + efMvS +
+                  ' (ply ' + effS + ', buffer=' + NOISE_PROXIMITY_BUFFER +
+                  '). Upstream alignment work is independent of the tail.');
+            }
+          }
+          // Fall through to subsequent gates and suggestion extraction.
+        } else {
+          if (typeof log === 'function') {
+            var posTagS = (noiseStartS !== null && effS >= 0)
+              ? ' (noise@ply ' + noiseStartS + ', user@ply ' + effS + ')'
+              : '';
+            log('🧭 NW suppressed: per-sheet noise check (with dup-bypass) flags ' +
+                'trailing noise — resolve noise before alignment suggestions surface' +
+                posTagS);
+          }
+          clearAlignmentBanner();
+          return;
+        }
+      }
+    }
+    // STALE-PER-SHEET GUARD — per-sheet arrays must agree with state.moves
+    // on game length. After truncation via deleteMovesFromPly the per-sheet
+    // arrays are filtered to c.num < truncMoveNum, so the highest c.num
+    // should match state.moves.length. If per-sheet still has cells well
+    // beyond state.moves' end (observed: state.moves truncated to 60 but
+    // ocrCellsSheet1 still carries cells with c.num 87-92), NW would propose
+    // edits on rows the user already truncated — the AFTER preview shows
+    // ghosts from the pre-truncation tail.
+    //
+    // Cause is upstream (some path resurrects per-sheet without honoring
+    // the truncation). The defensive move here is to detect the mismatch
+    // and either re-truncate the per-sheet arrays or suppress NW. We
+    // re-truncate so subsequent runs (including AFTER-preview generation)
+    // see clean data. Log loudly so the upstream bug is visible.
+    if (state.moves && state.moves.length > 0 &&
+        (state.ocrCellsSheet1 || state.ocrCellsSheet2)) {
+      var movesMaxNum = state.moves.length;
+      function _maxCellNum(cells) {
+        var m = 0;
+        if (!cells) return 0;
+        for (var i = 0; i < cells.length; i++) {
+          var n = cells[i] && cells[i].num;
+          if (typeof n === 'number' && n > m) m = n;
+        }
+        return m;
+      }
+      var s1Max = _maxCellNum(state.ocrCellsSheet1);
+      var s2Max = _maxCellNum(state.ocrCellsSheet2);
+      var STALE_MARGIN = 2;  // allow tiny round-off (one empty-half row)
+      var s1Stale = s1Max > movesMaxNum + STALE_MARGIN;
+      var s2Stale = s2Max > movesMaxNum + STALE_MARGIN;
+      if (s1Stale || s2Stale) {
+        if (typeof log === 'function') {
+          log('⚠️ Stale per-sheet data detected — state.moves=' + movesMaxNum +
+              ' moves, but ocrCellsSheet1 max num=' + s1Max +
+              ', ocrCellsSheet2 max num=' + s2Max +
+              ' — re-truncating per-sheet to match state.moves and suppressing NW this tick.');
+        }
+        function _truncToMax(cells, maxNum) {
+          if (!cells) return cells;
+          return cells.filter(function(c) {
+            return c && typeof c.num === 'number' && c.num <= maxNum;
+          });
+        }
+        if (s1Stale) state.ocrCellsSheet1 = _truncToMax(state.ocrCellsSheet1, movesMaxNum);
+        if (s2Stale) state.ocrCellsSheet2 = _truncToMax(state.ocrCellsSheet2, movesMaxNum);
+        clearAlignmentBanner();
+        return;
+      }
+    }
 
     var searchFrom = state.nwSearchFrom || 0;
     if (!state.dismissedNWKeys) state.dismissedNWKeys = {};
-    if (!state.postponedNWKeys) state.postponedNWKeys = {};
     if (state.alignmentAutoSurfaceMode === undefined) {
       state.alignmentAutoSurfaceMode = true;  // fresh OCR default
     }
 
-    // Auto-reset postponed keys once the user has cleared all stuck points.
-    // The point of Postpone is "I'll come back to this after working
-    // through the rest of the game" — so when stuckPly goes null, surface
-    // whatever they parked. Re-enable auto-surface so the first re-surfaced
-    // banner pops automatically (the user has earned it by finishing stuck
-    // points; they're not in the middle of other work).
-    var postponedKeys = Object.keys(state.postponedNWKeys);
-    if (postponedKeys.length > 0 &&
-        (state.stuckPly === null || state.stuckPly === undefined) &&
-        !state.stuckInfo) {
-      if (typeof log === 'function') {
-        log('♻️ Stuck points cleared — re-surfacing ' + postponedKeys.length +
-            ' postponed NW suggestion(s)');
-      }
-      state.postponedNWKeys = {};
-      state.alignmentAutoSurfaceMode = true;
-      state.nwSearchFrom = 0;  // restart enumeration from the top
-    }
-
     // Enumerate all pending issues for the count badge / log summary.
-    // Skips BOTH dismissed keys (permanent for this game) and postponed
-    // keys (temporary until stuck points resolve). Approximate (no
+    // Skips dismissed keys (permanent for this game). Approximate (no
     // hypothetical apply between), but good enough to tell the user how
     // much work is left.
     var allPending = [];
     var enumeratedTotal = 0;
     if (window.SheetNWAlignment.enumerateAlignmentIssues) {
+      // Pass reconstruction's confirmed move list so the chess-aware legality
+      // walks inside NW can seed chess.js with the VERIFIED game position
+      // close to the gap (instead of guessing via OCR best-of-both). These
+      // moves are chess-legal by construction — reconstruction wouldn't have
+      // advanced past them otherwise.
+      var reconMoves = (state.moves && state.moves.length) ? state.moves : null;
       var enumerated = window.SheetNWAlignment.enumerateAlignmentIssues(
-        state.ocrCellsSheet1, state.ocrCellsSheet2);
+        state.ocrCellsSheet1, state.ocrCellsSheet2, undefined, reconMoves);
       enumeratedTotal = enumerated.length;
       for (var ei = 0; ei < enumerated.length; ei++) {
         var k = _nwSuggestionKey(enumerated[ei]);
-        if (!state.dismissedNWKeys[k] && !state.postponedNWKeys[k]) {
+        if (!state.dismissedNWKeys[k]) {
           allPending.push(enumerated[ei]);
         }
       }
     }
     state.alignmentPendingIssues = allPending;
+
+    // ANTI-FLAP — is the banner currently on screen showing an issue that is
+    // STILL pending (i.e. not resolved and not dismissed)? If so,
+    // the SOFT gates below (closest-pick switch, workflow proximity, gap
+    // proximity) must not retract it. _runNWAlignmentCheck re-runs on many
+    // triggers (every merge / revalidate / nav-with-no-banner tick), and its
+    // inputs — stuckPly, currentPly, in-flight state.moves — wobble while
+    // background reconstruction backtracks. Without this, the banner surfaces
+    // on a tick where effPly is near the gap, then gets torn down on the next
+    // tick where effPly dipped, then reappears: the on/off flashing the user
+    // sees. Only HARD suppressions (noise / stale data / pendingNoiseReview,
+    // all gated ABOVE this point, and explicit apply/dismiss outside this
+    // function) tear a live banner down. A genuinely resolved issue drops out
+    // of allPending, so displayedStillPending goes false and the banner clears
+    // correctly.
+    var _displayedBanner = document.getElementById('alignment-suggestion-banner');
+    var _displayedKey = _displayedBanner ? _displayedBanner.dataset.suggestionKey : null;
+    var displayedStillPending = !!(_displayedKey && allPending.some(function(p) {
+      return _nwSuggestionKey(p) === _displayedKey;
+    }));
 
     // ALWAYS log the enumeration summary so the user can see at a glance
     // what the cascade thinks about the whole game, before any per-call
@@ -2084,11 +2624,7 @@
       });
       var pendStr = pendBits.length ? ' [' + pendBits.join(' ') + (allPending.length > 6 ? ' …' : '') + ']' : '';
       var declinedN = Object.keys(state.dismissedNWKeys).length;
-      var postponedN = Object.keys(state.postponedNWKeys).length;
-      var filteredBits = [];
-      if (declinedN > 0) filteredBits.push(declinedN + ' declined');
-      if (postponedN > 0) filteredBits.push(postponedN + ' postponed');
-      var filteredStr = filteredBits.length ? ' (' + filteredBits.join(', ') + ')' : '';
+      var filteredStr = declinedN > 0 ? ' (' + declinedN + ' declined)' : '';
       log('🧭 NW enumerate: ' + enumeratedTotal + ' total, ' +
           allPending.length + ' pending' + filteredStr + pendStr);
     }
@@ -2129,6 +2665,10 @@
                    (typeof state.stuckPly === 'number') ? state.stuckPly : 0;
       var nearby = Math.abs(sugPly - refPly) <= 8;
       if (!nearby) {
+        // Don't retract a live banner whose issue is still pending (anti-flap;
+        // see displayedStillPending above). This gate only suppresses FRESH
+        // surfacing.
+        if (displayedStillPending) return;
         // Don't surface; explain why so the user isn't left wondering.
         clearAlignmentBanner();
         var sugMove = Math.floor(sugPly / 2) + 1;
@@ -2136,6 +2676,93 @@
           log('🧭 NW workflow gate: next suggestion at move ' + sugMove +
               ' (ply ' + sugPly + ') is too far from currentPly=' + refPly +
               ' (auto-surface off after first apply/dismiss). Navigate near it to see the banner.');
+        }
+        _retryReconstructionLaunch();
+        return;
+      }
+    }
+
+    // GAP-PROXIMITY GATE — fires in BOTH auto-surface AND normal mode.
+    // User requirement: "the banner should only come up at 43.W" — i.e.
+    // we don't surface ahead of the gap location, even on fresh OCR.
+    //
+    // Computed as MAX(stuckPly, currentPly) — whichever is further along
+    // tells us how far the user has effectively progressed in this game.
+    // Stuck at 39.W with gap at ~85+: effectivePly = 76 < gapStartPly - 2
+    // = 84, so banner is suppressed until the user (or reconstruction)
+    // reaches the gap's pre-edge.
+    //
+    // Threshold = gapStartPly - 2 (one full white+black move before the
+    // gap). Allows the banner to surface when the user is at the move
+    // immediately preceding the gap, giving them position context.
+    //
+    // FORCE-STOP AT GAP (Q2 from user) — when state.stuckPly is null
+    // (recon completed end-to-end) but there's a pending verified-scoring
+    // gap, navigate currentPly to gapStartPly - 1 so the user is brought
+    // to the gap for review. Without this, recon completing past the gap
+    // would surface the banner with no clear "stop here" signal. One-shot
+    // per (sug-key, navigation): only fires the first time we see a given
+    // sug-key while currentPly is well before the gap, so we don't yank
+    // the user back every revalidate tick.
+    if (sug) {
+      var sugGapStart = (sug.action === 'insert')
+        ? ((typeof sug.afterPly === 'number' ? sug.afterPly : -1) + 1)
+        : (sug.plies && sug.plies.length ? sug.plies[0] : 0);
+      var stuckPlyNum = (typeof state.stuckPly === 'number') ? state.stuckPly : -1;
+      var curPlyNum = (typeof state.currentPly === 'number') ? state.currentPly : -1;
+
+      // Force-stop: if recon completed (no stuckPly) and user is well
+      // before the gap, snap them to gapStartPly - 1 via goToPly so the
+      // board + move-list re-render. goToPly itself calls
+      // runStructuralChecks at the end (when no banner is active), which
+      // re-enters _runNWAlignmentCheck with the updated currentPly — at
+      // which point the force-stop short-circuit fails (curPly is now at
+      // the gap) and the banner surfaces naturally through the proximity
+      // gate. We return early here to avoid a duplicate showNWAlignmentBanner
+      // call after the re-entry has already shown it.
+      if (stuckPlyNum < 0 && curPlyNum >= 0 && curPlyNum < sugGapStart - 2) {
+        var forceKey = _nwSuggestionKey(sug);
+        if (state.alignmentForceStuckAppliedFor !== forceKey) {
+          state.alignmentForceStuckAppliedFor = forceKey;
+          var targetPly = Math.max(0, sugGapStart - 1);
+          if (typeof log === 'function') {
+            var tMoveNum = Math.floor(targetPly / 2) + 1;
+            var tMoveColor = targetPly % 2 === 0 ? 'W' : 'B';
+            log('🧭 NW force-stop at gap: recon completed past gap, navigating to ' +
+                tMoveNum + '.' + tMoveColor + ' (ply ' + targetPly + ') for alignment review.');
+          }
+          if (typeof goToPly === 'function') {
+            goToPly(targetPly);
+            return;
+          }
+          // Fallback when goToPly isn't loaded (early init paths). Updates
+          // currentPly without a board re-render; the proximity gate below
+          // will still pass with the new value and surface the banner.
+          state.currentPly = targetPly;
+          curPlyNum = targetPly;
+        }
+      }
+
+      var effPly = Math.max(stuckPlyNum, curPlyNum);
+      var GAP_PROXIMITY_THRESHOLD = 2;
+      var scoringDeferred = !!(sug.cleanFenSrc &&
+                               sug.cleanFenSrc.indexOf('deferred') === 0);
+      if (effPly < sugGapStart - GAP_PROXIMITY_THRESHOLD || scoringDeferred) {
+        // Anti-flap: don't retract a verified live banner just because effPly
+        // dipped on a transient recon-backtrack tick. But a deferred-scored
+        // banner is NOT protected — it must be cleared so it re-evaluates once
+        // reconstruction confirms the pre-edge FEN and scoring is real.
+        if (displayedStillPending && !scoringDeferred) return;
+        clearAlignmentBanner();
+        if (typeof log === 'function') {
+          var gapMoveNum = Math.floor(sugGapStart / 2) + 1;
+          var gapMoveColor = sugGapStart % 2 === 0 ? 'W' : 'B';
+          var reason = scoringDeferred
+            ? 'scoring deferred (' + sug.cleanFenSrc + ') — waiting for recon to confirm pre-edge FEN'
+            : 'user position (stuck=' + stuckPlyNum + ', current=' + curPlyNum +
+              ', effective=' + effPly + ') ahead of gap';
+          log('🧭 NW gap-proximity gate: suppressed suggestion at ' + gapMoveNum + '.' +
+              gapMoveColor + ' (ply ' + sugGapStart + '): ' + reason);
         }
         _retryReconstructionLaunch();
         return;
@@ -2173,6 +2800,13 @@
           : 'none';
         log('  dup1 (S1): topMatchPairs=' + (dup1.topMatches || 0) + ' ' + d1Best);
         log('  dup2 (S2): topMatchPairs=' + (dup2.topMatches || 0) + ' ' + d2Best);
+        if (d.silentTail) {
+          log('  ⊘ Silent-tail suppression: lengths differ by ' + d.silentTail.lenDiff +
+              ' plies (shorter=' + d.silentTail.shorterLen +
+              ', longer=' + d.silentTail.longerLen +
+              ', threshold=' + d.silentTail.threshold +
+              ') — one player likely stopped writing; using longer sheet for the tail');
+        }
         if (d.nw) {
           log('  NW from ply ' + d.nwStart + ': len=' + d.nw.alignmentLen +
               ' matches=' + d.nw.counts.match +
@@ -2236,22 +2870,185 @@
     // before. Navigation-near triggers also re-render because the
     // "surface" selection in _runNWAlignmentCheck can switch to a
     // closer suggestion, producing a new key.
+    //
+    // Source-transition exception: same structural gap, but the scoring
+    // source changed (e.g. cleanFenSrc went from 'deferred(verifiedShort)'
+    // to 'verified' because reconstruction advanced past the gap). The
+    // numbers in the banner are now meaningfully different and we DO want
+    // to re-render — but quietly, without scrolling the user back. Set
+    // isSourceTransition so the scroll-into-view + flash at the bottom is
+    // skipped.
     var newKey = _nwSuggestionKey(sug);
+    var newSrc = sug.cleanFenSrc || '';
     var existingBanner = document.getElementById('alignment-suggestion-banner');
+    var isSourceTransition = false;
     if (existingBanner && existingBanner.dataset.suggestionKey === newKey) {
-      return;
+      var prevSrc = existingBanner.dataset.cleanFenSrc || '';
+      if (prevSrc === newSrc) {
+        return;  // identical structural + scoring source, nothing to redo
+      }
+      isSourceTransition = true;
     }
     clearAlignmentBanner();
 
     var icon = sug.action === 'insert' ? '➕' : '✂️';
+    function _actionLabelFor(s) {
+      if (!s) return '';
+      var lbl = s.fromSheet === 's1' || s.onSheet === 's1' ? "White's" : "Black's";
+      return s.action === 'insert'
+        ? ('Insert ' + s.nPlies + ' placeholder ' + (s.nPlies > 1 ? 'plies' : 'ply') +
+           ' on ' + lbl + " sheet")
+        : s.action === 'delete_duplicate'
+          ? ('Delete duplicated full move ' + s.moveNum + ' from ' + lbl + " sheet")
+          : ('Delete ' + s.nPlies + ' extra ' + (s.nPlies > 1 ? 'plies' : 'ply') +
+             ' from ' + lbl + " sheet");
+    }
     var sheetLabel = sug.fromSheet === 's1' || sug.onSheet === 's1' ? "White's" : "Black's";
-    var actionLabel = sug.action === 'insert'
-      ? ('Insert ' + sug.nPlies + ' placeholder ' + (sug.nPlies > 1 ? 'plies' : 'ply') +
-         ' on ' + sheetLabel + " sheet")
-      : sug.action === 'delete_duplicate'
-        ? ('Delete duplicated full move ' + sug.moveNum + ' from ' + sheetLabel + " sheet")
-        : ('Delete ' + sug.nPlies + ' extra ' + (sug.nPlies > 1 ? 'plies' : 'ply') +
-           ' from ' + sheetLabel + " sheet");
+    var actionLabel = _actionLabelFor(sug);
+
+    // Color-code the score-delta so the user can read it at a glance.
+    // Switched from raw NW score delta to PERCENTAGE-POINT delta (postPct -
+    // prePct, where pctX = scoreX / (cellsX × 1.95) × 100). The raw delta
+    // was structurally biased toward deletes because the pre/post slices
+    // used the same numeric indices over arrays of different length —
+    // delete made the post-window reach 2 plies further downstream,
+    // insert made it reach less far AND added zero-score placeholders
+    // inside the window. User caught the bias: raw Δ favored delete by
+    // 2.54 vs 1.10 in a case where the percentages were 8pp vs 7pp
+    // (only 1pp apart). The per-cell-normalized pp metric is the right
+    // thing to surface. (The underlying _computeScoreDeltaForSug now
+    // also uses absolute-ply windows, so the raw delta is honest too,
+    // but pp is still the more readable signal at a glance.)
+    //
+    // Bands tuned on pp delta (already cell-count-normalized, so a single
+    // band table works for any nPlies):
+    //
+    //   Δpp < 0    → bold red          (alignment WORSE)
+    //   Δpp < 1    → red               (essentially no improvement)
+    //   Δpp < 3    → yellow            (marginal)
+    //   Δpp < 7    → emerald           (decent)
+    //   Δpp ≥ 7    → bright emerald    (strong)
+    //
+    // Hover-tooltip surfaces the underlying raw NW score and the pre/post
+    // percentages for the curious; the badge itself keeps the focus on
+    // the headline pp number.
+    function _renderScoreDeltaBadge(sugObj) {
+      if (!sugObj || typeof sugObj.scoreDelta !== 'number') return '';
+      var MAX_PER_CELL = 1.95;
+      var prePct = null, postPct = null;
+      // Use preCells as the SAME denominator for both pre and post — the
+      // metric becomes "fraction of the original window's alignment
+      // ceiling achieved", which gives an apples-to-apples comparison
+      // regardless of whether the edit grew or shrank the cell count.
+      //
+      // Previous version used postCells in the denominator. That inflated
+      // delete's pp (postCells smaller → bigger ratio) and deflated
+      // insert's pp (postCells larger → smaller ratio) — a structural
+      // bias of roughly ±10-12% relative for an 18-ply window with N=2.
+      // User caught this and asked for the final fix.
+      //
+      // Math:
+      //   prePct  = preScore  / (preCells × 1.95) × 100
+      //   postPct = postScore / (preCells × 1.95) × 100   ← same denom
+      //
+      // Max postPct for delete  ≈ (preCells - N) / preCells × 100  ≈ 89% for N=2
+      // Max postPct for insert  ≈ (preCells × 1.95 - 0.05·N) / (preCells × 1.95) × 100 ≈ 99.7%
+      // — so neither direction structurally exceeds 100%, and the only
+      // residual asymmetry is the small placeholder penalty (~0.05/ply),
+      // which arguably reflects real downstream noise.
+      var denom = (typeof sugObj.preCells === 'number' && sugObj.preCells > 0)
+                  ? (sugObj.preCells * MAX_PER_CELL) : null;
+      if (denom !== null) {
+        prePct = Math.max(0, Math.min(100, (sugObj.preScore / denom) * 100));
+        postPct = Math.max(0, Math.min(100, (sugObj.postScore / denom) * 100));
+      }
+      var displayVal, suffix, deltaForColor;
+      if (denom !== null && typeof sugObj.scoreDelta === 'number') {
+        // Headline pp uses the CHESS-ADJUSTED scoreDelta, not the pure
+        // pre/post NW difference. This is the ranking signal — legality
+        // and piece-presence adjustments are already baked into scoreDelta
+        // — so the badge magnitude reflects what actually decides which
+        // direction is better. The bottom evidence rows show the pure NW
+        // pre→post for the curious, and break down the chess components
+        // separately.
+        var pp = (sugObj.scoreDelta / denom) * 100;
+        displayVal = (pp >= 0 ? '+' : '') + pp.toFixed(1);
+        suffix = 'pp';
+        deltaForColor = pp;
+      } else {
+        // Fallback to raw delta when per-cell% data is unavailable
+        // (shouldn't normally happen — detectNextAlignmentIssue populates
+        // pre/postCells via _computeScoreDeltaForSug).
+        displayVal = (sugObj.scoreDelta >= 0 ? '+' : '') + sugObj.scoreDelta.toFixed(2);
+        suffix = '';
+        var per = (sugObj.nPlies && sugObj.nPlies > 0)
+                  ? (sugObj.scoreDelta / sugObj.nPlies) : sugObj.scoreDelta;
+        deltaForColor = per * 50;     // rescale ~0.5/ply → ~25pp
+      }
+      var cls;
+      if (deltaForColor < 0)      cls = 'text-red-400 font-bold';
+      else if (deltaForColor < 1) cls = 'text-red-300 font-semibold';
+      else if (deltaForColor < 3) cls = 'text-yellow-300 font-semibold';
+      else if (deltaForColor < 7) cls = 'text-emerald-400 font-bold';
+      else                        cls = 'text-emerald-300 font-bold';
+
+      var rawSign = sugObj.scoreDelta >= 0 ? '+' : '';
+      var tipParts = [];
+      if (prePct !== null && postPct !== null) {
+        tipParts.push('per-cell match: ' + Math.round(prePct) + '% → ' +
+                       Math.round(postPct) + '%');
+      }
+      tipParts.push('raw NW: ' + (sugObj.preScore || 0).toFixed(2) + ' → ' +
+                    (sugObj.postScore || 0).toFixed(2) +
+                    ' (Δ=' + rawSign + sugObj.scoreDelta.toFixed(2) + ')');
+      // Chess-aware legality: only surface when the count changed in either
+      // direction — otherwise it's noise. illegal-move counts walk the
+      // modified sheet through chess.js; a non-zero delta means the edit
+      // either added or removed positions that no legal OCR candidate could
+      // satisfy. The penalty is already baked into the raw NW score above.
+      if (typeof sugObj.preIllegals === 'number' &&
+          typeof sugObj.postIllegals === 'number' &&
+          sugObj.preIllegals !== sugObj.postIllegals) {
+        var illDelta = sugObj.postIllegals - sugObj.preIllegals;
+        var illSign = illDelta > 0 ? '+' : '';
+        tipParts.push('illegal moves: ' + sugObj.preIllegals + ' → ' +
+                      sugObj.postIllegals + ' (' + illSign + illDelta + ')');
+      }
+      var tip = tipParts.join(' · ');
+
+      return ' <span class="text-gray-500">(Δ=</span>' +
+             '<span class="text-sm ' + cls + '" title="' + _esc(tip) + '">' +
+             displayVal + suffix + '</span>' +
+             '<span class="text-gray-500">)</span>';
+    }
+
+    // Inverse-direction blurb (e.g., for a delete-from-W primary, the inverse
+    // is insert-into-B). NW picks one direction by lower-cost alignment math
+    // alone — chess-blind. Surface the alternative so the user can swap when
+    // the scans say the OCR-pool-overlap picked the wrong direction. Only
+    // shown for gap-driven inserts/deletes (delete_duplicate has no
+    // structurally-equivalent inverse).
+    var inverseHtml = '';
+    if (sug.inverseDirection && (sug.action === 'insert' || sug.action === 'delete')) {
+      var inv = sug.inverseDirection;
+      var invDeltaStr = _renderScoreDeltaBadge(inv);
+      var curDeltaStr = _renderScoreDeltaBadge(sug);
+      // The two scoreDeltas tell the user which direction NW thought was
+      // structurally better — useful tiebreaker when both look plausible.
+      inverseHtml =
+        '<div class="text-[11px] text-gray-400 mb-1">' +
+          '<span class="text-gray-500">current:</span> ' + _esc(actionLabel) + curDeltaStr +
+          ' &nbsp;·&nbsp; ' +
+          '<button id="align-swap-direction-btn" ' +
+            'class="text-cyan-400/80 hover:text-cyan-300 underline-offset-2 ' +
+            'hover:underline cursor-pointer" ' +
+            'title="Swap to the alternative edit direction — same NW gap, ' +
+                   'opposite sheet. Lets you pick the direction that matches ' +
+                   'what the physical scoresheets actually show.">' +
+            '↔ alt: ' + _esc(_actionLabelFor(inv)) + invDeltaStr +
+          '</button>' +
+        '</div>';
+    }
 
     // Evidence lines beneath the AFTER block. Two flavors:
     // - NW gap insert/delete: "gap boundary match" (pool-overlap of anchor
@@ -2305,54 +3102,25 @@
           }
         }
       }
-      // Also surface gap-region pre/post for delete_duplicate. Pre = the
-      // duplicated row's cells cross-match other sheet (low — they're the
-      // misalignment); post = the row that shifts up after the delete vs
-      // other sheet (recovered alignment).
-      var dupGapMatch = _computeGapRegionMatch(sug);
-      if (dupGapMatch && typeof dupGapMatch.prePct === 'number' && typeof dupGapMatch.postPct === 'number') {
-        var dupDeltaPp = dupGapMatch.postPct - dupGapMatch.prePct;
-        var dupSign = dupDeltaPp >= 0 ? '+' : '';
-        evidenceLines.push(
-          'gap cells cross-sheet match: <span class="text-gray-200">' +
-          Math.round(dupGapMatch.prePct) + '% → ' + Math.round(dupGapMatch.postPct) +
-          '% (' + dupSign + Math.round(dupDeltaPp) + 'pp)</span>' +
-          ' <span class="text-gray-500">(removed cells vs. other sheet → cells that shift up vs. other sheet)</span>'
-        );
-      }
     } else if (sug.beforeScore !== undefined && sug.afterScore !== undefined) {
       var pctBefore = Math.round((sug.beforeScore / 2.0) * 100);
       var pctAfter  = Math.round((sug.afterScore  / 2.0) * 100);
-      // Static metric — these are pool overlaps of the cells that DO align
-      // across sheets, immediately bracketing the gap. The cells don't move
-      // with the proposed insert/delete, so there's no pre/post version of
-      // this number; it just is. The pre/post comparison the user wants is
-      // captured by "alignment quality" and "gap cells cross-sheet match"
-      // lines below.
+      // Static metric — pool overlaps of the cells that DO align across
+      // sheets, immediately bracketing the gap. The cells don't move with
+      // the proposed insert/delete, so there's no pre/post version; it just
+      // is. The pre/post comparison the user cares about is captured by
+      // "alignment quality" + "chess-aware legality" below.
       evidenceLines.push(
         'before-gap anchor: <span class="text-gray-200">' + pctBefore + '%</span>' +
         ', after-gap anchor: <span class="text-gray-200">' + pctAfter + '%</span>' +
         ' <span class="text-gray-500">(' + sug.beforeScore.toFixed(2) + ' / ' +
         sug.afterScore.toFixed(2) + ' of 2.00 max — static across pre/post)</span>'
       );
-      // Pre/post of the GAP CELLS specifically: how well do the cells AT
-      // the gap position match the other sheet, before vs after the fix?
-      // Insert: pre = original cells at that position cross-match S2;
-      //         post = placeholders filled from S2 → ~100% by construction.
-      // Delete: pre = cells being removed vs other sheet (low — they're
-      //               misaligned cells);
-      //         post = cells that shift up vs other sheet (recovered).
-      var gapMatch = _computeGapRegionMatch(sug);
-      if (gapMatch && typeof gapMatch.prePct === 'number' && typeof gapMatch.postPct === 'number') {
-        var deltaPp = gapMatch.postPct - gapMatch.prePct;
-        var deltaSign = deltaPp >= 0 ? '+' : '';
-        evidenceLines.push(
-          'gap cells cross-sheet match: <span class="text-gray-200">' +
-          Math.round(gapMatch.prePct) + '% → ' + Math.round(gapMatch.postPct) +
-          '% (' + deltaSign + Math.round(deltaPp) + 'pp)</span>' +
-          ' <span class="text-gray-500">(avg pool overlap of cells at the gap position vs. the other sheet)</span>'
-        );
-      }
+      // (Removed: "gap cells cross-sheet match" line. For inserts the post
+      // value was tautologically ~100% because placeholders are by-construction
+      // copies of the other sheet — so the metric was meaningless evidence
+      // for direction selection. The structured-anchor and legality rows
+      // already carry the discriminating signal users actually need.)
       // Structured match on the boundary anchors. Same pairs that produced
       // beforeScore/afterScore (which use exact-SAN matching only), but
       // scored with the chess-aware decomposition: agreement on target
@@ -2399,25 +3167,154 @@
       // mixing units.
       var MAX_PER_CELL = 1.95;
       var prePct = null, postPct = null;
+      // Use preCells as the SHARED denominator for both pre and post —
+      // same math as the colored pp badge at the top of the banner so the
+      // two surfaces tell the same story. Previously this line used
+      // postCells for postPct, which inflated delete pp (smaller denom)
+      // and deflated insert pp (larger denom). User caught the mismatch
+      // between the badge (+1.4pp) and this line (+5pp) for the same
+      // suggestion.
       if (typeof sug.preCells === 'number' && sug.preCells > 0) {
-        prePct = Math.max(0, Math.min(100, (sug.preScore / (sug.preCells * MAX_PER_CELL)) * 100));
+        var denom = sug.preCells * MAX_PER_CELL;
+        prePct = Math.max(0, Math.min(100, (sug.preScore / denom) * 100));
+        postPct = Math.max(0, Math.min(100, (sug.postScore / denom) * 100));
       }
-      if (typeof sug.postCells === 'number' && sug.postCells > 0) {
-        postPct = Math.max(0, Math.min(100, (sug.postScore / (sug.postCells * MAX_PER_CELL)) * 100));
-      }
-      var deltaSign = sug.scoreDelta >= 0 ? '+' : '';
+      // PURE NW raw-delta for the parenthetical (postScore - preScore is
+      // pure NW; sug.scoreDelta is chess-adjusted and would not equal the
+      // displayed pre→post arithmetic). Keep them consistent here, surface
+      // chess adjustments below in their own lines.
+      var pureNwDelta = sug.postScore - sug.preScore;
+      var pureNwSign = pureNwDelta >= 0 ? '+' : '';
       var pctPart = '';
       if (prePct !== null && postPct !== null) {
-        var pctDeltaSign = (postPct - prePct) >= 0 ? '+' : '';
+        var ppVal = postPct - prePct;
+        var pctDeltaSign = ppVal >= 0 ? '+' : '';
         pctPart =
-          '<span class="text-gray-200">' + Math.round(prePct) + '% → ' + Math.round(postPct) +
-          '% (' + pctDeltaSign + (postPct - prePct).toFixed(0) + 'pp)</span>';
+          '<span class="text-gray-200">' + prePct.toFixed(1) + '% → ' + postPct.toFixed(1) +
+          '% (' + pctDeltaSign + ppVal.toFixed(1) + 'pp)</span>';
       }
       evidenceLines.push(
         'alignment quality (per-cell match avg): ' +
-        (pctPart || '<span class="text-gray-200">' + deltaSign + sug.scoreDelta.toFixed(2) + '</span>') +
+        (pctPart || '<span class="text-gray-200">' + pureNwSign + pureNwDelta.toFixed(2) + '</span>') +
         ' <span class="text-gray-500">(raw NW ' + sug.preScore.toFixed(2) + ' → ' +
-        sug.postScore.toFixed(2) + ', ' + deltaSign + sug.scoreDelta.toFixed(2) + ')</span>'
+        sug.postScore.toFixed(2) + ', ' + pureNwSign + pureNwDelta.toFixed(2) + ')</span>'
+      );
+    }
+    // Helper: map sheet identifier to display name. NW labels sheets by
+    // structural role (modified vs other), which swaps depending on edit
+    // direction — confusing when the user wants to compare absolute facts
+    // across the two suggestions. Use White's / Black's consistently.
+    function _sheetName(sheetId) {
+      return (sheetId === 's1') ? "White's sheet"
+           : (sheetId === 's2') ? "Black's sheet"
+           : 'sheet ' + sheetId;
+    }
+    var modifiedSheetId = (sug.action === 'delete') ? sug.fromSheet : sug.onSheet;
+    var otherSheetId = (modifiedSheetId === 's1') ? 's2' : 's1';
+    var modifiedSheetName = _sheetName(modifiedSheetId);
+    var otherSheetName = _sheetName(otherSheetId);
+
+    // Chess-aware legality evidence — always render the line when counts
+    // exist (even when 0 → 0), so the user can confirm the check ran. Sign
+    // convention: legalityPenalty is the raw legalityScale (positive when
+    // illegals increased, negative when decreased). The EFFECT on
+    // scoreDelta is -legalityPenalty (subtracted). Display the EFFECT so
+    // a decrease in illegals reads as "+0.60 reward", matching the
+    // piece-presence convention (positive = reward, negative = penalty).
+    //
+    // Deferred case: when reconstruction hasn't reached the gap's pre-edge,
+    // legality + piece-presence are SKIPPED (preIllegals/pieceImpSelf left
+    // null) to avoid drift-confounded scoring. Surface a single line so the
+    // user knows the check will re-run once the forward pass advances.
+    var legalityScored = (typeof sug.preIllegals === 'number' && typeof sug.postIllegals === 'number');
+    if (!legalityScored && sug.cleanFenSrc &&
+        sug.cleanFenSrc.indexOf('deferred') === 0) {
+      evidenceLines.push(
+        '<span class="text-gray-400">chess-aware legality + piece-presence: ' +
+        'deferred — reconstruction has not yet confirmed the position before the gap. ' +
+        'Will re-score once the forward pass advances.</span>'
+      );
+    }
+    if (legalityScored) {
+      var illDelta = sug.postIllegals - sug.preIllegals;
+      var illSign = illDelta > 0 ? '+' : (illDelta < 0 ? '' : '');
+      var illCls = (illDelta < 0) ? 'text-emerald-300'
+                  : (illDelta > 0) ? 'text-red-300'
+                  : 'text-gray-200';
+      var effectStr = '';
+      if (typeof sug.legalityPenalty === 'number' && Math.abs(sug.legalityPenalty) > 0.0001) {
+        var legalityEffect = -sug.legalityPenalty; // effect on scoreDelta
+        var effSign = legalityEffect >= 0 ? '+' : '';
+        var effLabel = legalityEffect >= 0 ? 'reward' : 'penalty';
+        effectStr = ' <span class="text-gray-500">(' + effLabel + ' ' + effSign +
+                     legalityEffect.toFixed(2) + ' baked into raw NW above)</span>';
+      }
+      evidenceLines.push(
+        'chess-aware legality on ' + modifiedSheetName + ': ' +
+        '<span class="' + illCls + '">' + sug.preIllegals + ' → ' + sug.postIllegals +
+        ' illegal moves (' + illSign + illDelta + ')</span>' +
+        effectStr
+      );
+    }
+    // Odd-ply end-state penalty — fires only for odd-ply edits (1, 3, …)
+    // where post-edit illegality is dense (rate ≥ 50% AND postIllegals ≥ 2).
+    // Odd-ply edits flip the color column on every downstream cell, so a
+    // high post-edit illegal rate is a structural disqualifier even when
+    // raw NW similarity gives the edit an apparent advantage. See
+    // ODD_PLY_END_STATE_PENALTY_PER_MOVE in sheet-nw-alignment.js. Display
+    // only when the penalty actually fires (non-zero) — the typical even-
+    // ply path leaves it at 0 and we don't surface a "no effect" row.
+    if (typeof sug.endStatePenalty === 'number' && Math.abs(sug.endStatePenalty) > 0.0001) {
+      var espValue = -sug.endStatePenalty; // effect on scoreDelta (negative)
+      var espSign = espValue >= 0 ? '+' : '';
+      var espCells = (typeof sug.endStateCellsTested === 'number' && sug.endStateCellsTested > 0)
+        ? sug.endStateCellsTested : null;
+      var espRateStr = (espCells != null)
+        ? ' (' + Math.round(100 * sug.postIllegals / espCells) + '% rate, threshold 50%)'
+        : '';
+      var espCellsStr = (espCells != null)
+        ? sug.postIllegals + ' illegal in ' + espCells + ' cells tested'
+        : sug.postIllegals + ' illegal post-edit';
+      evidenceLines.push(
+        'odd-ply end-state on ' + modifiedSheetName + ': ' +
+        '<span class="text-red-300">' + espCellsStr + '</span>' + espRateStr +
+        ' <span class="text-gray-500">(penalty ' + espSign + espValue.toFixed(2) +
+        ' baked into raw NW above; odd-ply edits flip downstream color columns ' +
+        'so a dense post-edit illegal rate is a structural disqualifier)</span>'
+      );
+    }
+    // Piece-presence — fires especially in endgames after captures, addresses
+    // the "Black wrote bishop moves White can't make" class of bug. Display
+    // uses absolute sheet names so the underlying fact (which sheet has more
+    // piece-impossibilities) reads the same across both directions; only the
+    // conclusion (reward/penalty) flips based on which sheet the edit targets.
+    if (typeof sug.pieceImpSelf === 'number' && typeof sug.pieceImpOther === 'number') {
+      var whitePI = (modifiedSheetId === 's1') ? sug.pieceImpSelf : sug.pieceImpOther;
+      var blackPI = (modifiedSheetId === 's2') ? sug.pieceImpSelf : sug.pieceImpOther;
+      var diff = whitePI - blackPI;
+      var ghostHeavierName;
+      if (diff > 0)      ghostHeavierName = "White's sheet";
+      else if (diff < 0) ghostHeavierName = "Black's sheet";
+      var diffSummary = (diff === 0)
+        ? '<span class="text-gray-200">tied</span>'
+        : '<span class="text-gray-200">' + ghostHeavierName + ' has ' +
+          Math.abs(diff) + ' more</span>';
+      var adjStr = '';
+      if (typeof sug.piecePresenceAdj === 'number' && Math.abs(sug.piecePresenceAdj) > 0.0001) {
+        var adjVal = sug.piecePresenceAdj;
+        var adjLabel = adjVal >= 0 ? 'reward' : 'penalty';
+        var adjReason = adjVal >= 0
+          ? 'rewards modifying ' + modifiedSheetName + ' (the one with more ghosts)'
+          : 'penalizes modifying ' + modifiedSheetName + ' (the cleaner one)';
+        var adjSign = adjVal >= 0 ? '+' : '';
+        adjStr = ' <span class="text-gray-500">(' + adjLabel + ' ' + adjSign +
+                  adjVal.toFixed(2) + ' baked into raw NW above; ' + adjReason + ')</span>';
+      }
+      evidenceLines.push(
+        'piece-presence: ' +
+        "White's sheet " + whitePI + " ghost-piece moves, " +
+        "Black's sheet " + blackPI + " — " + diffSummary +
+        adjStr
       );
     }
     var anchorStr = evidenceLines.join('<br/>');
@@ -2458,14 +3355,49 @@
       deletedPlySet: deletedPlySet
     };
     var evidenceHtml = _renderEvidenceGrid(evidenceShape);
+    // Side-by-side scanned-cell preview (top-1 mode only). Lets the user
+    // verify the OCR read against the actual handwriting without leaving
+    // the banner.
+    var scanPanelHtml = _renderScannedImagesPanel(evidenceShape, 'before');
+    // Wrap the BEFORE evidence grid and scan panel in a horizontal flex so
+    // they sit side-by-side. The grid (with its SVG match-graph overlay)
+    // stays on the left at min-w-0 so it can shrink — historically it
+    // claimed the full banner width; with the scan panel beside it the
+    // graph is now noticeably narrower, which is what the user asked for.
+    var beforeRowHtml = scanPanelHtml
+      ? '<div class="flex items-start gap-3">' +
+          '<div class="min-w-0 flex-1">' + evidenceHtml + '</div>' +
+          '<div class="shrink-0">' + scanPanelHtml + '</div>' +
+        '</div>'
+      : evidenceHtml;
     // AFTER block — show what the sheets look like once the operation is
     // applied. Inserted placeholders highlighted in green, subsequent rows
-    // shift to fill the new positions.
+    // shift to fill the new positions. Stashes _previewAfterS1/S2/Meta as
+    // a side effect; the AFTER scan panel below reads from those.
     var afterHtml = _renderPostApplyEvidence(sug);
+    // AFTER scan panel — uses _previewAfterS1/S2 stashed by the call above.
+    // Center on the same row as the printed AFTER table (which uses
+    // floor(actionPly/2)+1 where actionPly is afterPly+1 for inserts and
+    // plies[0] for deletes).
+    var afterActionPly = (sug.action === 'insert') ? sug.afterPly + 1 : sug.plies[0];
+    var afterShape = {
+      atMoveNum: (typeof afterActionPly === 'number')
+        ? Math.floor(afterActionPly / 2) + 1 : null,
+      sheet: sheetLetter,
+      action: (sug.action === 'insert') ? 'insert' : 'delete'
+    };
+    var afterScanPanelHtml = _renderScannedImagesPanel(afterShape, 'after');
+    var afterRowHtml = afterScanPanelHtml
+      ? '<div class="flex items-start gap-3">' +
+          '<div class="min-w-0 flex-1">' + afterHtml + '</div>' +
+          '<div class="shrink-0">' + afterScanPanelHtml + '</div>' +
+        '</div>'
+      : afterHtml;
 
     var banner = document.createElement('div');
     banner.id = 'alignment-suggestion-banner';
     banner.dataset.suggestionKey = _nwSuggestionKey(sug);
+    banner.dataset.cleanFenSrc = sug.cleanFenSrc || '';
     banner.className = 'mx-3 my-2 p-3 rounded-lg border border-orange-500/60 bg-orange-900/20 text-sm';
     banner.innerHTML =
       '<div class="flex items-start gap-3">' +
@@ -2481,14 +3413,14 @@
             '</button>' +
           '</div>' +
           '<div class="text-gray-200 mb-1">' + actionLabel + '</div>' +
+          inverseHtml +
           detailHtml +
-          evidenceHtml +
-          afterHtml +
+          beforeRowHtml +
+          afterRowHtml +
           (anchorStr ? '<div class="text-gray-400 text-xs italic mt-1">' + anchorStr + '</div>' : '') +
         '</div>' +
         '<div class="flex flex-col gap-1 shrink-0">' +
           '<button id="align-apply-btn" class="px-3 py-1 rounded bg-orange-600 hover:bg-orange-500 text-white text-xs font-semibold" title="Apply the suggested edit and re-merge">Apply &amp; Re-merge</button>' +
-          '<button id="align-postpone-btn" class="px-3 py-1 rounded bg-yellow-700 hover:bg-yellow-600 text-yellow-100 text-xs" title="Hide for now; re-surface once all stuck points are resolved">Postpone</button>' +
           '<button id="align-decline-btn" class="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-200 text-xs" title="Reject this suggestion — don\'t show again">Decline</button>' +
         '</div>' +
       '</div>';
@@ -2510,6 +3442,22 @@
 
     var altsBtn = document.getElementById('alignment-alts-toggle');
     if (altsBtn) altsBtn.onclick = _toggleAllAlts;
+
+    // Swap-direction button. Promotes sug.inverseDirection to primary and
+    // re-renders. The inverse already carries its own preScore/postScore/
+    // scoreDelta computed in detectNextAlignmentIssue, so the swap is
+    // instant and the user sees real numbers for the new direction.
+    var swapBtn = document.getElementById('align-swap-direction-btn');
+    if (swapBtn && sug.inverseDirection) {
+      swapBtn.onclick = function() {
+        var nextSug = sug.inverseDirection;
+        // _currentSuggestion is used by the SVG overlay for graph context;
+        // wipe it before re-render so showNWAlignmentBanner doesn't bail on
+        // the suggestionKey-already-matches guard.
+        clearAlignmentBanner();
+        showNWAlignmentBanner(nextSug);
+      };
+    }
 
     // One-time install of cell-hover tooltip delegation. Listener stays on
     // body across banner re-renders; harmless when no evidence cells exist.
@@ -2539,12 +3487,10 @@
       window.addEventListener('resize', _overlayResizeListener);
     }
 
-    // Common post-action bookkeeping for both Decline and Postpone: skip
-    // past this region on the next pass, turn off auto-surface so further
-    // issues only show when the user navigates near them, clear the
-    // banner, and re-run the cascade so the NEXT suggestion (if any)
-    // surfaces appropriately.
-    function _afterDeclineOrPostpone() {
+    document.getElementById('align-decline-btn').onclick = function() {
+      if (!state.dismissedNWKeys) state.dismissedNWKeys = {};
+      state.dismissedNWKeys[_nwSuggestionKey(sug)] = true;
+      if (typeof log === 'function') log('✖ NW alignment DECLINED — will not show again for this game');
       var skipPly = (sug.action === 'insert')
         ? (sug.afterPly + sug.nPlies + 4)
         : (sug.plies[sug.plies.length - 1] + 4);
@@ -2552,19 +3498,6 @@
       state.alignmentAutoSurfaceMode = false;
       clearAlignmentBanner();
       _runNWAlignmentCheck();
-    }
-
-    document.getElementById('align-decline-btn').onclick = function() {
-      if (!state.dismissedNWKeys) state.dismissedNWKeys = {};
-      state.dismissedNWKeys[_nwSuggestionKey(sug)] = true;
-      if (typeof log === 'function') log('✖ NW alignment DECLINED — will not show again for this game');
-      _afterDeclineOrPostpone();
-    };
-    document.getElementById('align-postpone-btn').onclick = function() {
-      if (!state.postponedNWKeys) state.postponedNWKeys = {};
-      state.postponedNWKeys[_nwSuggestionKey(sug)] = true;
-      if (typeof log === 'function') log('⏸ NW alignment POSTPONED — will re-surface once all stuck points are resolved');
-      _afterDeclineOrPostpone();
     };
 
     // Scroll the window so the banner is unmistakable, with a brief flash.
@@ -2579,23 +3512,31 @@
         }
       } catch (e) {}
     }
-    try { banner.scrollIntoView({ block: 'start', behavior: 'instant' }); }
-    catch (e) {
-      try { banner.scrollIntoView({ block: 'start' }); } catch (e2) {}
+    // Source-transition re-render: same gap, but scoring source changed
+    // (deferred → verified or vice versa). Re-render the markup quietly,
+    // don't scroll-into-view or flash — the user is working on other
+    // things and we just want the new numbers to appear in place.
+    if (!isSourceTransition) {
+      try { banner.scrollIntoView({ block: 'start', behavior: 'instant' }); }
+      catch (e) {
+        try { banner.scrollIntoView({ block: 'start' }); } catch (e2) {}
+      }
+      setTimeout(_ensureNWBannerVisible, 50);
+      setTimeout(_ensureNWBannerVisible, 250);
+      setTimeout(_ensureNWBannerVisible, 600);
+      try {
+        banner.style.transition = 'box-shadow 0.45s ease-out';
+        banner.style.boxShadow = '0 0 24px 6px rgba(251, 146, 60, 0.65)';
+        setTimeout(function() { try { banner.style.boxShadow = '0 0 0 0 transparent'; } catch (e) {} }, 700);
+      } catch (e) {}
     }
-    setTimeout(_ensureNWBannerVisible, 50);
-    setTimeout(_ensureNWBannerVisible, 250);
-    setTimeout(_ensureNWBannerVisible, 600);
-    try {
-      banner.style.transition = 'box-shadow 0.45s ease-out';
-      banner.style.boxShadow = '0 0 24px 6px rgba(251, 146, 60, 0.65)';
-      setTimeout(function() { try { banner.style.boxShadow = '0 0 0 0 transparent'; } catch (e) {} }, 700);
-    } catch (e) {}
 
     // Reminder log: tell the user a banner is up so they know to scroll
     // up if they're focused on the move list. Also include count of
-    // remaining pending issues so they know the workload.
-    if (typeof log === 'function') {
+    // remaining pending issues so they know the workload. Skipped on
+    // source-transition re-renders (the banner is already on screen, the
+    // user knows it's there).
+    if (!isSourceTransition && typeof log === 'function') {
       var pendingCount = (state.alignmentPendingIssues || []).length;
       var remaining = Math.max(0, pendingCount - 1);
       var moveLabel = (typeof atMoveNum === 'number') ? ('move ' + atMoveNum) : 'top of game';
@@ -2604,6 +3545,9 @@
         : '';
       log('🧭 Alignment suggestion shown for ' + moveLabel +
           ' — scroll up to see it' + tail + '.');
+    } else if (isSourceTransition && typeof log === 'function') {
+      log('🧭 Alignment banner re-scored: ' + (sug.cleanFenSrc || '?') +
+          ' (reconstruction advanced; legality + piece-presence now scoreable).');
     }
   }
 
@@ -2800,6 +3744,20 @@
   }
 
   function evaluateAtPointAlignment() {
+    // GATE 0 — when the NW cascade pipeline is loaded, banner ownership
+    // belongs to _runNWAlignmentCheck. The OLD pipeline's at-point evaluator
+    // would otherwise wipe a freshly-shown NW banner: navigation.js falls
+    // through to this function when a banner is already up (its primary
+    // path skips the heavy runStructuralChecks in that case), and validation.js
+    // also calls it after every revalidate. Both paths reach line 2825's
+    // `!analysis` branch — state.alignmentAnalysis is never populated under
+    // NW — and clear the banner. Symptom: banner flashes for 3-5s while
+    // backtrack search runs, then disappears the moment mergeBacktrackFixes
+    // auto-selects its first fix (selectFix → goToPly → this fallback).
+    if (window.SheetNWAlignment &&
+        typeof window.SheetNWAlignment.detectNextAlignmentIssue === 'function') {
+      return;
+    }
     // GATE 1 — noise review must be resolved before any alignment work.
     // Two complementary checks:
     //   (a) state.pendingNoiseReview is the existing suspicious-tail review
@@ -2919,6 +3877,47 @@
     if (hasActiveStructuralBanner()) return;
     if (typeof launchBackgroundSearches !== 'function') return;
     if (state.stuckPly === undefined || state.stuckPly === null) return;
+    // Noise truncation must be resolved before any reconstruction work.
+    // The yellow noise-review panel is up (pendingNoiseReview), OR the
+    // merged-moves noise detectors flag trailing noise that the user
+    // hasn't dismissed — in either case Greedy/Beam/Dijkstra would run on
+    // half-resolved input. Mirrors the gate at the top of
+    // _runNWAlignmentCheck so neither alignment nor reconstruction
+    // surfaces before truncation is confirmed.
+    if (state.pendingNoiseReview) return;
+    if (window.NoiseDetection &&
+        typeof window.NoiseDetection.isTailNoisy === 'function' &&
+        state.moves && !state.noiseBannerDismissed &&
+        window.NoiseDetection.isTailNoisy(state.moves)) {
+      // Position-aware: same logic as _runNWAlignmentCheck's noise gate.
+      // If the stuck point is well upstream of the noise tail, the
+      // reconstruction work is independent of the trailing junk and we
+      // should let Greedy/Beam/Dijkstra run. See NOISE_PROXIMITY_BUFFER
+      // there for the rationale.
+      var RECON_NOISE_PROXIMITY_BUFFER = 6;
+      var reconNoiseStart = (typeof window.NoiseDetection.tailNoiseStartPly === 'function')
+        ? window.NoiseDetection.tailNoiseStartPly(state.moves)
+        : null;
+      var reconCur = (typeof state.currentPly === 'number') ? state.currentPly : -1;
+      var reconEff = Math.max(state.stuckPly, reconCur);
+      var reconFar = (reconNoiseStart !== null &&
+                      reconEff >= 0 &&
+                      reconNoiseStart > reconEff + RECON_NOISE_PROXIMITY_BUFFER);
+      if (!reconFar) {
+        if (typeof log === 'function') {
+          var posTagR = (reconNoiseStart !== null)
+            ? ' (noise@ply ' + reconNoiseStart + ', stuck@ply ' + state.stuckPly + ')'
+            : '';
+          log('⏸️ Reconstruction launch deferred: trailing noise detected — resolve via noise-review first.' + posTagR);
+        }
+        return;
+      }
+      if (typeof log === 'function') {
+        log('▶️ Reconstruction launch allowed past noise gate: noise tail at ply ' +
+            reconNoiseStart + ' is far downstream of stuck@ply ' + state.stuckPly +
+            ' (buffer=' + RECON_NOISE_PROXIMITY_BUFFER + ').');
+      }
+    }
     // Don't relaunch while the user is reviewing an algorithm's result.
     // goToPly (called by _focusFix on every Confirm → next fix) triggers
     // runStructuralChecks, which used to cascade into a full greedy+beam+

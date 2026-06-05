@@ -3,6 +3,86 @@
 // =============================================================================
 // Pure client-side using Pyodide. NO FLASK FALLBACK.
 
+// A move whose top OCR confidence is below this floor is treated as a
+// forced-stop ply: validate_moves stops there for mandatory user review, the
+// same mechanism as a dual-sheet near-tie disagreement. This catches the
+// "very low probability" single readings that today only get a red % badge and
+// otherwise play straight through if legal. Exposed on window so the move-list
+// renderer (ui.js forcedStopInd) shows the 🔍 badge at the same threshold.
+// TUNABLE: raise to review more aggressively, lower to reduce stops. Kept
+// below the 0.7 red-confidence band so only weak reads force a stop. Set to
+// 0.50 (Jun 2026) so coin-flip reads like 7.B f5 @43% force a review.
+var FORCED_STOP_MIN_CONFIDENCE = 0.50;
+if (typeof window !== 'undefined') window.FORCED_STOP_MIN_CONFIDENCE = FORCED_STOP_MIN_CONFIDENCE;
+
+// Ply indices flagged as dual-sheet ambiguous (near-tie disagreement). Single
+// source for the forced-stop readers (validate builders + the 🔍 badge).
+//
+// DERIVED FROM state.ocrCells (the merged cells' own _ambiguous flag) on every
+// call — NOT from the state.ambiguousPlies cache. ocrCells is the merged
+// ground truth kept fresh in every path: interactive merge, batch fresh load +
+// restore, re-merge after edits, and single-move splice+renumber (the flag
+// travels with each cell object). It's the same array the tier dots read, so
+// this is correct wherever the dots are. The state.ambiguousPlies index set is
+// NOT reset on batch game load, so consulting it risked a stale carry-over from
+// a prior interactive game; deriving here sidesteps that entirely.
+// (state.ambiguousPlies is now a vestigial cache — left in place, not read.)
+function getAmbiguousPlies() {
+  var out = [];
+  if (Array.isArray(state.ocrCells)) {
+    // Plies the user has already RESOLVED (picked an alternative / kept / locked
+    // / overrode) are no longer ambiguous. Excluding them stops the re-flag
+    // ping-pong: without this, after the user picks c3 at an ambiguous 4.W the
+    // cell still carries _ambiguous, so validate re-stops there and the fix
+    // finder proposes the OTHER reading (Nc3) — visibly "undoing" the pick.
+    // Mirrors classifyTiers' currentMovesMap carve-out. Derived from the
+    // resolution arrays (reset on game load, so not stale like ambiguousPlies).
+    var resolved = {};
+    [state.approvedPlies, state.lockedPlies, state.fixedPlies].forEach(function(arr) {
+      if (Array.isArray(arr)) arr.forEach(function(p) { resolved[p] = true; });
+    });
+    state.ocrCells.forEach(function(c) {
+      if (!c || !c._ambiguous) return;
+      var ply = (c.num - 1) * 2 + (c.color === 'w' ? 0 : 1);
+      if (resolved[ply]) return;
+      // Also treat a fixed/locked MOVE STATUS as resolved: confirming a fix in
+      // review (_confirmCurrentFix) flips wStatus/bStatus to 'fixed' without
+      // always touching the arrays above, so the status is the robust signal
+      // that the user has settled this ply.
+      var mv = Array.isArray(state.moves) ? state.moves[c.num - 1] : null;
+      var st = mv ? (c.color === 'w' ? mv.wStatus : mv.bStatus) : null;
+      if (st === 'fixed' || st === 'locked') return;
+      out.push(ply);
+    });
+  }
+  return out;
+}
+if (typeof window !== 'undefined') window.getAmbiguousPlies = getAmbiguousPlies;
+
+// A locked/fixed ply preserves the user's chosen MOVE, but its stored SAN must
+// still be one the board renderer (chess.js v0.12.0, strict) can replay. OCR
+// routinely drops the capture 'x' (e.g. "Ra8" for a rook capture whose
+// canonical SAN is "Rxa8+") or the check '+'. python-chess accepts those
+// non-canonical forms; chess.js does NOT — so the raw text freezes the board
+// at that ply while the move list shows the move green ("board stuck, movelist
+// continues"). The validator returns the canonical SAN (board.san) for the
+// ply; adopt it for a locked/fixed ply ONLY when it is the SAME move written
+// canonically — i.e. the two SANs differ exclusively by capture 'x' and check
+// '+'/'#'/'!'/'?' marks. Any difference in piece, destination, promotion, or
+// disambiguation means a semantic correction (e.g. the lock-preserving
+// "keep Qd2, not Qe2" case, or Nbd7 vs Nfd7) and MUST be left to the lock.
+function _sanCore(san){
+  if(!san) return null;
+  var s=String(san).replace(/[+#?!]+$/,'').replace(/x/g,'');
+  if(s==='0-0') s='O-O'; else if(s==='0-0-0') s='O-O-O';
+  return s;
+}
+function _notationOnlyCanonicalization(raw, canon){
+  if(!canon||!raw||canon===raw) return false;
+  var rc=_sanCore(raw), cc=_sanCore(canon);
+  return rc!==null && rc===cc;
+}
+
 // Helper function to call validate API (Pyodide only - NO FLASK)
 async function callValidateAPI(flat, ocrData, autoFixSettings, approvedPlies, startPly = 0) {
   if (!window.zugwise || !window.zugwise.isReady) {
@@ -26,8 +106,47 @@ async function callFindFixesAPI(flat, stuckPly, confirmedPly, ocrData, autoFixSe
   return result;
 }
 
-async function validateAndDisplay(paired,filename){
+// Snapshot the batch gameId at function entry so a mid-call game switch
+// (user clicks a different game in the sidebar while we're awaiting
+// callValidateAPI) can be detected after the await. Returns null outside
+// batch mode (no guard) or the gameId to expect when the await resolves.
+// Callers MAY pass opts.expectedGameId to pin against a gameId captured
+// earlier (e.g. ocr.js's noise-review onContinue captures it at button
+// click time and forwards it through here).
+function _captureBatchGuard(opts) {
+  if (opts && opts.skipGameGuard) return null;
+  if (!window.BatchGameList || !window.BatchGameList.batchState ||
+      !window.BatchGameList.batchState.active) {
+    return null;
+  }
+  return (opts && opts.expectedGameId) ||
+         window.BatchGameList.batchState.currentGameId ||
+         null;
+}
+
+// True if the batch gameId has changed since _captureBatchGuard. Callers
+// use this after every await that yields to the event loop, BEFORE
+// mutating state.moves / state.sans / etc — those slots belong to whichever
+// game is active NOW, and overwriting them with the pre-switch game's
+// results corrupts the displayed game. Reported user symptom: "Both games
+// claim to have the same movelist" — B2's validateAndDisplay resolved
+// while user was on B4 and B4's state.moves got overwritten with B2's
+// validated paired list.
+function _batchGuardChanged(guardId) {
+  if (!guardId) return false;
+  if (!window.BatchGameList || !window.BatchGameList.batchState ||
+      !window.BatchGameList.batchState.active) {
+    return false;  // batch deactivated — don't strand the call
+  }
+  return window.BatchGameList.batchState.currentGameId !== guardId;
+}
+
+async function validateAndDisplay(paired,filename,opts){
+  var _batchGuard = _captureBatchGuard(opts);
   var flat=[];var ocrData=[];
+  // Dual-sheet forced-stop plies (merge flagged a near-tie disagreement). Stamp
+  // forced_stop per ply so validate_moves stops there for user resolution.
+  var _ambigPlies = getAmbiguousPlies();
   paired.forEach(function(m){
     if(m.white){
       flat.push(m.white);
@@ -35,7 +154,7 @@ async function validateAndDisplay(paired,filename){
       if(m.wAlts&&m.wAlts.length>0){m.wAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.wLenientAlts&&m.wLenientAlts.length>0){m.wLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts});
+      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
     }
     if(m.black){
       flat.push(m.black);
@@ -43,7 +162,7 @@ async function validateAndDisplay(paired,filename){
       if(m.bAlts&&m.bAlts.length>0){m.bAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.bLenientAlts&&m.bLenientAlts.length>0){m.bLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts});
+      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
     }
   });
   // Debug: count lenient alternatives in OCR data
@@ -61,9 +180,46 @@ async function validateAndDisplay(paired,filename){
   } else {
     state.lockedPlies=[]; // Reset locked plies for new game
   }
+  // Restore PGN-batch snapshot's lock/fix/confirm state if a snapshot just
+  // ran _loadGame. Without this, switching games and back loses every
+  // "keep-as-is" the user applied (the validator's auto-fix overrides them
+  // when it sees the illegal raw SAN like Qd2).
+  if (state._pendingPgnLockedPlies && state._pendingPgnLockedPlies.length > 0) {
+    state.lockedPlies = state._pendingPgnLockedPlies.slice();
+    state._pendingPgnLockedPlies = null;
+  }
+  if (state._pendingPgnFixedPlies && state._pendingPgnFixedPlies.length > 0) {
+    state.fixedPlies = state._pendingPgnFixedPlies.slice();
+    state._pendingPgnFixedPlies = null;
+  }
+  if (state._pendingPgnApprovedPlies && state._pendingPgnApprovedPlies.length > 0) {
+    state.approvedPlies = state._pendingPgnApprovedPlies.slice();
+    state._pendingPgnApprovedPlies = null;
+  }
+  if (typeof state._pendingPgnConfirmedPly === 'number') {
+    state.confirmedPly = state._pendingPgnConfirmedPly;
+    state._pendingPgnConfirmedPly = null;
+  }
 
   try{
-    var val=await callValidateAPI(flat, ocrData, getAutoFixSettings(), null);
+    // Pass approvedPlies into the validator so EAD checks (bad-trade,
+    // piece-hanging, persistent-absurdity) skip plies the user has
+    // signed off on. Without this, switching back to a game whose
+    // locked "bad trade" was previously accepted re-fires the warning
+    // banner because the initial-validate call was passing null.
+    var val=await callValidateAPI(flat, ocrData, getAutoFixSettings(),
+                                  state.approvedPlies || null);
+    // If the user switched games while we were awaiting Pyodide, bail out
+    // BEFORE clobbering state.moves/state.sans — those slots belong to a
+    // different game now. The new game's selectGame → processAllSheets path
+    // will run its own validate. See _batchGuardChanged docstring above.
+    if (_batchGuardChanged(_batchGuard)) {
+      log('🔇 validateAndDisplay aborted — game switched from ' + _batchGuard +
+          ' to ' + (window.BatchGameList && window.BatchGameList.batchState &&
+                    window.BatchGameList.batchState.currentGameId) +
+          ' mid-await; not mutating state');
+      return;
+    }
     state.moves=[];state.sans=[];var ply=0;
     // Debug: Log validation result including infer_error
     if(val.infer_error) console.log('DEBUG: infer_error =', val.infer_error);
@@ -86,14 +242,28 @@ async function validateAndDisplay(paired,filename){
     var currentPlyInLoop=0;
 
     paired.forEach(function(m){
-      // Use corrected SANs from validation response if available
+      // Use corrected SANs from validation response if available — but
+      // never override a user-confirmed 'locked'/'fixed' move on the input
+      // paired array (this fires for PGN-batch snapshot restore: the user
+      // pressed "keep Qd2 as-is" earlier, so Qd2 must survive even though
+      // the validator's auto-fix would correct it to Qe2).
       var wPly=currentPlyInLoop;
       var bPly=currentPlyInLoop+(m.white?1:0);
-      var wSan=correctedSans[wPly]||m.white;
-      var bSan=correctedSans[bPly]||m.black;
-      // Store originals and log auto-corrections
-      var wOrig=(m.white&&wSan!==m.white)?m.white:null;
-      var bOrig=(m.black&&bSan!==m.black)?m.black:null;
+      var wPreserve=(m.wStatus==='locked'||m.wStatus==='fixed');
+      var bPreserve=(m.bStatus==='locked'||m.bStatus==='fixed');
+      // Even a preserved (locked/fixed) ply adopts the validator's canonical SAN
+      // when it's the SAME move written canonically (raw "Ra8" → "Rxa8+").
+      // Otherwise the non-canonical text freezes the board renderer while the
+      // move list shows it green. Semantic differences are still preserved.
+      var wNotationOnly=wPreserve&&_notationOnlyCanonicalization(m.white,correctedSans[wPly]);
+      var bNotationOnly=bPreserve&&_notationOnlyCanonicalization(m.black,correctedSans[bPly]);
+      var wSan=wPreserve?(wNotationOnly?correctedSans[wPly]:m.white):(correctedSans[wPly]||m.white);
+      var bSan=bPreserve?(bNotationOnly?correctedSans[bPly]:m.black):(correctedSans[bPly]||m.black);
+      // Store originals and log auto-corrections. A notation-only
+      // canonicalization of a locked/fixed move is not a user-visible
+      // correction (same move) — don't flash it or set wOriginal.
+      var wOrig=(m.white&&wSan!==m.white&&!wNotationOnly)?m.white:null;
+      var bOrig=(m.black&&bSan!==m.black&&!bNotationOnly)?m.black:null;
       // Check if OCR alternative was applied
       var wOcrAlt=ocrAltInfo[wPly];
       var bOcrAlt=ocrAltInfo[bPly];
@@ -116,11 +286,50 @@ async function validateAndDisplay(paired,filename){
           showAutoFixFlash(bOrig,bSan);
         }
       }
-      var entry={num:m.num,white:wSan,black:bSan,wConf:m.wConf,bConf:m.bConf,wAlts:m.wAlts,bAlts:m.bAlts,wStatus:'ok',bStatus:'ok',wOriginal:wOrig,bOriginal:bOrig,wOcrAlt:!!wOcrAlt,bOcrAlt:!!bOcrAlt};
-      if(m.white){if(val.stuck_at===currentPlyInLoop)entry.wStatus='error';else if(val.stuck_at!==null&&currentPlyInLoop>val.stuck_at)entry.wStatus='pending';else state.sans.push(wSan);currentPlyInLoop++;}
-      if(m.black){if(val.stuck_at===currentPlyInLoop)entry.bStatus='error';else if(val.stuck_at!==null&&currentPlyInLoop>val.stuck_at)entry.bStatus='pending';else if(entry.wStatus==='ok')state.sans.push(bSan);currentPlyInLoop++;}
+      // Preserve carried-over wOriginal/bOriginal for locked/fixed plies —
+      // the snapshot's original-OCR memory shouldn't be wiped on restore.
+      var carryWOriginal = wPreserve ? (m.wOriginal || null) : wOrig;
+      var carryBOriginal = bPreserve ? (m.bOriginal || null) : bOrig;
+      var entry={num:m.num,white:wSan,black:bSan,wConf:m.wConf,bConf:m.bConf,wAlts:m.wAlts,bAlts:m.bAlts,wStatus:wPreserve?m.wStatus:'ok',bStatus:bPreserve?m.bStatus:'ok',wOriginal:carryWOriginal,bOriginal:carryBOriginal,wOcrAlt:wPreserve?!!m.wOcrAlt:!!wOcrAlt,bOcrAlt:bPreserve?!!m.bOcrAlt:!!bOcrAlt};
+      // sans push + stuck_at status flip: don't override 'locked'/'fixed'
+      // status, just decide sans inclusion based on val.stuck_at like before.
+      if(m.white){
+        if(val.stuck_at===currentPlyInLoop){if(!wPreserve)entry.wStatus='error';}
+        else if(val.stuck_at!==null&&currentPlyInLoop>val.stuck_at){if(!wPreserve)entry.wStatus='pending';}
+        else state.sans.push(wSan);
+        currentPlyInLoop++;
+      }
+      if(m.black){
+        if(val.stuck_at===currentPlyInLoop){if(!bPreserve)entry.bStatus='error';}
+        else if(val.stuck_at!==null&&currentPlyInLoop>val.stuck_at){if(!bPreserve)entry.bStatus='pending';}
+        else if(entry.wStatus==='ok'||entry.wStatus==='locked'||entry.wStatus==='fixed') state.sans.push(bSan);
+        currentPlyInLoop++;
+      }
       state.moves.push(entry);
     });
+    // Reconstruct lockedPlies/fixedPlies from the preserved cell statuses.
+    // The loop above carries 'locked'/'fixed' wStatus/bStatus over from the
+    // input `paired` array (wPreserve/bPreserve), so the 🔒/✓ icons render —
+    // but state.lockedPlies was reset to [] above (only restored when a
+    // pending merge/PGN snapshot exists). Without this, a move shows 🔒 yet
+    // fetchFixes() passes an empty locked set, so live backtracking proposes
+    // changing a locked move (e.g. "12.W Ng5 → Ng1") — exactly what the
+    // search algorithms already refuse to do. Union (don't overwrite) so any
+    // merge tier-locks restored before the loop (which don't carry a 'locked'
+    // cell status) survive too.
+    var _lockedSet = new Set(state.lockedPlies || []);
+    var _fixedSet = new Set(state.fixedPlies || []);
+    state.moves.forEach(function(em, ei){
+      if(em.wStatus === 'locked') _lockedSet.add(ei*2);
+      else if(em.wStatus === 'fixed') _fixedSet.add(ei*2);
+      if(em.bStatus === 'locked') _lockedSet.add(ei*2+1);
+      else if(em.bStatus === 'fixed') _fixedSet.add(ei*2+1);
+    });
+    state.lockedPlies = Array.from(_lockedSet).sort(function(a,b){return a-b;});
+    state.fixedPlies = Array.from(_fixedSet).sort(function(a,b){return a-b;});
+    if(state.lockedPlies.length || state.fixedPlies.length){
+      log('🔒 Derived from statuses: locked_plies=['+state.lockedPlies.join(',')+'] fixed_plies=['+state.fixedPlies.join(',')+']');
+    }
     log('✓ Validated: '+state.sans.length+'/'+flat.length+' moves OK');
     // Store pending confirmation for display in fix panel (not modal)
     state.pendingConfirmation = val.pending_confirmation || null;
@@ -179,7 +388,44 @@ async function validateAndDisplay(paired,filename){
     if(state.stuckInfo){
       if(window.VerificationUI && typeof window.VerificationUI.scrollPanelsToTop === 'function') window.VerificationUI.scrollPanelsToTop();
       fetchFixes(); // Don't await - let it run while user sees the stuck position
+    } else {
+      // No stuck point on initial validation — game is already valid.
+      // The initial path historically didn't paint the green completion
+      // banner; only revalidate did. For PGN-batch game-switching we DO
+      // want it (otherwise switching back to a completed game leaves the
+      // previous game's stuck content visible).
+      var stuckDiv2=document.getElementById('stuck-info');
+      if(stuckDiv2) stuckDiv2.innerHTML='<span class="text-green-400">✓ All '+state.sans.length+' moves valid'+(val.is_checkmate?' — Checkmate!':'')+'</span>';
+      var fixDiv2=document.getElementById('fix-list');
+      if(fixDiv2) fixDiv2.innerHTML='<div class="text-green-400 text-sm p-4 text-center">'+(val.is_checkmate?'♔ Checkmate! Game complete!':'🎉 Game complete!')+'</div>';
+      try { if (typeof hideFixDetails === 'function') hideFixDetails(); } catch(_e){}
+      // Also refresh the Greedy/Beam/Dijkstra panels — otherwise switching
+      // back to a finished game leaves the prior session's content visible
+      // (e.g. "⏳ Queued for background Greedy" or a stale SOLVED list).
+      // Mirrors the revalidate-path call site below, addressing the same
+      // "previous game's stuck content visible" concern the comment above
+      // already flagged but only partially fixed.
+      if (typeof markPanelsGameComplete === 'function') {
+        try { markPanelsGameComplete(); } catch (_e) {}
+      }
     }
+
+    // Notify PGN-batch (if active) so the sidebar status icon stays in
+    // sync with this game's validation result. fromRevalidate=false here
+    // — this is the initial-validate path triggered by a game switch,
+    // not a user-applied fix.
+    try {
+      if (window.PgnBatch && window.PgnBatch.state && window.PgnBatch.state.active) {
+        window.PgnBatch.onCurrentGameValidated({
+          valid: val.stuck_at === null || val.stuck_at === undefined,
+          stuck_at: val.stuck_at,
+          stuck_reason: val.stuck_reason,
+          stuck_move: val.stuck_move,
+          is_checkmate: !!val.is_checkmate,
+          fromRevalidate: false
+        });
+      }
+    } catch(_e){}
 
   }catch(e){
     log('⚠ Validation error: '+e.message);
@@ -230,6 +476,13 @@ async function fetchFixes(){
     // Piece left hanging - legal move but suspicious
     var explanation=state.stuckInfo.explanation||'piece left hanging';
     stuckHtml='<div class="text-yellow-400">⚠️ '+lbl+' '+state.stuckInfo.move+' <span class="text-yellow-300/70 text-xs">— leaves piece hanging</span></div>'+
+      '<div class="text-xs text-gray-400 mt-1">'+explanation+'</div>';
+  }else if(reason==='ambiguous'){
+    // Forced stop: dual-sheet near-tie disagreement or very-low-confidence
+    // read. The move is LEGAL — we stopped so the user picks among the
+    // candidates below. Must NOT fall into the "is illegal" default.
+    var explanation=state.stuckInfo.explanation||'the two sheets disagree or this reading is low-confidence — choose the correct move below';
+    stuckHtml='<div class="text-amber-400">🔍 '+lbl+' '+state.stuckInfo.move+' <span class="text-amber-300/70 text-xs">— needs review</span></div>'+
       '<div class="text-xs text-gray-400 mt-1">'+explanation+'</div>';
   }else{
     // Default: illegal move - show explanation if available
@@ -302,8 +555,28 @@ async function fetchFixes(){
   // Use confirmedPly as soft boundary - backend will expand backward if no good fixes found
   // fixedPlies prevents undoing fixes the user just applied
   var searchMinPly = state.confirmedPly || 0;
-  var fixedPliesArray = state.fixedPlies || [];
-  var lockedPliesArray = state.lockedPlies || [];
+  // Derive locked/fixed sets from the move-cell statuses (the 🔒/✓ the user
+  // actually sees) and union them with state.lockedPlies/fixedPlies. This is
+  // the single chokepoint where the live backtracking is launched, so it
+  // enforces the invariant regardless of which path populated state: if a
+  // cell shows 🔒, ply gets locked here and the search can never propose
+  // changing it (e.g. "12.W Ng5 → Ng1"). The search algorithms already do
+  // this by recomputing locks fresh; the live path used to trust a
+  // state.lockedPlies that some reload/restore paths leave out of sync with
+  // the visible 'locked' status.
+  var _lk = new Set(state.lockedPlies || []);
+  var _fx = new Set(state.fixedPlies || []);
+  (state.moves || []).forEach(function(em, ei){
+    if(em.wStatus === 'locked') _lk.add(ei*2);
+    else if(em.wStatus === 'fixed') _fx.add(ei*2);
+    if(em.bStatus === 'locked') _lk.add(ei*2+1);
+    else if(em.bStatus === 'fixed') _fx.add(ei*2+1);
+  });
+  var fixedPliesArray = Array.from(_fx).sort(function(a,b){return a-b;});
+  var lockedPliesArray = Array.from(_lk).sort(function(a,b){return a-b;});
+  // Keep state in sync so downstream consumers see the reconciled sets.
+  state.lockedPlies = lockedPliesArray.slice();
+  state.fixedPlies = fixedPliesArray.slice();
   var isDualSheet = state.inputMode === 'dual-sheets';
   log('🔍 Finding fix suggestions (searchGen='+thisSearchGeneration+'):'+(isDualSheet ? ' [DUAL-SHEET MODE]' : ''));
   log('   stuck_ply='+state.stuckPly+' ('+Math.floor(state.stuckPly/2+1)+'.'+(state.stuckPly%2===0?'W':'B')+')');
@@ -313,6 +586,7 @@ async function fetchFixes(){
   log('   approvedPlies=['+(state.approvedPlies||[]).join(',')+']');
   try{
     var flat=[];var ocrData=[];
+    var _ambigPlies = getAmbiguousPlies();
     state.moves.forEach(function(m){
       if(m.white){
         flat.push(m.white);
@@ -323,7 +597,7 @@ async function fetchFixes(){
         }
         var lenientAlts=[];
         if(m.wLenientAlts&&m.wLenientAlts.length>0){m.wLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-        ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts});
+        ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
       }
       if(m.black){
         flat.push(m.black);
@@ -333,7 +607,7 @@ async function fetchFixes(){
         }
         var lenientAlts=[];
         if(m.bLenientAlts&&m.bLenientAlts.length>0){m.bLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-        ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts});
+        ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
       }
     });
 
@@ -563,8 +837,24 @@ async function fetchFixes(){
   }
 }
 
-async function revalidate(){
+// Drop a ply from every protected set (fixed / locked / approved). Called when
+// revalidate() finds the backend stuck on a move the user had previously
+// confirmed — the confirmation is invalid now (an upstream edit changed the
+// board), so the ply must become searchable again. Without this, fetchFixes()
+// re-derives the protected sets and unions in state.fixedPlies/lockedPlies,
+// re-locking the very ply we need deep search to repair (e.g. 21.W Bf4→Qf4).
+function _unconfirmPlyForRevalidate(ply){
+  [state.fixedPlies, state.lockedPlies, state.approvedPlies].forEach(function(arr){
+    if(!arr) return;
+    var k = arr.indexOf(ply);
+    if(k !== -1) arr.splice(k, 1);
+  });
+}
+
+async function revalidate(opts){
+  var _batchGuard = _captureBatchGuard(opts);
   var flat=[];var ocrData=[];
+  var _ambigPlies = getAmbiguousPlies();
   state.moves.forEach(function(m){
     if(m.white){
       flat.push(m.white);
@@ -572,7 +862,7 @@ async function revalidate(){
       if(m.wAlts&&m.wAlts.length>0){m.wAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.wLenientAlts&&m.wLenientAlts.length>0){m.wLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts});
+      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
     }
     if(m.black){
       flat.push(m.black);
@@ -580,7 +870,7 @@ async function revalidate(){
       if(m.bAlts&&m.bAlts.length>0){m.bAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.bLenientAlts&&m.bLenientAlts.length>0){m.bLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts});
+      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
     }
   });
   // Pass confirmedPly as startPly to skip re-checking already-confirmed moves
@@ -603,6 +893,17 @@ async function revalidate(){
   }
   log('🔄 Revalidating '+flat.length+' moves (starting EAD from ply '+startPly+')...');
   try{var val=await callValidateAPI(flat, ocrData, settings, state.approvedPlies||[], startPly);
+    // If the user switched games during the Pyodide await, bail BEFORE
+    // mutating state. The new game has its own state.moves now — overwriting
+    // it with this game's revalidation would corrupt the display until the
+    // next user action triggers another revalidate / re-bind.
+    if (_batchGuardChanged(_batchGuard)) {
+      log('🔇 revalidate aborted — game switched from ' + _batchGuard +
+          ' to ' + (window.BatchGameList && window.BatchGameList.batchState &&
+                    window.BatchGameList.batchState.currentGameId) +
+          ' mid-await; not mutating state');
+      return;
+    }
     // Store pending confirmation for display in fix panel (not modal)
     state.pendingConfirmation = val.pending_confirmation || null;
     // Build lookup from ply to corrected SAN and OCR alt info
@@ -628,6 +929,11 @@ async function revalidate(){
           log('Quick fix '+m.num+'.W: '+origW+' -> '+m.white);
           showAutoFixFlash(origW,m.white);
         }
+      }else if(m.white&&(m.wStatus==='fixed'||m.wStatus==='locked')&&_notationOnlyCanonicalization(m.white,correctedSans[ply])){
+        // Locked/fixed ply: adopt the canonical SAN for the SAME move so the
+        // board can replay it (raw "Ra8" → "Rxa8+"). No flash / ⚡ — the move is
+        // unchanged, only its notation is normalized for chess.js.
+        m.white=correctedSans[ply];
       }
       if(m.black&&correctedSans[ply+(m.white?1:0)]&&correctedSans[ply+(m.white?1:0)]!==m.black&&m.bStatus!=='fixed'&&m.bStatus!=='locked'){
         if(!m.bOriginal)m.bOriginal=m.black;
@@ -640,11 +946,23 @@ async function revalidate(){
           log('Quick fix '+m.num+'.B: '+origB+' -> '+m.black);
           showAutoFixFlash(origB,m.black);
         }
+      }else if(m.black&&(m.bStatus==='fixed'||m.bStatus==='locked')&&_notationOnlyCanonicalization(m.black,correctedSans[ply+(m.white?1:0)])){
+        // Locked/fixed ply: adopt the canonical SAN for the SAME move (raw
+        // "Ra8" → "Rxa8+") so the board can replay it. No flash / ⚡.
+        m.black=correctedSans[ply+(m.white?1:0)];
       }
       if(m.white){
-        if(m.wStatus!=='fixed'&&m.wStatus!=='locked'){
-          if(val.stuck_at===ply) m.wStatus='error';
-          else if(val.stuck_at!==null&&ply>val.stuck_at){
+        if(val.stuck_at===ply){
+          // Backend halted HERE. Reality overrides a stale 'fixed'/'locked'
+          // tag: an upstream edit (e.g. 20.W Bd2→Qd2) can make a move the
+          // user confirmed earlier (21.W Bf4) illegal. Surface it as the
+          // error instead of leaving a green ✓ on a move the board cannot
+          // play, and un-protect the ply so deep search can actually propose
+          // a replacement (it would otherwise be skipped as fixed/locked).
+          m.wStatus='error';
+          _unconfirmPlyForRevalidate(ply);
+        } else if(m.wStatus!=='fixed'&&m.wStatus!=='locked'){
+          if(val.stuck_at!==null&&ply>val.stuck_at){
             m.wStatus='pending';
             // Past-stuck revert: when the game is stuck earlier, the board
             // state at this ply is no longer reachable, so any silent auto-
@@ -658,19 +976,27 @@ async function revalidate(){
           }
           else m.wStatus='ok';
         }
-        if(m.wStatus==='ok'||m.wStatus==='fixed'||m.wStatus==='locked')state.sans.push(m.white);
+        // Only feed moves up to the stuck point into state.sans. A
+        // fixed/locked move PAST the stuck point would otherwise leak in and
+        // the board replay would diverge from the movelist — the reported
+        // "board stuck, movelist continues" symptom.
+        var wPastStuck=(val.stuck_at!==null&&ply>val.stuck_at);
+        if(!wPastStuck&&(m.wStatus==='ok'||m.wStatus==='fixed'||m.wStatus==='locked'))state.sans.push(m.white);
         ply++;
       }
       if(m.black){
-        if(m.bStatus!=='fixed'&&m.bStatus!=='locked'){
-          if(val.stuck_at===ply) m.bStatus='error';
-          else if(val.stuck_at!==null&&ply>val.stuck_at){
+        if(val.stuck_at===ply){
+          m.bStatus='error';
+          _unconfirmPlyForRevalidate(ply);
+        } else if(m.bStatus!=='fixed'&&m.bStatus!=='locked'){
+          if(val.stuck_at!==null&&ply>val.stuck_at){
             m.bStatus='pending';
             if(m.bOriginal){m.black=m.bOriginal;m.bOriginal=null;m.bOcrAlt=false;}
           }
           else m.bStatus='ok';
         }
-        if((m.wStatus==='ok'||m.wStatus==='fixed'||m.wStatus==='locked')&&(m.bStatus==='ok'||m.bStatus==='fixed'||m.bStatus==='locked'))state.sans.push(m.black);
+        var bPastStuck=(val.stuck_at!==null&&ply>val.stuck_at);
+        if(!bPastStuck&&(m.wStatus==='ok'||m.wStatus==='fixed'||m.wStatus==='locked')&&(m.bStatus==='ok'||m.bStatus==='fixed'||m.bStatus==='locked'))state.sans.push(m.black);
         ply++;
       }
     });
@@ -696,6 +1022,23 @@ async function revalidate(){
       state.stuckInfo=null;
       state.errorArrow=null;
       state.savedErrorArrow=null;
+      // Game completed — drop the residual fix-suggestion state that was
+      // built for the previous stuck point. Without this, the right panel
+      // keeps showing the last selectedFix's score breakdown ("10.W
+      // Qd2→Qe2 | score=209 ...") and the legal-moves list from the
+      // previous stuck ply ("All legal moves at 22.W (41)") alongside the
+      // green "Game complete!" banner.
+      state.selectedFix = null;
+      state.legalMoves = [];
+      state.fixArrow = null;
+      state.ocrArrow = null;
+      try { if (typeof hideFixDetails === 'function') hideFixDetails(); } catch(e){}
+      var _lc = document.getElementById('legal-moves');
+      if (_lc) _lc.innerHTML = '';
+      var _lcCount = document.getElementById('legal-count');
+      if (_lcCount) _lcCount.textContent = '0';
+      var _lcPos = document.getElementById('legal-position');
+      if (_lcPos) _lcPos.textContent = '';
       // Invalidate any in-flight deep searches AND cancel any background
       // search workers (greedy / beam / dijkstra) — game is solved, no
       // reason to keep CPU spinning on it.
@@ -740,6 +1083,22 @@ async function revalidate(){
         try { markPanelsGameComplete(); } catch (e) {}
       }
     }
+    // Notify PGN-batch (if active) so the sidebar status icon stays in
+    // sync with this game's validation result. Mirrors the hook in the
+    // initial-validate path so applying a fix that makes the game valid
+    // flips the sidebar row from 🟡 to ✅ immediately.
+    try {
+      if (window.PgnBatch && window.PgnBatch.state && window.PgnBatch.state.active) {
+        window.PgnBatch.onCurrentGameValidated({
+          valid: val.stuck_at === null || val.stuck_at === undefined,
+          stuck_at: val.stuck_at,
+          stuck_reason: val.stuck_reason,
+          stuck_move: val.stuck_move,
+          is_checkmate: !!val.is_checkmate,
+          fromRevalidate: true  // distinguishes user-fix-triggered revalidate from initial validate
+        });
+      }
+    } catch(_e){}
     // At-point alignment trigger after every revalidation.
     if (window.SheetAlignment) window.SheetAlignment.evaluateAtPointAlignment();
   }catch(e){log('⚠ Revalidation error: '+e.message);}

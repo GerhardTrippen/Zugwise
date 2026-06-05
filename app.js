@@ -110,6 +110,7 @@ var PYODIDE_STAGES={
   'Installing python-chess...':50,
   'Loading ONNX model...':70,
   'Loading Python modules...':90,
+  'Loading OCR workers...':95,
   'Ready!':100
 };
 
@@ -227,18 +228,35 @@ function setupEventListeners(){
   document.getElementById('btn-apply').onclick=applyFix;
   document.getElementById('btn-download').onclick=downloadPGN;
   document.getElementById('btn-lichess').onclick=openLichess;
-  document.getElementById('btn-change-input').onclick=function(){
+  // Shared handler for both Change buttons (collapsed view header + the
+  // expanded view's Upload Scoresheets header). Same full-reset semantics —
+  // gives the user one escape hatch even when they're partway through an
+  // upload, since Clear only nulls the sheet slots and leaves state, OCR,
+  // batch, and search panels in place. Exposed on window because the
+  // expanded copy lives inside sheets.js's render output and gets re-bound
+  // there on every refreshSheetsUI call (the DOM node is recreated each time).
+  window.handleChangeInput = function handleChangeInput() {
     var batchActive = !!(window.BatchGameList && window.BatchGameList.batchState && window.BatchGameList.batchState.active);
+    var pgnBatchActive = !!(window.PgnBatch && window.PgnBatch.state && window.PgnBatch.state.active);
     var gameLoaded = Array.isArray(state.moves) && state.moves.length > 0;
-    if (batchActive || gameLoaded) {
+    var hasSheets = typeof sheetsState !== 'undefined' && sheetsState && (
+      (sheetsState.player1 || []).some(function(s){ return s; }) ||
+      (sheetsState.player2 || []).some(function(s){ return s; })
+    );
+    if (batchActive || pgnBatchActive || gameLoaded || hasSheets) {
       var msg = batchActive
         ? 'Discard the current batch round? All OCR results, reconstructions, and per-game progress will be lost.'
-        : 'Discard the current game? Your fixes and OCR will be lost.';
+        : (pgnBatchActive
+            ? 'Discard the current PGN batch? All games, applied fixes, and Greedy results will be lost.'
+            : (gameLoaded
+                ? 'Discard the current game? Your fixes and OCR will be lost.'
+                : 'Discard the uploaded sheets and start fresh?'));
       if (!window.confirm(msg)) return;
     }
     resetGameState();
     toggleInputArea(false);
   };
+  document.getElementById('btn-change-input').onclick = window.handleChangeInput;
   document.getElementById('btn-download-ocr').onclick=downloadOCRText;
   document.getElementById('btn-download-ocr-sheet1').onclick=function(){downloadOCRTextForSheet(1);};
   document.getElementById('btn-download-ocr-sheet2').onclick=function(){downloadOCRTextForSheet(2);};
@@ -372,6 +390,16 @@ function resetGameState(){
   try { if (typeof cancelSearch === 'function') cancelSearch(); } catch(e){}
   try { if (typeof resetSearchPanels === 'function') resetSearchPanels(); } catch(e){}
 
+  // Invalidate any inflight per-ply backtrack search launched for the
+  // outgoing game. validation.js/fetchFixes captures searchGeneration at
+  // entry and bails on mismatch — without bumping here, a fetchFixes that
+  // was awaiting computeQuickFixes when the user clicked Change resumes
+  // afterward, calls renderQuickFixes(state.quickFixes) with the prior
+  // game's data, and the auto-select of the first quick fix (fixes.js:1977)
+  // re-paints the green/yellow arrows AND restores the red arrow from the
+  // still-stale state.savedErrorArrow. Mirrors the bump in selectGame.
+  state.searchGeneration = (state.searchGeneration || 0) + 1;
+
   // Reset core game state
   state.moves=[];
   state.sans=[];
@@ -384,6 +412,11 @@ function resetGameState(){
   state.errorArrow=null;
   state.fixArrow=null;
   state.ocrArrow=null;
+  // Clear the persistent red-arrow memory used by selectFix (fixes.js:520)
+  // — otherwise a late selectFix call after reset would restore the prior
+  // game's stuck-move arrow even though state.errorArrow itself was cleared.
+  state.savedErrorArrow=null;
+  state.quickFixes=[];
   state.missingMoveCandidates=[];
   state.confirmedPly=0;
   state.fixedPlies=[];
@@ -429,6 +462,12 @@ function resetGameState(){
   if(ocrCtx) ocrCtx.classList.add('hidden');
   var loadedInfo=document.getElementById('loaded-info');
   if(loadedInfo) loadedInfo.textContent='';
+  // Remove the dual-sheet tier-summary banner (🟢/🟡/🔴 + Lock radios). It
+  // lives inside #input-collapsed and is only (re)created by mergePlayerMoves
+  // — switching to a single-sheet game (or just clearing) leaves it stranded.
+  // Mirrors the batch-mode game-switch cleanup in batch-game-list.js.
+  var tierBanner=document.getElementById('tier-summary-banner');
+  if(tierBanner) tierBanner.remove();
 
   // Reset apply button
   if (typeof resetApplyButton === 'function') resetApplyButton();
@@ -472,6 +511,49 @@ function resetGameState(){
     // early on !bs.active but only toggles the class on re-render).
     var glEl = document.getElementById('batch-game-list');
     if (glEl) glEl.classList.add('hidden');
+
+    // The round dropdown was populated from the now-discarded allGames. Before
+    // this, the stale <option>s survived the reset, so the user could pick a
+    // round (e.g. switch round 4 → round 5) and selectRound would call
+    // filterGamesByRound(null, ...) → throw, aborting the onchange handler
+    // before it re-enabled Start. Result: "Start Batch OCR" stayed disabled
+    // with no recovery short of reloading the folder. Repaint the dropdown
+    // empty (availableRounds is [] now), collapse the selector, and reset the
+    // Start/Cancel/summary/export controls so the only path forward is loading
+    // a folder again — which re-shows and repopulates the selector cleanly.
+    var roundSelEl = document.getElementById('batch-round-select');
+    if (roundSelEl && typeof window.BatchGameList.renderRoundSelector === 'function') {
+      try { window.BatchGameList.renderRoundSelector(roundSelEl); } catch (e) {}
+      roundSelEl.value = '';
+    }
+    var sectionSelEl = document.getElementById('batch-section-select');
+    if (sectionSelEl) { sectionSelEl.innerHTML = ''; sectionSelEl.classList.add('hidden'); }
+    var roundSelectorDiv = document.getElementById('batch-round-selector');
+    if (roundSelectorDiv) roundSelectorDiv.classList.add('hidden');
+    var startBtn = document.getElementById('btn-batch-start');
+    if (startBtn) startBtn.disabled = true;
+    var cancelBtn = document.getElementById('btn-batch-cancel');
+    if (cancelBtn) cancelBtn.classList.add('hidden');
+    var summaryEl = document.getElementById('batch-summary');
+    if (summaryEl) summaryEl.classList.add('hidden');
+    ['btn-batch-export-round', 'btn-batch-export-csv', 'btn-batch-dashboard']
+      .forEach(function(id) {
+        var b = document.getElementById(id);
+        if (b) b.classList.add('hidden');
+      });
+    var folderStatusEl = document.getElementById('batch-folder-status');
+    if (folderStatusEl) folderStatusEl.textContent = '';
+  }
+
+  // Same cleanup for PGN-batch mode. Without this, clicking Change while a
+  // multi-game PGN was loaded left pgnBatchState.games + the rendered
+  // sidebar rows + the background algo queue alive, so the next interactive
+  // OCR session opened with a leftover PGN game list on the left rail and
+  // a still-active algo queue eating Pyodide cycles. PgnBatch.reset hides
+  // the sidebar container, restores the PGN-input disclosure to its
+  // single-game default ("Paste a PGN", open), and cancels the algo queue.
+  if (window.PgnBatch && typeof window.PgnBatch.reset === 'function') {
+    try { window.PgnBatch.reset(); } catch (e) {}
   }
 
   log('🔄 Reset — ready for new game');
@@ -493,7 +575,7 @@ function trimMovesAtCheckmate(moves){
   return out;
 }
 
-function downloadPGN(){var moves=trimMovesAtCheckmate(state.moves);var pgn='[Event "Zugwise"]\n[Result "*"]\n\n';moves.forEach(function(m,i){pgn+=m.num+'. '+m.white+' '+(m.black||'')+' ';if((i+1)%5===0)pgn+='\n';});pgn+='*';var blob=new Blob([pgn],{type:'text/plain'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='game.pgn';a.click();log('📥 Downloaded PGN');}
+function downloadPGN(){var moves=trimMovesAtCheckmate(state.moves);var pgn='[Event "Zugwise"]\n[Result "*"]\n[Source "Zugwise (gerhardtrippen.github.io/zugwise)"]\n\n';moves.forEach(function(m,i){pgn+=m.num+'. '+m.white+' '+(m.black||'')+' ';if((i+1)%5===0)pgn+='\n';});pgn+='*';var blob=new Blob([pgn],{type:'text/plain'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='game.pgn';a.click();log('📥 Downloaded PGN');}
 
 function openLichess(){var moves=trimMovesAtCheckmate(state.moves);var pgn=moves.map(function(m){return m.num+'. '+m.white+' '+(m.black||'');}).join(' ');window.open('https://lichess.org/paste?pgn='+encodeURIComponent(pgn),'_blank');log('🔗 Opened in Lichess');}
 
@@ -598,31 +680,68 @@ function initBatchHandlers() {
   }
 
   // --- Tournament file load helper (shared by manual upload + auto-detect) ---
-  async function _loadTournamentFile(file, opts) {
+  // Accepts either a single File or a FileList/array. When given multiple
+  // files, delegates to BatchTournament.parseTournamentFiles which dispatches
+  // each one to the per-round or crosstable parser and merges. The crosstable
+  // (when present) contributes ratings / federation / event metadata that
+  // the per-round XLS export does not carry.
+  async function _loadTournamentFile(fileOrFiles, opts) {
     opts = opts || {};
+    var files = (fileOrFiles && typeof fileOrFiles.length === 'number' &&
+                 typeof fileOrFiles[0] !== 'undefined')
+                 ? Array.from(fileOrFiles) : [fileOrFiles];
+    files = files.filter(Boolean);
+    if (files.length === 0) return null;
     var statusEl = document.getElementById('batch-tournament-status');
-    statusEl.textContent = 'Loading ' + file.name + '...';
+    var loadingLabel = (files.length === 1)
+      ? files[0].name
+      : (files.length + ' files (' + files.map(function(f) { return f.name; }).join(', ') + ')');
+    statusEl.textContent = 'Loading ' + loadingLabel + '...';
     statusEl.classList.remove('text-green-400', 'text-red-400');
     statusEl.classList.add('text-gray-500');
     try {
-      var data = await parseTournamentFile(file);
+      var data;
+      if (files.length > 1 &&
+          window.BatchTournament &&
+          typeof window.BatchTournament.parseTournamentFiles === 'function') {
+        data = await window.BatchTournament.parseTournamentFiles(files);
+      } else {
+        data = await parseTournamentFile(files[0]);
+      }
       var playerCount = Object.keys(data.players).length;
-      var roundCount = Object.keys(data.pairings).length;
+      // Pairing keys are section-qualified (OPEN_R1, U1800_R1, ...) when a
+      // tournament has multiple sections — naive Object.keys would report
+      // "15 rounds" for a 3-section × 5-round event. Count distinct round
+      // NUMBERS instead, and report the section count separately.
+      var roundNumbers = {};
+      Object.keys(data.pairings || {}).forEach(function(k) {
+        var m = k.match(/_R(\d+)$|^R(\d+)$/);
+        if (m) roundNumbers[parseInt(m[1] || m[2])] = true;
+      });
+      var roundCount = Object.keys(roundNumbers).length;
+      var sectionCount = (data.sections || []).length;
       // Auto-detected files (the ones without named sections / pairings) are
       // treated as "no match" so the manual status line is not overwritten
       // with a misleading empty-load success.
       if (roundCount === 0) {
-        throw new Error('no rounds parsed from ' + file.name);
+        throw new Error('no rounds parsed from ' + loadingLabel);
       }
       window._batchTournamentData = data;
-      var prefix = data.event ? data.event + ' — ' : (file.name + ' — ');
+      var eventType = window.BatchTournament &&
+                      typeof window.BatchTournament.detectEventType === 'function'
+                      ? window.BatchTournament.detectEventType(data) : null;
+      var prefix = data.event ? data.event + ' — ' : (loadingLabel + ' — ');
       var tag = opts.auto ? ' ⚙ auto-loaded from scan folder' : '';
+      var typeTag = eventType ? ' [' + eventType + ']' : '';
+      var sectionTag = sectionCount > 1
+        ? ' in ' + sectionCount + ' sections'
+        : '';
       statusEl.textContent = prefix + playerCount + ' players, ' +
-                             roundCount + ' round(s)' + tag;
+                             roundCount + ' round(s)' + sectionTag + typeTag + tag;
       statusEl.classList.remove('text-gray-500');
       statusEl.classList.add('text-green-400');
-      log((opts.auto ? 'Tournament file auto-loaded: ' : 'Tournament file loaded: ') +
-          file.name);
+      log((opts.auto ? 'Tournament file(s) auto-loaded: ' : 'Tournament file(s) loaded: ') +
+          loadingLabel);
       // Rewire pairings onto any games already in the list (happens when the
       // user re-selects a folder and a new tournament file appears alongside).
       if (window.BatchGameList && window.BatchGameList.batchState &&
@@ -652,54 +771,129 @@ function initBatchHandlers() {
     btnTournament.onclick = function() { tournamentInput.click(); };
     tournamentInput.onchange = function() {
       if (tournamentInput.files.length === 0) return;
-      _loadTournamentFile(tournamentInput.files[0], { auto: false });
+      // Pass the whole FileList — the helper auto-dispatches to the
+      // multi-file merger when more than one file was selected.
+      _loadTournamentFile(tournamentInput.files, { auto: false });
     };
   }
 
   // Tournament-file auto-detection. When the user selects a scan folder, look
-  // for an .xls/.xlsx/.sjson/.json at the top level and try to parse it. If it
-  // produces pairings, load it automatically so the user does not have to also
+  // for .xls/.xlsx/.sjson/.json at the top level and try to parse them. If they
+  // produce pairings, load them automatically so the user does not have to also
   // pick up the tournament file by hand when the TD dropped it into the same
   // folder as the scans.
-  function _rankTournamentCandidates(names) {
-    // Skip SwissManager crosstable exports (standings matrix, not pairings).
-    return names.filter(function(n) { return !/crosstable|tiebreak/i.test(n); })
-                .sort(function(a, b) {
-      function rank(n) {
-        if (/pairings.*results/i.test(n)) return 0;       // best: SwissManager P&R
-        if (/\.sjson$/i.test(n)) return 1;                 // SwissSys native
-        if (/\.json$/i.test(n)) return 2;                  // SwissSys variant
-        if (/\.xlsx?$/i.test(n)) return 3;                 // any other xls
-        return 4;
-      }
-      return rank(a) - rank(b);
+  //
+  // SwissSys: a single .sjson is authoritative — return that one file alone.
+  // SwissManager: pick up ALL related XLS exports (per-round pairings AND the
+  //   crosstable). The crosstable carries ratings / federation / event metadata
+  //   that the per-round files don't, so merging both produces strictly richer
+  //   tournament data than either source alone.
+  function _selectTournamentCandidates(names) {
+    // Classification regex applies to the filename only — a parent folder
+    // literally named "Crosstable" or "MyPairings" must not change how a
+    // file inside it is bucketed. The returned keys are still the original
+    // input strings (which may contain paths) so callers can look them up.
+    function base(n) { return n.split('/').pop(); }
+    // .grid.json is an OCR-pipeline sidecar, never a tournament file —
+    // reject up front in case a caller fed us a path the discovery
+    // filter missed (e.g. manual file picker).
+    names = names.filter(function(n) { return !/\.grid\.json$/i.test(base(n)); });
+    var sjson = names.filter(function(n) { return /\.(sjson|json)$/i.test(base(n)); });
+    if (sjson.length > 0) {
+      // Authoritative single-file format — return just the first one.
+      sjson.sort();
+      return [sjson[0]];
+    }
+    var xls = names.filter(function(n) { return /\.xlsx?$/i.test(base(n)); });
+    var perRound = xls.filter(function(n) {
+      var b = base(n);
+      return /round|pairing/i.test(b) && !/crosstable|tiebreak|standings|ranking/i.test(b);
     });
+    var crosstable = xls.filter(function(n) {
+      return /crosstable|tiebreak|standings|ranking|berger/i.test(base(n));
+    });
+    if (perRound.length > 0 || crosstable.length > 0) {
+      // Sort per-round files for stable ordering ("Round_1.xls" before
+      // "Round_2.xls"); crosstable order is irrelevant — there's usually one.
+      perRound.sort();
+      crosstable.sort();
+      return crosstable.concat(perRound);
+    }
+    if (xls.length > 0) {
+      // No filename hints matched — fall back to all XLS files; the parser's
+      // structural sniff will sort them out.
+      xls.sort();
+      return xls;
+    }
+    // chessmanager.com export family (CSV + PGN-headers). Lowest priority:
+    // only when no XLS / SJSON candidates exist, since a folder may also hold
+    // a Zugwise diagnostics CSV or a recorded-games PGN. Both are rejected by
+    // their parsers (CSV throws on a missing "Player No"/header; a games PGN
+    // throws on real movetext) and the auto-load path ignores the throw.
+    var family = names.filter(function(n) { return /\.(csv|pgn)$/i.test(base(n)); });
+    family.sort();
+    return family;
   }
-  async function _findTournamentFileInDir(dirHandle) {
-    var byName = {};
-    try {
-      for await (var entry of dirHandle.values()) {
-        if (entry.kind !== 'file') continue;
-        if (!/\.(xlsx?|sjson|json)$/i.test(entry.name)) continue;
-        byName[entry.name] = entry;
-      }
-    } catch (e) { return null; }
-    var ranked = _rankTournamentCandidates(Object.keys(byName));
-    if (ranked.length === 0) return null;
-    try { return await byName[ranked[0]].getFile(); } catch (e) { return null; }
+  // Tournament-file shape: .xls / .xlsx / .sjson / .json, but NOT scan-side
+  // sidecar JSON files written by the OCR pipeline (.grid.json, etc.).
+  // Without this filter, "Crown_R1_B1.grid.json" gets picked as a SwissSys
+  // SJSON candidate, the parser throws "Unrecognized JSON format", and the
+  // auto-load looks stuck on its "Loading ..." status line.
+  function _isTournamentFile(name) {
+    if (!/\.(xlsx?|sjson|json|csv|pgn)$/i.test(name)) return false;
+    if (/\.grid\.json$/i.test(name)) return false;   // OCR grid sidecar
+    return true;
   }
-  function _findTournamentFileInList(fileList) {
-    // Top-level files only: webkitRelativePath has exactly one '/'.
-    var topLevel = Array.from(fileList).filter(function(f) {
+  async function _findTournamentFilesInDir(dirHandle) {
+    // Walk the picker root AND each immediate subfolder one level deep.
+    // Two layouts in the wild:
+    //   Layout B: MCC_root/{XLS files}, MCC_root/OPEN/{scans}, ...
+    //   Layout A: MCC_root/OPEN/{XLS files + scans}, MCC_root/U1800/{...}
+    // Walking one extra level catches Layout A without descending into
+    // arbitrarily deep scan trees. Path-keyed dict prevents a filename
+    // collision between sibling subfolders (theoretical: two sections
+    // shipping XLS with the same bare filename).
+    var byPath = {};
+    async function walk(handle, prefix) {
+      try {
+        for await (var entry of handle.values()) {
+          var rel = prefix ? prefix + '/' + entry.name : entry.name;
+          if (entry.kind === 'file') {
+            if (_isTournamentFile(entry.name)) {
+              byPath[rel] = entry;
+            }
+          } else if (entry.kind === 'directory' && prefix === '') {
+            await walk(entry, entry.name);
+          }
+        }
+      } catch (e) { /* skip unreadable subtree */ }
+    }
+    await walk(dirHandle, '');
+    var selected = _selectTournamentCandidates(Object.keys(byPath));
+    var files = [];
+    for (var i = 0; i < selected.length; i++) {
+      try { files.push(await byPath[selected[i]].getFile()); }
+      catch (e) { /* skip unreadable entry */ }
+    }
+    return files;
+  }
+  function _findTournamentFilesInList(fileList) {
+    // Accept either the picker root (depth 2) or one-folder-deep section
+    // subfolders (depth 3). With <input webkitdirectory> the first segment
+    // is the chosen folder name, so "MCC_root/file.xls" has 2 segments and
+    // "MCC_root/OPEN/file.xls" has 3.
+    var candidates = Array.from(fileList).filter(function(f) {
       var rel = f.webkitRelativePath || f.name;
-      return (rel.split('/').length === 2) &&
-             /\.(xlsx?|sjson|json)$/i.test(f.name);
+      var depth = rel.split('/').length;
+      return depth >= 2 && depth <= 3 && _isTournamentFile(f.name);
     });
-    if (topLevel.length === 0) return null;
-    var nameToFile = {};
-    topLevel.forEach(function(f) { nameToFile[f.name] = f; });
-    var ranked = _rankTournamentCandidates(Object.keys(nameToFile));
-    return ranked.length ? nameToFile[ranked[0]] : null;
+    if (candidates.length === 0) return [];
+    var pathToFile = {};
+    candidates.forEach(function(f) {
+      pathToFile[f.webkitRelativePath || f.name] = f;
+    });
+    var selected = _selectTournamentCandidates(Object.keys(pathToFile));
+    return selected.map(function(n) { return pathToFile[n]; }).filter(Boolean);
   }
 
   // --- Step 2: Select folder (File System Access API — Chrome/Edge) ---
@@ -710,11 +904,15 @@ function initBatchHandlers() {
       try { await window.BatchFolderStore.saveHandle(dirHandle); } catch (e) { /* ignore */ }
     }
     _renderReuseLink(null);
-    // Auto-detect tournament file alongside the scans. Always try — a new
+    // Auto-detect tournament file(s) alongside the scans. Always try — a new
     // folder usually corresponds to a new tournament, so replacing a prior
-    // manually-selected file is the expected behaviour.
-    var autoFile = await _findTournamentFileInDir(dirHandle);
-    if (autoFile) _loadTournamentFile(autoFile, { auto: true });
+    // manually-selected file is the expected behaviour. For SwissManager
+    // tournaments this picks up both per-round pairings AND the crosstable
+    // when present, so ratings/federation/event-metadata come along.
+    var autoFiles = await _findTournamentFilesInDir(dirHandle);
+    if (autoFiles && autoFiles.length > 0) {
+      _loadTournamentFile(autoFiles, { auto: true });
+    }
   }
 
   btnFolder.onclick = async function() {
@@ -776,12 +974,29 @@ function initBatchHandlers() {
     if (fileInput.files.length === 0) return;
     var result = window.BatchGameList.initFromFiles(fileInput.files);
     onBatchFilesDiscovered(result);
-    // Auto-detect tournament file at the top level of the chosen directory.
-    var autoFile = _findTournamentFileInList(fileInput.files);
-    if (autoFile) _loadTournamentFile(autoFile, { auto: true });
+    // Auto-detect tournament file(s) at the top level of the chosen directory.
+    var autoFiles = _findTournamentFilesInList(fileInput.files);
+    if (autoFiles && autoFiles.length > 0) {
+      _loadTournamentFile(autoFiles, { auto: true });
+    }
   };
 
-  // --- Step 4: Round selection ---
+  // --- Step 4: Section + round selection ---
+  // Section is optional; only fired when the dropdown is visible (i.e.
+  // multi-section tournament). Picking a new section invalidates the
+  // current round selection — the round dropdown is re-rendered with
+  // only the rounds present in that section.
+  var sectionSelect = document.getElementById('batch-section-select');
+  if (sectionSelect) {
+    sectionSelect.onchange = function() {
+      window.BatchGameList.selectSection(sectionSelect.value || null);
+      window.BatchGameList.renderRoundSelector(roundSelect);
+      roundSelect.value = '';
+      btnStart.disabled = true;
+      var summary = document.getElementById('batch-summary');
+      if (summary) summary.classList.add('hidden');
+    };
+  }
   roundSelect.onchange = function() {
     var round = parseInt(roundSelect.value);
     if (isNaN(round)) {
@@ -792,7 +1007,9 @@ function initBatchHandlers() {
     btnStart.disabled = false;
     var summary = document.getElementById('batch-summary');
     var games = window.BatchGameList.batchState.games;
-    summary.textContent = games.size + ' game' + (games.size !== 1 ? 's' : '') +
+    var sec = window.BatchGameList.batchState.selectedSection;
+    var prefix = sec ? (sec + ' — ') : '';
+    summary.textContent = prefix + games.size + ' game' + (games.size !== 1 ? 's' : '') +
                           ' in Round ' + round;
     summary.classList.remove('hidden');
   };
@@ -835,34 +1052,42 @@ function initBatchHandlers() {
       if (!window.BatchExport) { log('BatchExport module not loaded'); return; }
       btnExportRound.disabled = true;
       try {
-        // Verified games go to the main round PGN — that's what the
-        // operator uploads to chess-results.com or similar.
-        var verifiedOut = await window.BatchExport.exportAndSaveRoundPgn(
-          undefined, { includeUnverified: false });
+        // All games go into one file: verified games with their actual result,
+        // non-verified games with result=* and a [Termination] tag, move list
+        // truncated to the confirmed prefix (stuckPly cutoff — never ships
+        // algorithm-staged moves the user hasn't reviewed).
+        var out = await window.BatchExport.exportAndSaveRoundCombinedPgn();
 
-        // Non-verified games (Greedy ran but the user hasn't reviewed,
-        // or only confirmed a prefix) go to a sibling _incomplete.pgn.
-        // Move list is truncated to the user's confirmed prefix so we
-        // never publish algorithm-staged moves as if they were valid.
-        // Result is `*` and a [Termination] tag flags the file as WIP.
-        // Reported case: B7 had Greedy proposals all the way through,
-        // none reviewed by the user, and the previous "include
-        // unverified" path shipped a PGN with repeated moves and
-        // physically impossible positions — better to mark it
-        // incomplete with zero moves than to publish nonsense.
-        var incompleteOut = await window.BatchExport.exportAndSaveRoundIncompletePgn(
-          undefined, {});
+        if (out.count === 0) {
+          log('No games in this round to export');
+        } else {
+          var where = (out.savedTo === 'folder') ? 'saved to scan folder' : 'downloaded';
+          var detail = '';
+          if (out.verifiedCount > 0 && out.incompleteCount > 0) {
+            detail = out.verifiedCount + ' verified, ' + out.incompleteCount + ' incomplete (result=*)';
+          } else if (out.verifiedCount > 0) {
+            detail = out.verifiedCount + ' verified game(s)';
+          } else {
+            detail = out.incompleteCount + ' game(s), none verified yet (result=*)';
+          }
+          log('✅ ' + out.filename + ' ' + where + ' — ' + detail);
 
-        if (verifiedOut.count === 0 && incompleteOut.count === 0) {
-          log('No games to export in this round yet');
-        }
-        if (verifiedOut.count > 0) {
-          log('Exported ' + verifiedOut.count + ' verified game(s) to ' +
-              verifiedOut.filename + ' (' + verifiedOut.savedTo + ')');
-        }
-        if (incompleteOut.count > 0) {
-          log('Exported ' + incompleteOut.count + ' incomplete game(s) to ' +
-              incompleteOut.filename + ' (' + incompleteOut.savedTo + ')');
+          // Flash the button green for 3 seconds so the save is unmissable.
+          function _flashSaved(btn, origHtml, greenCls, removeCls) {
+            if (!btn) return;
+            btn.innerHTML = '✓ Saved!';
+            btn.classList.add(greenCls);
+            btn.classList.remove(removeCls);
+            setTimeout(function() {
+              btn.innerHTML = origHtml;
+              btn.classList.remove(greenCls);
+              btn.classList.add(removeCls);
+            }, 3000);
+          }
+          _flashSaved(btnExportRound,
+                      'Export Round PGN', 'bg-green-600', 'bg-indigo-600');
+          _flashSaved(document.getElementById('btn-batch-export-round-list'),
+                      '&#128229; Round PGN', 'bg-green-700', 'bg-indigo-700');
         }
       } catch (e) {
         log('Export failed: ' + (e && e.message ? e.message : e));
@@ -1004,14 +1229,52 @@ function parseSwissSysSJSON(data) {
   return tournament;
 }
 
+// Inline fallback used only when js/batch-tournament.js failed to load. It
+// mirrors the module's header-driven layout detection so the fallback
+// produces the same per-pairing output for SwissManager export profiles that
+// vary in column count (no Bo., with Bo., with/without Pts, with/without
+// title, with/without Rtg). Kept in one function — the inline fallback does
+// not need crosstable / multi-file support.
 function parseSwissManagerXLS(buffer) {
   var workbook = XLSX.read(buffer, { type: 'array' });
   var sheet = workbook.Sheets[workbook.SheetNames[0]];
   var rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
 
   var tournament = { event: '', site: '', players: {}, pairings: {} };
-  var TITLE_CODES = ['GM','IM','WGM','FM','WIM','CM','WFM','WCM','NM','ACM','AFM','AGM'];
-  var currentRound = null, currentDate = '', boardCounter = 0, hasTitle = false;
+  var currentRound = null, currentDate = '', boardCounter = 0;
+  var cols = null;
+
+  function parseHeader(row) {
+    var c = {
+      bo: -1, snoWhite: -1, snoBlack: -1, white: -1, black: -1,
+      result: -1, rtgWhite: -1, rtgBlack: -1, titleWhite: -1, titleBlack: -1
+    };
+    var snoCols = [], rtgCols = [];
+    for (var k = 0; k < row.length; k++) {
+      var h = String(row[k] || '').trim().toLowerCase().replace(/\.+$/, '');
+      if (h === 'bo' || h === 'board' || h === 'no') { if (c.bo < 0) c.bo = k; }
+      else if (h === 'sno') snoCols.push(k);
+      else if (h === 'white') c.white = k;
+      else if (h === 'black') c.black = k;
+      else if (h === 'res' || h === 'result') c.result = k;
+      else if (h === 'rtg' || h === 'rating') rtgCols.push(k);
+    }
+    if (snoCols.length >= 1) c.snoWhite = snoCols[0];
+    if (snoCols.length >= 2) c.snoBlack = snoCols[snoCols.length - 1];
+    if (rtgCols.length >= 1) c.rtgWhite = rtgCols[0];
+    if (rtgCols.length >= 2) c.rtgBlack = rtgCols[rtgCols.length - 1];
+    if (c.white > 0 && String(row[c.white - 1] || '').trim() === '') c.titleWhite = c.white - 1;
+    if (c.black > 0 && String(row[c.black - 1] || '').trim() === '') c.titleBlack = c.black - 1;
+    return c;
+  }
+  function findDate(row) {
+    var joined = row.join(' ');
+    var m = joined.match(/(\d{4})-(\w{3})-(\d{2})/);
+    if (m) return m[1] + '-' + m[2] + '-' + m[3];
+    m = joined.match(/(\d{4})[\.\/](\d{2})[\.\/](\d{2})/);
+    if (m) return m[1] + '.' + m[2] + '.' + m[3];
+    return '';
+  }
 
   for (var i = 0; i < rows.length; i++) {
     var row = rows[i].map(function(c) { return String(c).trim(); });
@@ -1021,50 +1284,64 @@ function parseSwissManagerXLS(buffer) {
     if (roundHeaderMatch) {
       currentRound = parseInt(roundHeaderMatch[1]);
       boardCounter = 0;
-      var dateMatch = row.join(' ').match(/(\d{4}-\w{3}-\d{2}|\d{4}\.\d{2}\.\d{2})/);
-      if (dateMatch) currentDate = dateMatch[1];
+      cols = null;
+      var d = findDate(row);
+      if (d) currentDate = d;
       tournament.pairings['R' + currentRound] = [];
       continue;
     }
 
     if (!currentRound) continue;
-    if (row[0] === '' || row[0] === 'SNo') continue;
+    if (row[0] === '' && (cols == null || cols.bo < 0)) continue;
+
+    if (/^(SNo\.?|No\.?|Bo\.?|Board)$/i.test(row[0])) {
+      cols = parseHeader(row);
+      continue;
+    }
+
     if (row[0].indexOf('Swiss-Manager') >= 0 || row[0].indexOf('Program') >= 0) continue;
+    if (cols == null) continue;
 
-    var snoWhite = parseInt(row[0]);
+    var blackCellRaw = (cols.black >= 0) ? row[cols.black] : '';
+    if (/^bye$/i.test(blackCellRaw) || blackCellRaw === '-' || blackCellRaw === '') continue;
+
+    var snoWhite = (cols.snoWhite >= 0) ? parseInt(row[cols.snoWhite]) : NaN;
     if (isNaN(snoWhite)) continue;
+
     boardCounter++;
-
-    if (boardCounter === 1 && !tournament.pairings['R' + currentRound].length) {
-      hasTitle = TITLE_CODES.indexOf(row[1].toUpperCase()) >= 0;
+    var board = boardCounter;
+    if (cols.bo >= 0) {
+      var boRaw = parseInt(row[cols.bo]);
+      if (!isNaN(boRaw)) board = boRaw;
     }
 
-    var whiteName, whiteRtg, result, blackName, blackRtg, snoBlack;
-    if (hasTitle) {
-      whiteName = row[2]; whiteRtg = parseInt(row[3]) || 0;
-      result = row[4]; blackName = row[6]; blackRtg = parseInt(row[7]) || 0;
-      snoBlack = parseInt(row[8]) || 0;
-    } else {
-      whiteName = row[1]; whiteRtg = parseInt(row[2]) || 0;
-      result = row[3]; blackName = row[4]; blackRtg = parseInt(row[5]) || 0;
-      snoBlack = parseInt(row[6]) || 0;
-    }
+    var whiteName  = row[cols.white] || '';
+    var whiteTitle = (cols.titleWhite >= 0) ? (row[cols.titleWhite] || '') : '';
+    var whiteRtg   = (cols.rtgWhite >= 0) ? (parseInt(row[cols.rtgWhite]) || 0) : 0;
+    var result     = (cols.result >= 0) ? row[cols.result] : '';
+    var blackName  = blackCellRaw;
+    var blackTitle = (cols.titleBlack >= 0) ? (row[cols.titleBlack] || '') : '';
+    var blackRtg   = (cols.rtgBlack >= 0) ? (parseInt(row[cols.rtgBlack]) || 0) : 0;
+    var snoBlack   = (cols.snoBlack >= 0) ? (parseInt(row[cols.snoBlack]) || 0) : 0;
 
-    // Normalize result
     result = (result || '').replace(/\s+/g, '').replace(/½/g, '1/2');
     if (/1\/2-1\/2/.test(result)) result = '1/2-1/2';
     else if (!/^(1-0|0-1)$/.test(result)) result = result || '*';
 
     if (!tournament.players[snoWhite]) {
-      tournament.players[snoWhite] = { name: whiteName, rating: whiteRtg };
+      tournament.players[snoWhite] = { name: whiteName, rating: whiteRtg, title: whiteTitle };
     }
     if (snoBlack && !tournament.players[snoBlack]) {
-      tournament.players[snoBlack] = { name: blackName, rating: blackRtg };
+      tournament.players[snoBlack] = { name: blackName, rating: blackRtg, title: blackTitle };
     }
 
     tournament.pairings['R' + currentRound].push({
-      board: boardCounter, whiteName: whiteName, blackName: blackName,
-      whiteRtg: whiteRtg, blackRtg: blackRtg, result: result, date: currentDate
+      board: board,
+      whiteSNo: snoWhite, blackSNo: snoBlack,
+      whiteName: whiteName, blackName: blackName,
+      whiteRtg: whiteRtg, blackRtg: blackRtg,
+      whiteTitle: whiteTitle, blackTitle: blackTitle,
+      result: result, date: currentDate
     });
   }
 
@@ -1210,9 +1487,30 @@ function onBatchFilesDiscovered(result) {
   var statusEl = document.getElementById('batch-folder-status');
   statusEl.textContent = result.games.size + ' game(s) found';
 
-  // Show round selector
+  // Show round selector (and inline section selector when >1 section).
   var roundDiv = document.getElementById('batch-round-selector');
   roundDiv.classList.remove('hidden');
+
+  var sectionSelect = document.getElementById('batch-section-select');
+  var step4Label = document.getElementById('batch-step4-label');
+  var sections = (result.sections || []).filter(function(s) { return s.section; });
+
+  if (sectionSelect && sections.length > 1) {
+    // Multi-section tournament: surface the section dropdown, default to the
+    // first section so the round dropdown isn't ambiguous from the start.
+    window.BatchGameList.renderSectionSelector(sectionSelect);
+    sectionSelect.value = sections[0].section;
+    sectionSelect.classList.remove('hidden');
+    window.BatchGameList.selectSection(sections[0].section);
+    if (step4Label) step4Label.textContent = 'section + round';
+  } else if (sectionSelect) {
+    // Single-section (or zero-section): hide the chooser and clear any
+    // prior selection so getAvailableRounds returns all rounds.
+    sectionSelect.classList.add('hidden');
+    sectionSelect.innerHTML = '';
+    window.BatchGameList.selectSection(null);
+    if (step4Label) step4Label.textContent = 'round';
+  }
 
   var roundSelect = document.getElementById('batch-round-select');
   window.BatchGameList.renderRoundSelector(roundSelect);

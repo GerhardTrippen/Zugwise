@@ -1,7 +1,7 @@
 // sw.js - Service Worker for Zugwise PWA
 // Place this file in your root directory (same level as index.html)
 
-const CACHE_NAME = 'zugwise-v0.11.8';
+const CACHE_NAME = 'zugwise-v0.11.13';
 
 // Origins that don't send CORS headers — must use no-cors (gives opaque responses)
 const NO_CORS_ORIGINS = ['docs.opencv.org', 'cdn.tailwindcss.com'];
@@ -27,6 +27,8 @@ const STATIC_ASSETS = [
   // Main JS files (in frontend root)
   './app.js',
   './worker-api.js',
+  './ocr-pool.js',
+  './ocr-worker.js',
   './zugwise-worker.js',
   './search-worker.js',
   './python-loader.js',

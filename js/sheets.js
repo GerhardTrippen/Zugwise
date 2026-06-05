@@ -96,6 +96,9 @@ function renderSheetsUploader() {
           <button id="btn-clear-sheets" class="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 rounded text-red-400" title="Clear all sheets">
             ✕ Clear
           </button>
+          <button id="btn-change-input-expanded" class="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 rounded" title="Discard everything (sheets, OCR, batch state) and start fresh">
+            🔄 Change
+          </button>
         </div>
       </div>
       
@@ -246,13 +249,11 @@ function renderSheetBox(player, sheetIndex) {
           <option value="2col" ${sheet.format==='2col'?'selected':''}>2col</option>
           <option value="3col" ${sheet.format==='3col'?'selected':''}>3col</option>
         </select>
-        <select class="sheet-rows-select bg-gray-700 text-white rounded px-1 text-xs flex-1"
-                data-player="${player}" data-sheet="${sheetIndex}">
-          <option value="15" ${sheet.rowCount==15?'selected':''}>15r</option>
-          <option value="20" ${sheet.rowCount==20?'selected':''}>20r</option>
-          <option value="25" ${sheet.rowCount==25?'selected':''}>25r</option>
-          <option value="30" ${sheet.rowCount==30?'selected':''}>30r</option>
-        </select>
+        <input type="number" min="5" max="60" step="1" list="rowcount-suggestions"
+               value="${sheet.rowCount || 20}"
+               class="sheet-rows-select bg-gray-700 text-white rounded px-1 text-xs flex-1 w-12"
+               data-player="${player}" data-sheet="${sheetIndex}"
+               title="Rows per column (any value, suggestions: 15/20/24/25/26/30/35)">
       </div>
     `;
   }
@@ -374,6 +375,14 @@ function attachSheetEventListeners() {
   // Clear all button
   var clearBtn = document.getElementById('btn-clear-sheets');
   if (clearBtn) clearBtn.addEventListener('click', handleClearSheets);
+
+  // Change button (full reset — wired to the same handler app.js uses for the
+  // collapsed-view button). Re-bound on every refresh because the renderer
+  // recreates the DOM node.
+  var changeBtn = document.getElementById('btn-change-input-expanded');
+  if (changeBtn && typeof window.handleChangeInput === 'function') {
+    changeBtn.addEventListener('click', window.handleChangeInput);
+  }
   
   // Process button
   var processBtn = document.getElementById('btn-process-sheets');
@@ -485,9 +494,25 @@ async function handleDualSheetBoxFile(pageIndex, file) {
 
     if (dualInfo.isDual) {
       hasDual = true;
-      var halves = await splitDualSheet(pageFile, dualInfo.width, dualInfo.height);
+      var unsplit = (typeof findUnsplitMidpoint === 'function')
+        ? await findUnsplitMidpoint(pageFile, slot)
+        : { midpoint: null, failureReason: null };
+      if (unsplit.failureReason) {
+        var unsplitMsg = '⚠ Anchor detection: ' + unsplit.failureReason
+            + ' — using ink-valley fallback. If results look wrong, try a different Format / Cols × Rows.';
+        log(unsplitMsg);
+        if (typeof showHintBanner === 'function') showHintBanner(unsplitMsg);
+      }
+      var halves = await splitDualSheet(pageFile, dualInfo.width, dualInfo.height,
+        unsplit.midpoint !== null ? { cutX: unsplit.midpoint } : null);
       log('  Page ' + (slot + 1) + ': dual-sheet (' + dualInfo.width + 'x' + dualInfo.height +
           ') → P1.' + (slot + 1) + ' + P2.' + (slot + 1));
+      var leftAnchors = unsplit.leftHalfAnchorXs;
+      var rightAnchors = unsplit.rightHalfAnchorXs;
+      // When GridUnsplit had to infer a missing leftmost column, per-half
+      // detection can't see that column — force-use the anchors instead of
+      // trying clean per-half first.
+      var inferredLeftCol = !!unsplit.inferredLeftColumn;
 
       // Store landscape thumbnail for the dual-sheet box display
       try {
@@ -497,8 +522,14 @@ async function handleDualSheetBoxFile(pageIndex, file) {
         // Non-critical — box will still show "Split" status
       }
 
-      loadSheetImage(1, slot, halves.left);
-      loadSheetImage(2, slot, halves.right);
+      loadSheetImage(1, slot, halves.left, {
+        predefinedAnchorXs: leftAnchors,
+        inferredLeftColumn: inferredLeftCol
+      });
+      loadSheetImage(2, slot, halves.right, {
+        predefinedAnchorXs: rightAnchors,
+        inferredLeftColumn: inferredLeftCol
+      });
     } else {
       // Not landscape — load as single sheet into Player 1
       log('  Page ' + (slot + 1) + ': single sheet → P1.' + (slot + 1));
@@ -728,11 +759,30 @@ async function loadSheetFile(player, sheetIndex, file) {
     if (dualInfo.isDual) {
       log('📐 Dual-sheet detected (' + dualInfo.width + 'x' + dualInfo.height +
           ', ratio ' + dualInfo.ratio.toFixed(2) + ') — splitting into Player 1 + Player 2');
-      var halves = await splitDualSheet(imageFile, dualInfo.width, dualInfo.height);
+      var unsplit = (typeof findUnsplitMidpoint === 'function')
+        ? await findUnsplitMidpoint(imageFile, sheetIndex)
+        : { midpoint: null, failureReason: null };
+      if (unsplit.failureReason) {
+        var unsplitMsg = '⚠ Anchor detection: ' + unsplit.failureReason
+            + ' — using ink-valley fallback. If results look wrong, try a different Format / Cols × Rows.';
+        log(unsplitMsg);
+        if (typeof showHintBanner === 'function') showHintBanner(unsplitMsg);
+      }
+      var halves = await splitDualSheet(imageFile, dualInfo.width, dualInfo.height,
+        unsplit.midpoint !== null ? { cutX: unsplit.midpoint } : null);
 
-      // Load left half into Player 1, right half into Player 2 (same page slot)
-      loadSheetImage(1, sheetIndex, halves.left);
-      loadSheetImage(2, sheetIndex, halves.right);
+      // Load left half into Player 1, right half into Player 2 (same page slot).
+      // inferredLeftColumn: when GridUnsplit had to extrapolate a clipped
+      // leftmost column, per-half detection can't recover it on its own.
+      var inferredLeftCol2 = !!unsplit.inferredLeftColumn;
+      loadSheetImage(1, sheetIndex, halves.left, {
+        predefinedAnchorXs: unsplit.leftHalfAnchorXs,
+        inferredLeftColumn: inferredLeftCol2
+      });
+      loadSheetImage(2, sheetIndex, halves.right, {
+        predefinedAnchorXs: unsplit.rightHalfAnchorXs,
+        inferredLeftColumn: inferredLeftCol2
+      });
       return;
     }
   }
@@ -745,9 +795,10 @@ async function loadSheetFile(player, sheetIndex, file) {
 // IMAGE LOADING & GRID DETECTION
 // =============================================================================
 
-async function loadSheetImage(player, sheetIndex, file) {
+async function loadSheetImage(player, sheetIndex, file, opts) {
   log('📷 Loading ' + file.name + ' for Player ' + player + ' Page ' + (sheetIndex + 1));
-  
+  opts = opts || {};
+
   // Create sheet object
   var sheet = {
     file: file,
@@ -760,7 +811,16 @@ async function loadSheetImage(player, sheetIndex, file) {
     detectedColor: null,
     format: (window.SheetProfiles ? window.SheetProfiles.getProfileGridConfig(sheetIndex + 1).format : '2col'),
     rowCount: (window.SheetProfiles ? window.SheetProfiles.getProfileGridConfig(sheetIndex + 1).rowCount : 20),
-    method: 'slide'  // default method for new uploads
+    method: 'slide',  // default method for new uploads
+    // Optional: column X positions in this half-image's coords, supplied by
+    // GridUnsplit when the unsplit dual-sheet image yielded reliable anchors.
+    // Used to bypass per-half SlideGrid auto-detection that would otherwise
+    // fail on a clipped left-most column.
+    predefinedAnchorXs: opts.predefinedAnchorXs || null,
+    // True when GridUnsplit extrapolated a missing leftmost column. Tells the
+    // OCR path to skip clean per-half detection and use the anchors directly
+    // (per-half can't find the clipped column on its own).
+    inferredLeftColumn: !!opts.inferredLeftColumn
   };
   
   sheetsState['player' + player][sheetIndex] = sheet;
@@ -782,7 +842,32 @@ async function loadSheetImage(player, sheetIndex, file) {
     } else {
       gridConfig = getGridConfig(sheet.rowCount, sheet.format);
     }
+    // Pass GridUnsplit-derived per-half anchors into the initial grid detection
+    // step (in addition to startBackgroundOCR's later use). Without this, grid
+    // detection runs auto-find on a clipped half image and fails before OCR
+    // even gets a chance.
+    if (sheet.predefinedAnchorXs && sheet.predefinedAnchorXs.length > 0) {
+      gridConfig.predefinedAnchorXs = sheet.predefinedAnchorXs;
+      gridConfig.inferredLeftColumn = sheet.inferredLeftColumn;
+    }
     var gridResult = await detectGrid(imageData, gridConfig, sheet.method);
+
+    // Template-mismatch hint: surface even on successful detection so the
+    // user can fix their Format/Rows×Cols selection before OCR results
+    // come out wrong. (slide method only — contour path doesn't compute it.)
+    if (gridResult.templateWarning) {
+      var tmMsg = '⚠ Detection looks off (' + gridResult.templateWarning
+                + '). Verify Format / Rows × Cols matches this scoresheet.';
+      log(tmMsg);
+      if (typeof showHintBanner === 'function') showHintBanner(tmMsg);
+    }
+
+    // Leftmost-column-missing hint: surface so the user can verify the
+    // synthesized col1 W/B move cells line up with the actual move text.
+    if (gridResult.leftmostSynthHint) {
+      log(gridResult.leftmostSynthHint);
+      if (typeof showHintBanner === 'function') showHintBanner(gridResult.leftmostSynthHint);
+    }
 
     if (gridResult.success) {
       sheet.corners = gridResult.corners;
@@ -915,8 +1000,21 @@ async function detectGrid(imageDataURL, sheetConfig, method) {
         pageType: 'front'
       };
 
+      // Forward GridUnsplit-derived per-half column anchors into the PREVIEW
+      // detection. Without this, detectGrid rebuilt slideConfig from scratch and
+      // dropped them, so the preview re-ran blind AutoFind on a dual-sheet half
+      // and invented squished/misplaced columns — even though the OCR-extraction
+      // path (opencv_image_processor.js) already honored the same anchors. Only
+      // ever set for dual-sheet halves, so single-sheet detection is unchanged.
+      if (config.predefinedAnchorXs && config.predefinedAnchorXs.length > 0) {
+        slideConfig.predefinedAnchorXs = config.predefinedAnchorXs;
+        slideConfig.inferredLeftColumn = config.inferredLeftColumn;
+      }
+
       var slideResult = window.SlideGrid.processScoresheet(srcMat, slideConfig, function(msg) {
-        log('  [Slide] ' + msg);
+        // Same gate as opencv_image_processor.js. Flip via
+        // `window.SLIDE_VERBOSE_LOG = true` in DevTools.
+        if (window.SLIDE_VERBOSE_LOG) log('  [Slide] ' + msg);
       });
 
       srcMat.delete();
@@ -931,7 +1029,13 @@ async function detectGrid(imageDataURL, sheetConfig, method) {
       log('  Slide detection: ' + (success ? 'SUCCESS' : 'FAILED') +
           ' (' + (slideResult ? slideResult.cells.length : 0) + ' cells)');
 
-      return { success: success, corners: null, detectedColor: null };
+      return {
+        success: success,
+        corners: null,
+        detectedColor: null,
+        templateWarning: slideResult ? slideResult.templateWarning : null,
+        leftmostSynthHint: slideResult ? slideResult.leftmostSynthHint : null
+      };
 
     } else {
       // === CONTOUR-BASED DETECTION (v34) ===
@@ -1445,6 +1549,12 @@ async function startBackgroundOCR(player, sheetIndex) {
       gridConfig = getGridConfig(sheet.rowCount || 20, sheet.format || '2col');
     }
 
+    // Pass GridUnsplit-derived per-half anchor positions through, when set
+    if (sheet.predefinedAnchorXs && sheet.predefinedAnchorXs.length > 0) {
+      gridConfig.predefinedAnchorXs = sheet.predefinedAnchorXs;
+      gridConfig.inferredLeftColumn = sheet.inferredLeftColumn;
+    }
+
     // Use client-side pipeline if available, WITH corners for perspective correction
     if (window.zugwise && window.zugwise.isReady) {
       // Convert dataURL to File for processScoresheet
@@ -1682,6 +1792,10 @@ async function processAllSheets() {
     state.ocrCells = moves;
     state.ocrCellsSheet1 = null;
     state.ocrCellsSheet2 = null;
+    // Drop the dual-sheet tier-summary banner if it survived from a prior
+    // dual-sheet pass — single-sheet has no merge tiers to display.
+    var leftoverTierBanner = document.getElementById('tier-summary-banner');
+    if (leftoverTierBanner) leftoverTierBanner.remove();
     state.noiseBannerDismissed = true;  // single-sheet has no per-sheet noise to flag
     if (window.SheetAlignment) window.SheetAlignment.clearAllStructuralBanners();
     state.hasGridImage = moves.some(function(m) { return m.imageDataUrl; });
@@ -1738,6 +1852,26 @@ function mergePlayerMoves(player1Data, player2Data) {
   var lockMode = (state.mergeSettings && state.mergeSettings.lockMode) || 'tier1';
   var lockedPlies = window.MergeSheets.computeLockedPlies(tierMap, lockMode);
   state.mergeLockedPlies = lockedPlies;
+
+  // Forced-stop ambiguity plies: cells the merge flagged (_ambiguous) because
+  // two confident sheets disagree on the move (near-tie). validate_moves and
+  // the search algorithms stop at these so the user resolves them instead of
+  // the higher-confidence reading being silently played through (the 12.B
+  // Rb8/Qb8 corruption). Stored as a ply-set + a _pending copy so the
+  // validateAndDisplay reset can re-apply it (mirrors mergeLockedPlies). This
+  // is the single source of truth the ocrData builders read to stamp
+  // forced_stop — no per-cell field threaded through pairMoves/state.moves.
+  var ambiguousPlies = [];
+  merged.forEach(function(m) {
+    if (m && m._ambiguous) {
+      ambiguousPlies.push((m.num - 1) * 2 + (m.color === 'w' ? 0 : 1));
+    }
+  });
+  state.ambiguousPlies = ambiguousPlies;
+  if (ambiguousPlies.length > 0) {
+    state._pendingAmbiguousPlies = ambiguousPlies.slice();
+    log('🔍 ' + ambiguousPlies.length + ' ambiguous ply(ies) flagged for forced review');
+  }
 
   // Log tier summary
   var tSummary = window.MergeSheets.tierSummary(tierMap);

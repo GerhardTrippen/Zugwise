@@ -14,6 +14,11 @@ var SearchManager = (function() {
         this.results = {};       // method -> final result
         this.cancelFlags = {};   // method -> boolean
         this.nextId = {};        // method -> counter
+        // method -> array of review-ready applied fixes streamed from greedy
+        // (greedy_step's 'applied_fix' event). Lets an instant Cancel rebuild a
+        // PARTIAL result with full alternative detail without waiting for a
+        // long in-flight step to finish.
+        this.partialFixes = {};
 
         // Callbacks for UI
         this.onStepUpdate = null;   // function(method, stepData)
@@ -22,6 +27,12 @@ var SearchManager = (function() {
 
         // Track user-locked plies
         this.lockedPlies = new Set();
+        // Tier 1 candidate plies: plies where BOTH OCR sheets agreed on
+        // the move (dual-sheet _agree && _sheetCount===2). Static — does
+        // NOT depend on legality. Greedy uses this to recompute its
+        // locked set after each applied fix, matching what the frontend's
+        // classifyTiers would compute on a manual revalidate.
+        this.tier1AgreedPlies = new Set();
     }
 
     /**
@@ -30,7 +41,7 @@ var SearchManager = (function() {
      * @param {Array<string>} methods - ['greedy', 'beam'] or ['greedy', 'beam', 'dijkstra']
      * @param {Object} methodOptions - per-method options, e.g. { greedy: {max_fixes: 15}, beam: {beam_width: 5} }
      */
-    SearchManager.prototype.launchSearches = function(ocrMoves, methods, methodOptions, lockedPlies) {
+    SearchManager.prototype.launchSearches = function(ocrMoves, methods, methodOptions, lockedPlies, tier1AgreedPlies) {
         methods = methods || ['greedy', 'beam'];
         methodOptions = methodOptions || {};
 
@@ -42,6 +53,14 @@ var SearchManager = (function() {
             var selfL = this;
             lockedPlies.forEach(function(p) { selfL.lockedPlies.add(p | 0); });
         }
+        // Tier 1 agreed plies: independent of legality. Greedy uses this to
+        // re-evaluate its locked set after each applied fix, matching the
+        // frontend's classifyTiers behavior on revalidate.
+        if (Array.isArray(tier1AgreedPlies)) {
+            this.tier1AgreedPlies.clear();
+            var selfT = this;
+            tier1AgreedPlies.forEach(function(p) { selfT.tier1AgreedPlies.add(p | 0); });
+        }
 
         var self = this;
         methods.forEach(function(method) {
@@ -51,9 +70,20 @@ var SearchManager = (function() {
 
     /**
      * Cancel a specific method's search.
+     *
+     * Sets the cancel flag AND aborts any in-flight worker request. The cancel
+     * flag alone only takes effect between steps — a single greedy step can
+     * grind quiescence for minutes, and JS can't preempt Pyodide mid-call. So
+     * we also reject the pending search-step promise (worker._abort) to unblock
+     * the step loop immediately; the loop then rebuilds a PARTIAL result from
+     * the fixes streamed so far and terminates the worker. Greedy keeps full
+     * alternative detail because each fix's all_candidates were already shipped
+     * via 'applied_fix' events before the worker is killed.
      */
     SearchManager.prototype.cancelMethod = function(method) {
         this.cancelFlags[method] = true;
+        var worker = this.workers[method];
+        if (worker && worker._abort) worker._abort();
     };
 
     /**
@@ -63,6 +93,8 @@ var SearchManager = (function() {
         var self = this;
         Object.keys(this.workers).forEach(function(method) {
             self.cancelFlags[method] = true;
+            var worker = self.workers[method];
+            if (worker && worker._abort) worker._abort();
         });
     };
 
@@ -108,6 +140,7 @@ var SearchManager = (function() {
         this.results[method] = null;
         this.cancelFlags[method] = false;
         this.nextId[method] = 1;
+        this.partialFixes[method] = [];
 
         if (this.onStatusChange) this.onStatusChange(method, 'loading');
 
@@ -167,6 +200,20 @@ var SearchManager = (function() {
             });
         };
 
+        // Abort all pending requests immediately (used by cancel). Rejecting
+        // with __aborted lets the step loop distinguish a user cancel from a
+        // real worker error and rebuild a PARTIAL from the streamed fixes. The
+        // Pyodide call backing the pending request keeps running until the
+        // worker is terminated at the end of the loop — that's fine, we no
+        // longer await its result.
+        worker._abort = function() {
+            Object.keys(callbacks).forEach(function(id) {
+                var cb = callbacks[id];
+                delete callbacks[id];
+                if (cb && cb.reject) cb.reject({ __aborted: true });
+            });
+        };
+
         // Start initialization
         worker.postMessage({ type: 'init' });
     };
@@ -220,7 +267,8 @@ var SearchManager = (function() {
                 ocrMoves: ocrMoves,
                 method: method,
                 options: opts,
-                lockedPlies: Array.from(this.lockedPlies)
+                lockedPlies: Array.from(this.lockedPlies),
+                tier1AgreedPlies: Array.from(this.tier1AgreedPlies)
             });
 
             var stateId = stateInfo.stateId;
@@ -234,19 +282,31 @@ var SearchManager = (function() {
                 });
             }
 
-            // Step loop
+            // Step loop. The cancel flag is checked between steps; a long
+            // in-flight step (greedy can grind quiescence for minutes) is
+            // unblocked by worker._abort, which rejects the pending step
+            // promise with __aborted so we can bail without waiting it out.
             var done = false;
+            var aborted = false;
             while (!done) {
-                if (self.cancelFlags[method]) {
-                    await worker._send('search-finalize', { stateId: stateId });
-                    if (self.onStepUpdate) {
-                        self.onStepUpdate(method, { done: true, status: 'CANCELLED', message: 'Cancelled' });
-                    }
-                    break;
-                }
+                if (self.cancelFlags[method]) { aborted = true; break; }
 
-                var step = await worker._send('search-step', { stateId: stateId });
+                var step;
+                try {
+                    step = await worker._send('search-step', { stateId: stateId });
+                } catch (err) {
+                    if (err && err.__aborted) { aborted = true; break; }
+                    throw err;
+                }
                 done = step.done;
+
+                // Accumulate greedy's review-ready applied fix (full detail,
+                // incl. all_candidates) so an instant Cancel can rebuild a
+                // PARTIAL without losing the alternatives.
+                if (step && step.applied_fix) {
+                    if (!self.partialFixes[method]) self.partialFixes[method] = [];
+                    self.partialFixes[method].push(step.applied_fix);
+                }
 
                 // Report step to UI
                 if (self.onStepUpdate) {
@@ -254,25 +314,54 @@ var SearchManager = (function() {
                 }
             }
 
-            // Finalize
-            if (!self.cancelFlags[method]) {
+            if (aborted) {
+                // User cancelled. If fixes were streamed (greedy), rebuild a
+                // PARTIAL result with full alternative detail and surface it
+                // for Review instead of discarding the work. The worker is
+                // terminated below; we never touch its Pyodide state again.
+                var streamed = self.partialFixes[method] || [];
+                if (streamed.length > 0) {
+                    var partial = self._buildCancelledPartial(method, ocrMoves);
+                    self.results[method] = partial;
+                    self.statuses[method] = 'complete';
+                    if (self.onComplete) self.onComplete(method, partial);
+                    if (self.onStatusChange) self.onStatusChange(method, 'complete');
+                } else {
+                    // Nothing streamed to preserve (beam/dijkstra, or greedy
+                    // cancelled before its first fix) — keep the old cancel UX.
+                    if (self.onStepUpdate) {
+                        self.onStepUpdate(method, { done: true, status: 'CANCELLED', message: 'Cancelled' });
+                    }
+                    self.statuses[method] = 'idle';
+                    if (self.onStatusChange) self.onStatusChange(method, 'idle');
+                }
+            } else {
+                // Natural completion — finalize as before.
                 var result = await worker._send('search-finalize', { stateId: stateId });
                 self.results[method] = result;
                 self.statuses[method] = 'complete';
 
                 if (self.onComplete) self.onComplete(method, result);
                 if (self.onStatusChange) self.onStatusChange(method, 'complete');
-            } else {
-                self.statuses[method] = 'idle';
-                if (self.onStatusChange) self.onStatusChange(method, 'idle');
             }
 
         } catch (e) {
-            console.error('[' + method + '] Streaming error:', e.message);
-            self.statuses[method] = 'error';
-            if (self.onStatusChange) self.onStatusChange(method, 'error');
-            if (self.onStepUpdate) {
-                self.onStepUpdate(method, { done: true, status: 'ERROR', message: 'Error: ' + e.message });
+            if (e && e.__aborted) {
+                // Cancelled during a phase we can't preserve (e.g. the initial
+                // search-create, before any fix streamed) — treat as a plain
+                // cancel, not an error.
+                self.statuses[method] = 'idle';
+                if (self.onStatusChange) self.onStatusChange(method, 'idle');
+                if (self.onStepUpdate) {
+                    self.onStepUpdate(method, { done: true, status: 'CANCELLED', message: 'Cancelled' });
+                }
+            } else {
+                console.error('[' + method + '] Streaming error:', e.message);
+                self.statuses[method] = 'error';
+                if (self.onStatusChange) self.onStatusChange(method, 'error');
+                if (self.onStepUpdate) {
+                    self.onStepUpdate(method, { done: true, status: 'ERROR', message: 'Error: ' + e.message });
+                }
             }
         }
 
@@ -281,6 +370,58 @@ var SearchManager = (function() {
             worker.terminate();
             delete self.workers[method];
         }
+    };
+
+    // =========================================================================
+    // INTERNAL: Build a PARTIAL result from fixes streamed before an instant
+    // Cancel. Mirrors the shape searchFinalize returns (status/moves/fixes/
+    // reached_ply/stop_*) so handleSearchComplete renders it — and enables
+    // Review — exactly like a naturally-completed greedy PARTIAL. The fixes
+    // carry full all_candidates detail (packaged by package_review_fix in the
+    // worker before each 'applied_fix' event), so no alternatives are lost.
+    // =========================================================================
+    SearchManager.prototype._buildCancelledPartial = function(method, ocrMoves) {
+        var fixes = (this.partialFixes[method] || []).slice();
+        // Reconstruct the corrected move list: base SAN from the launched OCR
+        // moves, then overlay each applied fix at its ply. Unfixed plies keep
+        // their raw OCR text (they replayed legally, which is why greedy never
+        // touched them). This matches how locked/unfixed plies appear in a
+        // full finalize for the stale-check + board preview in beam.js.
+        var moves = this._ocrMovesToSanList(ocrMoves);
+        var maxFixPly = -1;
+        fixes.forEach(function(f) {
+            var p = (typeof f.ply === 'number') ? f.ply : -1;
+            if (p >= 0 && p < moves.length) moves[p] = f.san;
+            if (p > maxFixPly) maxFixPly = p;
+        });
+        return {
+            status: 'PARTIAL',
+            moves: moves,
+            fixes: fixes,
+            elapsed: 0,
+            reached_ply: (maxFixPly >= 0) ? (maxFixPly + 1) : null,
+            stop_reason: 'cancelled',
+            stop_message: 'Cancelled — kept ' + fixes.length + ' fix(es) found ' +
+                'so far. Review them or use the Fix Suggestions panel for the ' +
+                'ranked candidates.'
+        };
+    };
+
+    // Build a ply-indexed SAN array from the launched ocrMoves payload
+    // ([{num, color, move, ...}]). Index = (num-1)*2 + (white?0:1).
+    SearchManager.prototype._ocrMovesToSanList = function(ocrMoves) {
+        var maxPly = -1;
+        (ocrMoves || []).forEach(function(e) {
+            var ply = (e.num - 1) * 2 + (e.color === 'w' ? 0 : 1);
+            if (ply > maxPly) maxPly = ply;
+        });
+        var arr = [];
+        for (var i = 0; i <= maxPly; i++) arr.push('');
+        (ocrMoves || []).forEach(function(e) {
+            var ply = (e.num - 1) * 2 + (e.color === 'w' ? 0 : 1);
+            if (ply >= 0) arr[ply] = e.move;
+        });
+        return arr;
     };
 
     // =========================================================================
@@ -303,7 +444,7 @@ var SearchManager = (function() {
     // singleton's worker pool, statuses, or callbacks. Per-call callbacks are
     // restored at settle time so a re-used instance is still safe.
 
-    SearchManager.prototype.launchSearchesPromise = function(ocrMoves, methods, methodOptions, callbacks, lockedPlies) {
+    SearchManager.prototype.launchSearchesPromise = function(ocrMoves, methods, methodOptions, callbacks, lockedPlies, tier1AgreedPlies) {
         var self = this;
         methods = methods || ['greedy', 'beam'];
         methodOptions = methodOptions || {};
@@ -354,7 +495,7 @@ var SearchManager = (function() {
                 markDone(method, result);
             };
 
-            self.launchSearches(ocrMoves, methods, methodOptions, lockedPlies);
+            self.launchSearches(ocrMoves, methods, methodOptions, lockedPlies, tier1AgreedPlies);
         });
     };
 

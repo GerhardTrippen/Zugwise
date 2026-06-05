@@ -153,24 +153,143 @@ function findDualSheetCut(img, width, height) {
                      'intra-sheet gap ' + maxIntraGap + 'px' };
   }
 
-  var cutX = Math.round(((left + right) / 2) / scale);
+  // Asymmetric valley: when one sheet has much sparser ink than the other,
+  // the valley walk extends far on the sparse side and barely on the dense
+  // side. The (left+right)/2 midpoint then lands deep inside the sparse
+  // sheet, not at the seam. Detect this and fall back to the page midpoint.
+  var leftReach = minIdx - left;
+  var rightReach = right - minIdx;
+  var minReach = Math.min(leftReach, rightReach);
+  var maxReach = Math.max(leftReach, rightReach);
+  if (minReach > 0 && maxReach > 3 * minReach) {
+    return { cutX: midX, confident: false,
+             reason: 'asymmetric valley (reach left=' + leftReach +
+                     'px, right=' + rightReach + 'px) — sparse on one side, ' +
+                     'falling back to midpoint' };
+  }
+
+  // Use minIdx (the densest minimum within the search range) as the cut
+  // rather than the midpoint of the (potentially asymmetric) valley.
+  var cutX = Math.round(minIdx / scale);
   return { cutX: cutX, confident: true,
-           reason: 'valley at x=' + cutX + ' (width=' + Math.round(valleyWidth / scale) +
+           reason: 'valley min at x=' + cutX + ' (width=' + Math.round(valleyWidth / scale) +
                    'px, depth=' + Math.round((1 - minDensity / peakDensity) * 100) + '%)' };
 }
 
 /**
+ * Try to find the optimal split midpoint by running anchor detection on the
+ * UNSPLIT dual-sheet image (Phase 4 entry into Phase 2/3 logic).
+ *
+ * Returns {midpoint, failureReason}:
+ *   - midpoint: integer X-coordinate on success, null on any failure
+ *   - failureReason: string describing what went wrong (when GridUnsplit
+ *     produced a diagnostic), null otherwise. Caller can surface this as
+ *     a user-visible hint suggesting Format / Cols × Rows may be wrong.
+ *
+ * Silent (no failureReason) for setup failures the user cannot act on:
+ * missing modules, missing profile, OpenCV init failure.
+ *
+ * @param {File} file - The wide image file
+ * @param {number} pageIndex - 0-based page slot (0, 1, or 2)
+ * @returns {Promise<{midpoint: number|null, failureReason: string|null}>}
+ */
+async function findUnsplitMidpoint(file, pageIndex) {
+  var nullResult = { midpoint: null, failureReason: null };
+  if (typeof window === 'undefined') return nullResult;
+  if (!window.GridUnsplit || !window.GridUnsplit.detectMidpoint) return nullResult;
+  if (!window.OpenCVImageProcessor || !window.OpenCVImageProcessor.loadImageToMat) return nullResult;
+  if (!window.SheetProfiles || !window.SheetProfiles.getProfileGridConfig) return nullResult;
+
+  // Both halves of an image record the same game → same per-page profile
+  var pageProfile;
+  try {
+    pageProfile = window.SheetProfiles.getProfileGridConfig(pageIndex + 1);
+  } catch (e) {
+    console.warn('[GridUnsplit] getProfileGridConfig failed:', e);
+    return nullResult;
+  }
+  if (!pageProfile || !pageProfile.format) return nullResult;
+
+  try {
+    if (window.OpenCVImageProcessor.initOpenCV) {
+      await window.OpenCVImageProcessor.initOpenCV();
+    }
+  } catch (e) {
+    console.warn('[GridUnsplit] OpenCV init failed:', e);
+    return nullResult;
+  }
+
+  var srcMat = null;
+  try {
+    srcMat = await window.OpenCVImageProcessor.loadImageToMat(file);
+  } catch (e) {
+    console.warn('[GridUnsplit] loadImageToMat failed:', e);
+    return { midpoint: null, failureReason: 'image load failed' };
+  }
+
+  try {
+    var result = window.GridUnsplit.detectMidpoint(srcMat, pageProfile, pageProfile, {
+      log: function(msg) {
+        // Gate per-step detection trace behind window.GRID_VERBOSE_LOG.
+        // Same flag as the [SmartCrop] / [CC] / [GridUnsplit] suppression
+        // in ui.js. To re-enable: window.GRID_VERBOSE_LOG = true in DevTools.
+        if (window.GRID_VERBOSE_LOG) console.log('[GridUnsplit] ' + msg);
+      }
+    });
+
+    if (!result || result.failureReason) {
+      var reason = (result && result.failureReason) || 'no result';
+      if (window.GRID_VERBOSE_LOG) {
+        console.log('[GridUnsplit] ' + reason + ' — falling back to ink-valley split');
+      }
+      return { midpoint: null, failureReason: reason };
+    }
+
+    if (window.GRID_VERBOSE_LOG) {
+      console.log('[GridUnsplit] midpoint=' + Math.round(result.midpoint)
+                  + ' pageSlope=' + result.pageSlopeDeg.toFixed(2) + '°'
+                  + (result.inferredLeftColumn ? ' (left col extrapolated)' : '')
+                  + (result.slopeWarn ? ' (slope warn)' : ''));
+    }
+    return {
+      midpoint: result.midpoint,
+      leftHalfAnchorXs: result.leftHalfAnchorXs || null,
+      rightHalfAnchorXs: result.rightHalfAnchorXs || null,
+      // True when GridUnsplit extrapolated a missing leftmost column (Hugh's
+      // Scarborough clipped-page case). Per-half detection won't see that
+      // column on its own, so callers must use the anchors instead of
+      // attempting clean per-half first.
+      inferredLeftColumn: !!result.inferredLeftColumn,
+      failureReason: null
+    };
+  } catch (e) {
+    var msg = (e && e.message) ? e.message : String(e);
+    console.warn('[GridUnsplit] detectMidpoint threw:', e);
+    return { midpoint: null, failureReason: 'exception: ' + msg };
+  } finally {
+    if (srcMat && srcMat.delete) {
+      try { srcMat.delete(); } catch (e2) { /* ignore */ }
+    }
+  }
+}
+
+/**
  * Split a dual-sheet image, producing two separate image Files (left half =
- * one player's sheet, right half = the other player's sheet). Uses ink-valley
- * detection to find the real seam; falls back to the midpoint if the valley
- * signal is weak.
+ * one player's sheet, right half = the other player's sheet).
+ *
+ * Cut-point precedence:
+ *   1. Caller-provided opts.cutX (e.g., from GridUnsplit anchor detection)
+ *   2. Ink-valley detection via findDualSheetCut
+ *   3. Midpoint fallback (built into findDualSheetCut)
  *
  * @param {File} file - The wide image file
  * @param {number} width - Image width
  * @param {number} height - Image height
+ * @param {Object} [opts] - {cutX} optional explicit X-coordinate to split at
  * @returns {Promise<{left: File, right: File}>}
  */
-async function splitDualSheet(file, width, height) {
+async function splitDualSheet(file, width, height, opts) {
+  opts = opts || {};
   var url = URL.createObjectURL(file);
   var img = new Image();
   await new Promise(function(resolve) {
@@ -179,12 +298,19 @@ async function splitDualSheet(file, width, height) {
   });
   URL.revokeObjectURL(url);
 
-  var cut = findDualSheetCut(img, width, height);
-  var cutX = cut.cutX;
-  console.log('[DualSheet] split ' + file.name + ': ' +
-              (cut.confident ? 'ink-valley cut at x=' + cutX
-                             : 'midpoint fallback at x=' + cutX) +
-              ' — ' + cut.reason);
+  var cutX, cutReason;
+  if (typeof opts.cutX === 'number' && isFinite(opts.cutX)
+      && opts.cutX > 0 && opts.cutX < width) {
+    cutX = Math.round(opts.cutX);
+    cutReason = 'caller-provided cutX=' + cutX;
+  } else {
+    var cut = findDualSheetCut(img, width, height);
+    cutX = cut.cutX;
+    cutReason = (cut.confident ? 'ink-valley cut at x=' + cutX
+                               : 'midpoint fallback at x=' + cutX)
+                + ' — ' + cut.reason;
+  }
+  console.log('[DualSheet] split ' + file.name + ': ' + cutReason);
 
   var baseName = file.name.replace(/\.\w+$/, '');
 

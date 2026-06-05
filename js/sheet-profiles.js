@@ -12,9 +12,10 @@
 // =============================================================================
 
 var DEFAULT_PROFILES = [
-    // --- Generic defaults ---
+    // --- Generic defaults (cols-first matches the scoresheet's visual unit:
+    //     you fill move-by-move down a column before moving to the next) ---
     {
-        name: "20 rows x 2 cols Default (2 pages)",
+        name: "2 cols x 20 rows Default (2 pages)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -22,7 +23,31 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "20 rows x 3 cols Default (2 pages)",
+        name: "2 cols x 25 rows Default (2 pages)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 51 }
+        ]
+    },
+    {
+        name: "2 cols x 30 rows Default (2 pages)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 61 }
+        ]
+    },
+    {
+        name: "2 cols x 35 rows Default (2 pages)",
+        builtin: true,
+        pages: [
+            { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 71 }
+        ]
+    },
+    {
+        name: "3 cols x 20 rows Default (2 pages)",
         builtin: true,
         pages: [
             { format: '3col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -30,40 +55,16 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "25 rows x 2 cols Default (2 pages)",
-        builtin: true,
-        pages: [
-            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
-            { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 51 }
-        ]
-    },
-    {
-        name: "25 rows x 3 cols Default (2 pages)",
+        name: "3 cols x 25 rows Default (2 pages)",
         builtin: true,
         pages: [
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 76 }
         ]
     },
-    {
-        name: "30 rows x 2 cols Default (2 pages)",
-        builtin: true,
-        pages: [
-            { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
-            { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 61 }
-        ]
-    },
-    {
-        name: "35 rows x 2 cols Default (2 pages)",
-        builtin: true,
-        pages: [
-            { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 1 },
-            { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 71 }
-        ]
-    },
     // --- Club-specific profiles (alphabetical) ---
     {
-        name: "Annex Chess Club 50-Move Carbon Copy (1 page)",
+        name: "Annex Chess Club Carbon Copy (2 cols x 25 rows, 1 page)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -71,7 +72,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Aurora Chess Club 50-Move (1 page)",
+        name: "Aurora Chess Club Carbon Copy (2 cols x 25 rows, 1 page)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -79,7 +80,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Bob & Gord's Milton Rapid (2 pages)",
+        name: "Bob & Gord's Milton Rapid (2 cols x 20 rows x 2 pages)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -87,7 +88,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Carbon Copy 50-Move (2 pages)",
+        name: "Carbon Copy (2 cols x 25 rows x 2 pages)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 25, headerRows: 1, footerRows: 1, startingMove: 1 },
@@ -95,7 +96,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Chess Federation of Canada (2 pages)",
+        name: "Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, 2 pages)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -103,7 +104,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Chess'n Math Association 75-Move Carbon Copy (1 page)",
+        name: "Chess'n Math Association Carbon Copy (3 cols x 25 rows, 1 page)",
         builtin: true,
         pages: [
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -111,7 +112,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Collingwood-Somborac Chess Festival 50-Move Carbon Copy (1 page)",
+        name: "Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, 1 page)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -119,7 +120,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Excelsior Chess Club (1 page)",
+        name: "Excelsior Chess Club Carbon Copy (2 cols x 24 rows, 1 page)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 24, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -127,7 +128,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Federation Quebecoise Des Echecs 75-Move Carbon Copy (1 page)",
+        name: "Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, 1 page)",
         builtin: true,
         pages: [
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -135,7 +136,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Forcing Moves First (2 pages)",
+        name: "Forcing Moves First (2 cols x 25 rows x 2 pages)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -143,7 +144,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Hart House Chess Club 75-Move Carbon Copy (1 page)",
+        name: "Hart House Chess Club Carbon Copy (3 cols x 25 rows, 1 page)",
         builtin: true,
         pages: [
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -151,7 +152,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Kitchener Waterloo Chess Club (2 pages)",
+        name: "Kitchener Waterloo Chess Club (2 cols x 30 rows x 2 pages)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -159,7 +160,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Mississauga Chess Club (2 pages)",
+        name: "Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, 2 pages)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -167,7 +168,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Mississauga Chess Club 40-Move Carbon Copy Old (1 page)",
+        name: "Mississauga Chess Club Carbon Copy Old (2 cols x 20 rows, 1 page)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -175,15 +176,15 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Mississauga Chess Club 60-Move Carbon Copy (1 page)",
+        name: "Mississauga Chess Club Carbon Copy (3 cols x 20 rows, 1 page)",
         builtin: true,
         pages: [
-            { format: '3col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
-            { format: '3col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 }
+            { format: '3col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '3col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 }
         ]
     },
     {
-        name: "Niagara Chess (1 page)",
+        name: "Niagara Chess Carbon Copy (2 cols x 25 rows, 1 page)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -191,7 +192,15 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Silent Storm Chess Academy Brampton Carbon Copy (1 page)",
+        name: "Scarborough Chess Club Carbon Copy (3 cols x 26 rows, 1 page)",
+        builtin: true,
+        pages: [
+            { format: '3col', rowCount: 26, headerRows: 0, footerRows: 0, startingMove: 1 },
+            { format: '3col', rowCount: 26, headerRows: 0, footerRows: 0, startingMove: 1 }
+        ]
+    },
+    {
+        name: "Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, 1 page)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -199,7 +208,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Vancity Chess Carbon Copy (1 page)",
+        name: "Vancity Chess Carbon Copy (2 cols x 30 rows, 1 page)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -210,6 +219,109 @@ var DEFAULT_PROFILES = [
 
 var STORAGE_KEY_PROFILES = 'zugwise_sheet_profiles';
 var STORAGE_KEY_ACTIVE = 'zugwise_active_profile';
+
+// Old-name → new-name map for every renaming wave so far. Lets a user's
+// saved active-profile selection survive each rename so they don't get
+// silently bumped back to the first entry on next load.
+//
+// Three waves so far:
+//   1) Generic defaults: rows-first → cols-first
+//   2) Club templates: pre-existing names → "<Club> [Carbon Copy] N-Move (<P> page[s])"
+//   3) Club templates: move count → explicit "<C> cols x <R> rows" per page.
+//      Move count was ambiguous (60 = 3x20 or 2x30); this is exact.
+//
+// Both wave-1 (original) and wave-2 (move-count) club entries are mapped
+// directly to their wave-3 names so a user on either generation lands
+// on the current canonical name.
+var LEGACY_PROFILE_NAME_MAP = {
+    // Wave 1 — generic defaults rename
+    '20 rows x 2 cols Default (2 pages)': '2 cols x 20 rows Default (2 pages)',
+    '20 rows x 3 cols Default (2 pages)': '3 cols x 20 rows Default (2 pages)',
+    '25 rows x 2 cols Default (2 pages)': '2 cols x 25 rows Default (2 pages)',
+    '25 rows x 3 cols Default (2 pages)': '3 cols x 25 rows Default (2 pages)',
+    '30 rows x 2 cols Default (2 pages)': '2 cols x 30 rows Default (2 pages)',
+    '35 rows x 2 cols Default (2 pages)': '2 cols x 35 rows Default (2 pages)',
+
+    // Wave 1 club names (pre-rename) → wave 3 (current cols x rows)
+    'Annex Chess Club 50-Move Carbon Copy (1 page)':
+        'Annex Chess Club Carbon Copy (2 cols x 25 rows, 1 page)',
+    'Aurora Chess Club 50-Move (1 page)':
+        'Aurora Chess Club Carbon Copy (2 cols x 25 rows, 1 page)',
+    "Bob & Gord's Milton Rapid (2 pages)":
+        "Bob & Gord's Milton Rapid (2 cols x 20 rows x 2 pages)",
+    'Carbon Copy 50-Move (2 pages)':
+        'Carbon Copy (2 cols x 25 rows x 2 pages)',
+    'Chess Federation of Canada (2 pages)':
+        'Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, 2 pages)',
+    "Chess'n Math Association 75-Move Carbon Copy (1 page)":
+        "Chess'n Math Association Carbon Copy (3 cols x 25 rows, 1 page)",
+    'Collingwood-Somborac Chess Festival 50-Move Carbon Copy (1 page)':
+        'Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, 1 page)',
+    'Excelsior Chess Club (1 page)':
+        'Excelsior Chess Club Carbon Copy (2 cols x 24 rows, 1 page)',
+    'Federation Quebecoise Des Echecs 75-Move Carbon Copy (1 page)':
+        'Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, 1 page)',
+    'Forcing Moves First (2 pages)':
+        'Forcing Moves First (2 cols x 25 rows x 2 pages)',
+    'Hart House Chess Club 75-Move Carbon Copy (1 page)':
+        'Hart House Chess Club Carbon Copy (3 cols x 25 rows, 1 page)',
+    'Kitchener Waterloo Chess Club (2 pages)':
+        'Kitchener Waterloo Chess Club (2 cols x 30 rows x 2 pages)',
+    'Mississauga Chess Club (2 pages)':
+        'Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, 2 pages)',
+    'Mississauga Chess Club 40-Move Carbon Copy Old (1 page)':
+        'Mississauga Chess Club Carbon Copy Old (2 cols x 20 rows, 1 page)',
+    'Mississauga Chess Club 60-Move Carbon Copy (1 page)':
+        'Mississauga Chess Club Carbon Copy (3 cols x 20 rows, 1 page)',
+    'Niagara Chess (1 page)':
+        'Niagara Chess Carbon Copy (2 cols x 25 rows, 1 page)',
+    'Scarborough Chess Club (1 page)':
+        'Scarborough Chess Club Carbon Copy (3 cols x 26 rows, 1 page)',
+    'Silent Storm Chess Academy Brampton Carbon Copy (1 page)':
+        'Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, 1 page)',
+    'Vancity Chess Carbon Copy (1 page)':
+        'Vancity Chess Carbon Copy (2 cols x 30 rows, 1 page)',
+
+    // Wave 2 club names (move-count generation) → wave 3 (current cols x rows)
+    'Annex Chess Club Carbon Copy 50-Move (1 page)':
+        'Annex Chess Club Carbon Copy (2 cols x 25 rows, 1 page)',
+    'Aurora Chess Club Carbon Copy 50-Move (1 page)':
+        'Aurora Chess Club Carbon Copy (2 cols x 25 rows, 1 page)',
+    "Bob & Gord's Milton Rapid 80-Move (2 pages)":
+        "Bob & Gord's Milton Rapid (2 cols x 20 rows x 2 pages)",
+    'Carbon Copy 100-Move (2 pages)':
+        'Carbon Copy (2 cols x 25 rows x 2 pages)',
+    'Chess Federation of Canada 80-Move (2 pages)':
+        'Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, 2 pages)',
+    "Chess'n Math Association Carbon Copy 75-Move (1 page)":
+        "Chess'n Math Association Carbon Copy (3 cols x 25 rows, 1 page)",
+    'Collingwood-Somborac Chess Festival Carbon Copy 50-Move (1 page)':
+        'Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, 1 page)',
+    'Excelsior Chess Club Carbon Copy 48-Move (1 page)':
+        'Excelsior Chess Club Carbon Copy (2 cols x 24 rows, 1 page)',
+    'Federation Quebecoise Des Echecs Carbon Copy 75-Move (1 page)':
+        'Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, 1 page)',
+    'Forcing Moves First 100-Move (2 pages)':
+        'Forcing Moves First (2 cols x 25 rows x 2 pages)',
+    'Hart House Chess Club Carbon Copy 75-Move (1 page)':
+        'Hart House Chess Club Carbon Copy (3 cols x 25 rows, 1 page)',
+    'Kitchener Waterloo Chess Club 120-Move (2 pages)':
+        'Kitchener Waterloo Chess Club (2 cols x 30 rows x 2 pages)',
+    'Mississauga Chess Club 90-Move (2 pages)':
+        'Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, 2 pages)',
+    'Mississauga Chess Club Carbon Copy 40-Move Old (1 page)':
+        'Mississauga Chess Club Carbon Copy Old (2 cols x 20 rows, 1 page)',
+    'Mississauga Chess Club Carbon Copy 60-Move (1 page)':
+        'Mississauga Chess Club Carbon Copy (3 cols x 20 rows, 1 page)',
+    'Niagara Chess Carbon Copy 50-Move (1 page)':
+        'Niagara Chess Carbon Copy (2 cols x 25 rows, 1 page)',
+    'Scarborough Chess Club Carbon Copy 78-Move (1 page)':
+        'Scarborough Chess Club Carbon Copy (3 cols x 26 rows, 1 page)',
+    'Silent Storm Chess Academy Brampton Carbon Copy 70-Move (1 page)':
+        'Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, 1 page)',
+    'Vancity Chess Carbon Copy 60-Move (1 page)':
+        'Vancity Chess Carbon Copy (2 cols x 30 rows, 1 page)'
+};
 
 // In-memory state
 var _profiles = [];
@@ -250,6 +362,12 @@ function loadProfiles() {
 
     // Load active profile name
     _activeProfileName = localStorage.getItem(STORAGE_KEY_ACTIVE) || DEFAULT_PROFILES[0].name;
+
+    // Migrate legacy "rows x cols" default names to the new "cols x rows" names.
+    if (LEGACY_PROFILE_NAME_MAP[_activeProfileName]) {
+        _activeProfileName = LEGACY_PROFILE_NAME_MAP[_activeProfileName];
+        try { localStorage.setItem(STORAGE_KEY_ACTIVE, _activeProfileName); } catch (e) {}
+    }
 
     // Ensure active profile exists
     if (!_profiles.find(function(p) { return p.name === _activeProfileName; })) {
@@ -294,28 +412,83 @@ function setActiveProfile(name) {
 
 /**
  * Get grid config from the active profile for a specific page.
+ *
+ * **CYCLIC recycling** when pageNumber > profile.pages.length: the template
+ * is treated as one "sheet cycle" and repeated. For an asymmetric template
+ * (e.g., page 1 has a signature header, page 2 doesn't, different rowCount),
+ * page 3 mirrors page 1, page 4 mirrors page 2, page 5 mirrors page 1 again,
+ * and so on — exactly how a tournament player flips to a second double-sided
+ * scoresheet when the first runs out. R-style vector recycling.
+ *
+ * Literal fields (format, rowCount, headerRows, footerRows, gridType) recycle
+ * directly from the corresponding template page in the cycle.
+ *
+ * `startingMove` is the exception: it EXTRAPOLATES rather than literal-recycles.
+ * Each completed cycle adds `cycleSize` moves (sum of movesPerPage across all
+ * template pages). Without this, page 3 of a 2-page-profile game would inherit
+ * page 1's startingMove and its cell.num values would collide with page 1's —
+ * collapsing the tail in any code path that indexes cells by (num, color)
+ * (mergeSheets, _cellsToPaired in the orchestrator's noise gate, etc.).
+ *
+ * Per-page movesPerPage:
+ *   - '2col' → 2 moves per row × rowCount rows
+ *   - '3col' → 3 moves per row × rowCount rows
+ *
+ * Historical context: the longest official tournament game on record is
+ * Nikolić–Arsović, Belgrade 1989 — 269 moves (a draw). At ~40 moves per
+ * physical sheet that's roughly 7 pages, so the cyclic recycling handles
+ * even pathological game lengths without configuration.
+ *
  * @param {number} pageNumber - 1-based page number
  * @param {Object} overrides - Optional {format, rowCount} from per-sheet dropdowns
  * @returns {Object} - Extended grid config with headerRows, footerRows, startingMove
  */
 function getProfileGridConfig(pageNumber, overrides) {
     var profile = getActiveProfile();
-    var pageIdx = Math.min(pageNumber - 1, profile.pages.length - 1);
+    var nPages = profile.pages.length;
+    var zeroBased = pageNumber - 1;
+    var pageIdx = nPages > 0 ? (zeroBased % nPages) : 0;
+    var completedCycles = nPages > 0 ? Math.floor(zeroBased / nPages) : 0;
     var page = profile.pages[pageIdx];
 
     var format = (overrides && overrides.format) || page.format;
     var rowCount = (overrides && overrides.rowCount) || page.rowCount;
 
-    // Use getGridConfig from grid-detection.js
+    // Grid config (cell dimensions, column expectations).
     var config = (typeof getGridConfig === 'function')
         ? getGridConfig(rowCount, format)
         : { rowCount: rowCount, format: format, expectedCols: format === '2col' ? 7 : 10, internalDividers: format === '2col' ? 5 : 8 };
 
-    // Extend with profile fields
+    // Literal-recycled fields from the corresponding template page.
     config.headerRows = page.headerRows || 0;
     config.footerRows = page.footerRows || 0;
-    config.startingMove = page.startingMove || 1;
     config.gridType = page.gridType || 'full';
+
+    // startingMove: template's value + (completedCycles × cycleSize).
+    // cycleSize is the total moves represented by one full sweep of the
+    // template, computed by summing movesPerPage across every template page.
+    var templateStart = page.startingMove || 1;
+    if (completedCycles === 0) {
+        config.startingMove = templateStart;
+    } else {
+        var cycleSize = 0;
+        for (var ti = 0; ti < nPages; ti++) {
+            var tp = profile.pages[ti];
+            var tFmt = tp.format;
+            var tRows = tp.rowCount || 0;
+            var cols = (tFmt === '3col') ? 3 : 2;
+            cycleSize += tRows * cols;
+        }
+        config.startingMove = templateStart + completedCycles * cycleSize;
+        if (typeof console !== 'undefined') {
+            console.log('[ProfileConfig] page ' + pageNumber + ' wraps template (' +
+                        nPages + ' pages) — cycle #' + completedCycles +
+                        ' position #' + pageIdx +
+                        '; startingMove = ' + templateStart +
+                        ' + ' + completedCycles + ' × ' + cycleSize +
+                        ' = ' + config.startingMove);
+        }
+    }
 
     return config;
 }
@@ -526,14 +699,10 @@ function renderProfilePageRows(pages) {
                 </label>
                 <label class="text-gray-400">
                     Rows per column
-                    <select class="profile-pg-rows w-full bg-gray-600 text-white rounded px-2 py-1 mt-0.5">
-                        <option value="15" ${pg.rowCount == 15 ? 'selected' : ''}>15</option>
-                        <option value="20" ${pg.rowCount == 20 ? 'selected' : ''}>20</option>
-                        <option value="24" ${pg.rowCount == 24 ? 'selected' : ''}>24</option>
-                        <option value="25" ${pg.rowCount == 25 ? 'selected' : ''}>25</option>
-                        <option value="30" ${pg.rowCount == 30 ? 'selected' : ''}>30</option>
-                        <option value="35" ${pg.rowCount == 35 ? 'selected' : ''}>35</option>
-                    </select>
+                    <input type="number" min="5" max="60" step="1" list="rowcount-suggestions"
+                           value="${pg.rowCount || 20}"
+                           class="profile-pg-rows w-full bg-gray-600 text-white rounded px-2 py-1 mt-0.5"
+                           title="Any value (suggestions: 15/20/24/25/26/30/35)">
                 </label>
                 <label class="text-gray-400">
                     Header rows to skip

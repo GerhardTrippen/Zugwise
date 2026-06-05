@@ -10,7 +10,8 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 
 from helpers import (
     try_move, count_changes, get_semantic_changes, infer_move_squares,
-    piece_value, _is_valid_move_notation
+    piece_value, _is_valid_move_notation, _disambig_consistent_with_move,
+    extract_destination
 )
 from absurdity import would_capture_be_bad, is_piece_adequately_defended, is_piece_genuinely_hanging
 from play import is_bad_trade_move, check_piece_hanging
@@ -25,6 +26,12 @@ def is_forced_piece_substitution(board: chess.Board, original_san: str, correcte
 
     If a player has no rooks left, any R->K correction is forced (only king can move).
     Similarly, if there's no king confusion possible (always exists), we skip that direction.
+
+    A forced substitution swaps ONLY the piece letter (Rg1 -> Kg1); the
+    destination square must be unchanged. A correction that also moves the
+    piece to a different square (Rg1 -> Ka1) is a 2-change fix, not a forced
+    notation swap — it must go through the normal confirmation / deep-search
+    path so a same-destination alternative (e.g. Qg1) isn't silently lost.
     """
     if not original_san or not corrected_san:
         return False
@@ -34,6 +41,10 @@ def is_forced_piece_substitution(board: chess.Board, original_san: str, correcte
         return False
     if set([orig_piece, corr_piece]) != set(['K', 'R']):
         return False  # Only K<->R
+    # Destination must be identical — otherwise this is a different move, not a
+    # forced piece-letter swap.
+    if extract_destination(original_san) != extract_destination(corrected_san):
+        return False
     color = board.turn
     rook_count = len(board.pieces(chess.ROOK, color))
     if rook_count == 0:
@@ -330,6 +341,36 @@ def validate_moves(
                                 'original': san if san != corrected_san else None})
                 continue
 
+            # FORCED STOP: dual-sheet ambiguity. The merge flags a ply
+            # (ocr_data[i]['forced_stop']) when two confident sheets disagree on
+            # the move (near-tie). The cell text is the higher-confidence reading,
+            # but it is unresolved and must NOT be silently played through — stop
+            # here so the user chooses between the candidates (the fix UI surfaces
+            # the ocr_data alternatives). This replaces the old illegal "/"-marker
+            # trick: the move text stays a real, replayable move (so noise
+            # truncation / export / display see ordinary data) while this explicit
+            # flag — checked only here and in the search driver — does the
+            # stopping. Skipped once the user confirms the ply (approved_plies);
+            # resolution also clears the flag on the next merge.
+            #
+            # LEGALITY GUARD: only stop as 'ambiguous' when the flagged reading is
+            # actually LEGAL. The merge can pick an illegal higher-confidence
+            # reading (e.g. 1.B 'Kc5' @52%, illegal, vs legal 'c5'); that must be
+            # handled as a normal illegal fix below (which surfaces c5) — NOT as a
+            # keepable ambiguity (a "Keep Kc5" button is nonsense). So an illegal
+            # forced-stop reading falls through to Step 0.5 / the fix search.
+            if (ocr_data and i < len(ocr_data)
+                    and ocr_data[i].get('forced_stop')
+                    and i not in approved_plies
+                    and try_move(board, san, auto_correct=False) is not None):
+                stuck_at = i
+                stuck_move = san
+                stuck_reason = 'ambiguous'
+                stuck_explanation = ocr_data[i].get('ambiguous_explanation')
+                validated.append({'ply': i, 'san': san, 'status': 'error',
+                                  'original': san, 'forced_stop': True})
+                break
+
             # Step 0.5: High-confidence fallback (runs BEFORE try_move)
             # If top move is illegal AND there's an alternative with >50% confidence
             # (in dual mode this is the other sheet's top pick), try it directly.
@@ -345,7 +386,83 @@ def validate_moves(
             if try_move(board, san, auto_correct=False) is not None:
                 pass  # Top move is strictly legal — skip to Step 1
             else:
-                # Top move is illegal — check for high-confidence alternatives
+                # Top move is illegal — check for high-confidence alternatives.
+                #
+                # DUAL-SHEET DISAGREEMENT GUARD (pre-scan): before falling back
+                # to the OTHER sheet's >50% reading, find the legal alternative
+                # that is the CLOSEST (fewest char edits) to the illegal primary
+                # text. If that nearest legal reading is STRICTLY closer than the
+                # >50% fallback AND points to a different move, the two sheets
+                # genuinely disagree and the higher-confidence sheet (whose
+                # reading became the cell text) plainly meant its own closer
+                # move. Example (15.B): sheet1 'Rb4'@0.88 — a b-file rook move
+                # whose only legal reading is 'Rb8' (4->8, 1 edit) — vs sheet2
+                # 'Rd8'@0.67 (the OTHER rook, 2 edits, blocked from b8 by Bc8).
+                # The old dual fallback silently applied 'Rd8' because 'Rb4'->
+                # 'Rd8' isn't a SEMANTIC change (no piece/capture swap). That is
+                # a confident-wrong commit: it overrides the more-confident sheet
+                # with the less-confident one. Surface it as an 'ambiguous'
+                # forced-stop displaying the closer legal reading so the user
+                # picks (Keep Rb8 / replace with Rd8). See CLAUDE.md "One or
+                # Nothing" — when two legal readings compete, don't auto-apply.
+                nearest_legal_san = None
+                nearest_legal_changes = None
+                if i < len(ocr_data) and ocr_data[i].get('alternatives'):
+                    for alt in ocr_data[i]['alternatives']:
+                        normalized = normalize_candidate(alt)
+                        if not normalized:
+                            continue
+                        nl_move, _nl_conf = normalized
+                        try:
+                            nl_parsed = board.parse_san(nl_move)
+                        except Exception:
+                            continue
+                        if nl_parsed not in board.legal_moves:
+                            continue
+                        if not _is_valid_move_notation(nl_move, nl_parsed, board):
+                            continue
+                        nl_canon = board.san(nl_parsed)
+                        nl_changes = count_changes(san, nl_canon)
+                        if nearest_legal_changes is None or nl_changes < nearest_legal_changes:
+                            nearest_legal_changes = nl_changes
+                            nearest_legal_san = nl_canon
+
+                # PAWN-MOVE PROBE (one-or-nothing): a phantom leading piece
+                # letter on a pawn push is a common OCR error — a stray mark
+                # before 'e3' reads as 'N', giving the illegal 'Ne3'. Dropping
+                # the piece letter yields the pawn move 'e3' (SAME destination
+                # square), a candidate the character corrector never generates
+                # and the dual fallback never considers. It competes head-on
+                # with the piece-move fix at EQUAL edit distance (Ne3->Nf3 vs
+                # Ne3->e3, both 1 edit), so the strictly-closer guard above
+                # misses it. Surface that as ambiguous instead of silently
+                # committing the piece move.
+                #
+                # GROUNDING: require the pawn move to actually appear in the
+                # alternatives (a sheet genuinely read it). This keeps the probe
+                # tied to OCR evidence and — critically — avoids the 15.B 'Rb4'
+                # regression: there 'b4' (pawn b5->b4) is legal but NO sheet
+                # read it, so the rook reading 'Rb8' (handled by the strictly-
+                # closer guard) must win, not a synthesized pawn push.
+                pawn_legal_san = None
+                if san and san[0] in 'NBRQK':
+                    _pawn_txt = san[1:]  # 'e3', 'e3+', 'e8=Q' ...
+                    if (_pawn_txt and _pawn_txt[0] in 'abcdefgh' and 'x' not in _pawn_txt):
+                        _alt_sans = set()
+                        if i < len(ocr_data) and ocr_data[i].get('alternatives'):
+                            for _a in ocr_data[i]['alternatives']:
+                                _n = normalize_candidate(_a)
+                                if _n:
+                                    _alt_sans.add(_n[0])
+                        if _pawn_txt in _alt_sans:
+                            try:
+                                _pp = board.parse_san(_pawn_txt)
+                                if (_pp in board.legal_moves
+                                        and _is_valid_move_notation(_pawn_txt, _pp, board)):
+                                    pawn_legal_san = board.san(_pp)
+                            except Exception:
+                                pass
+
                 if i < len(ocr_data) and ocr_data[i].get('alternatives'):
                     for alt in ocr_data[i]['alternatives']:
                         normalized = normalize_candidate(alt)
@@ -368,22 +485,66 @@ def validate_moves(
                                 continue
                             if is_move_absurd(board, parsed):
                                 continue
-                            # Legal and not absurd — play it
-                            print(f"  [DUAL FALLBACK] ply {i}: '{san}' illegal, using high-conf alt '{alt_move}' ({alt_conf:.0%})")
+                            # Legal and not absurd — play it.
+                            # Canonicalize via board.san(parsed) before push: an OCR alt
+                            # like "Rbc8" carries the player's over-specified disambig,
+                            # which chess.js 0.12.0 strictly rejects (canonical is just
+                            # "Rc8" when only one rook can reach c8 — the b3 rook can't).
+                            # Storing the alt verbatim leaves state.sans with a SAN the
+                            # frontend can't replay, freezing the board at that ply.
+                            # python-chess's board.san emits canonical SAN; everything
+                            # downstream (move list, navigation, PGN export) needs it.
+                            canon_san = board.san(parsed)
+                            # DISAGREEMENT GUARD: a genuinely competing legal
+                            # reading of the illegal primary exists -> don't
+                            # auto-apply this fallback; stop as 'ambiguous' so
+                            # the user picks. Two triggers, in priority order:
+                            #   1. A strictly-closer cross-sheet reading (15.B
+                            #      'Rb4'@0.88 -> 'Rb8' (1 edit) beats fallback
+                            #      'Rd8' (2 edits)) — the higher-confidence
+                            #      sheet plainly meant its own closer move.
+                            #   2. The pawn-move version (phantom piece letter,
+                            #      4.W 'Ne3' -> 'e3' vs fallback 'Nf3', both 1
+                            #      edit) — equal distance, so it isn't caught by
+                            #      (1), but a sheet read the pawn push and it is
+                            #      legal, so the reading is ambiguous.
+                            ambiguous_alt = None
+                            if (nearest_legal_san is not None
+                                    and nearest_legal_changes < count_changes(san, canon_san)
+                                    and nearest_legal_san != canon_san):
+                                ambiguous_alt = nearest_legal_san
+                            elif pawn_legal_san is not None and pawn_legal_san != canon_san:
+                                ambiguous_alt = pawn_legal_san
+                            if ambiguous_alt is not None:
+                                print(f"  [DUAL DISAGREE] ply {i}: '{san}' illegal; "
+                                      f"competing legal reading '{ambiguous_alt}' vs "
+                                      f"fallback '{canon_san}' — surfacing as ambiguous")
+                                stuck_at = i
+                                stuck_move = ambiguous_alt
+                                stuck_reason = 'ambiguous'
+                                stuck_explanation = (
+                                    f"Two readings: '{ambiguous_alt}' vs "
+                                    f"'{canon_san}' (OCR read '{san}')")
+                                validated.append({'ply': i, 'san': ambiguous_alt,
+                                                  'status': 'error', 'original': san,
+                                                  'forced_stop': True})
+                                move = parsed  # non-None: signals "handled" below
+                                break
+                            print(f"  [DUAL FALLBACK] ply {i}: '{san}' illegal, using high-conf alt '{alt_move}' ({alt_conf:.0%}) -> canon '{canon_san}'")
                             board.push(parsed)
-                            should_stop, ead_reason, ead_info = check_ead_after_move(i, parsed, alt_move)
+                            should_stop, ead_reason, ead_info = check_ead_after_move(i, parsed, canon_san)
                             if should_stop:
                                 stuck_at = i
-                                stuck_move = alt_move
+                                stuck_move = canon_san
                                 stuck_reason = ead_reason
                                 stuck_explanation = ead_info
                                 stuck_from_square = chess.square_name(parsed.from_square)
                                 stuck_to_square = chess.square_name(parsed.to_square)
-                                validated.append({'ply': i, 'san': alt_move, 'status': 'warning',
+                                validated.append({'ply': i, 'san': canon_san, 'status': 'warning',
                                                 'warning': ead_info, 'original': san})
                                 break
                             validated.append({
-                                'ply': i, 'san': alt_move, 'status': 'ok',
+                                'ply': i, 'san': canon_san, 'status': 'ok',
                                 'original': san,
                                 'ocr_alt_applied': True,
                                 'ocr_alt_confidence': alt_conf,
@@ -460,21 +621,26 @@ def validate_moves(
 
                         board.push(best_move)
 
-                        should_stop, ead_reason, ead_info = check_ead_after_move(i, best_move, best_alt)
+                        # Store canonical SAN (corrected_san = board.san(best_move),
+                        # already computed above for the num_changes gate). Mirrors
+                        # the DUAL FALLBACK fix: an OCR alt like "Rbc8" canonicalizes
+                        # to "Rc8" and the frontend (chess.js 0.12.0) can only replay
+                        # canonical SAN.
+                        should_stop, ead_reason, ead_info = check_ead_after_move(i, best_move, corrected_san)
                         if should_stop:
                             stuck_at = i
-                            stuck_move = best_alt
+                            stuck_move = corrected_san
                             stuck_reason = ead_reason
                             stuck_explanation = ead_info
                             stuck_from_square = chess.square_name(best_move.from_square)
                             stuck_to_square = chess.square_name(best_move.to_square)
-                            validated.append({'ply': i, 'san': best_alt, 'status': 'warning',
+                            validated.append({'ply': i, 'san': corrected_san, 'status': 'warning',
                                             'warning': ead_info, 'original': san})
                             break
 
                         validated.append({
                             'ply': i,
-                            'san': best_alt,
+                            'san': corrected_san,
                             'status': 'ok',
                             'original': san,
                             'ocr_alt_applied': True,
@@ -531,7 +697,57 @@ def validate_moves(
             # max_changes=1 succeeded - check for semantic changes
             corrected_san = board.san(move)
 
-            if san != corrected_san:
+            # Unnecessary-but-correct disambiguation (e.g. "Nge2" canonicalizes
+            # to "Ne2" when Nc3 is pinned) is a notation-only normalization,
+            # not a substitution. Skip the confirmation flow entirely and
+            # suppress the ⚡ "auto-corrected" indicator on the move list —
+            # many PGN tools emit redundant disambig and flagging every one
+            # as needing review is noise. The user typed valid SAN; there is
+            # literally no semantic correction happening, just python-chess's
+            # minimal-SAN preference. Same suppression that similarity_autofix=on
+            # already does for clean 1-change diffs, but unconditional here
+            # because this isn't a substitution at all.
+            is_only_disambig_cleanup = (
+                san != corrected_san and
+                san.rstrip('+#') != corrected_san.rstrip('+#') and
+                not get_semantic_changes(san, corrected_san) and
+                _disambig_consistent_with_move(san, move)
+            )
+
+            # Inferred capture: the player omitted the 'x' and we added it
+            # (e.g. "Nb5" -> "Nxb5" because b5 is occupied). When b5 is
+            # occupied there is no non-capturing reading, so adding 'x' is
+            # normally safe notation cleanup — handwritten scoresheets omit
+            # 'x' constantly — and falls through is_only_disambig_cleanup
+            # silently. But because WE inferred a capture the player never
+            # marked, a material LOSS is evidence the OCR/inference is wrong:
+            # surface it for review instead of committing it silently.
+            #
+            # Tighter SEE threshold than the explicit-capture EAD gate
+            # (loss >= 1 here vs loss >= 2 in check_ead_after_move): if the
+            # player HAD written "Nxb5" we'd trust their intent and only flag
+            # a >=2 loss, but an UNMARKED capture that even slightly loses
+            # material is suspect. Clean/winning/equal inferred captures
+            # (loss <= 0) stay silent — the common, safe case. SEE-backed, so
+            # this stays within the "no chess-quality signals" rule.
+            if (use_ead and 'x' not in san and board.is_capture(move)
+                    and i not in approved_plies):
+                is_forced = board.is_check() and len(list(board.legal_moves)) == 1
+                is_bad, loss, explanation = is_bad_trade_move(board, move, threshold=1)
+                if is_bad and not is_forced:
+                    print(f"  [CONFIRM] ply {i}: inferred capture '{san}' -> "
+                          f"'{corrected_san}' loses {loss}: {explanation}")
+                    pending_confirmation = {
+                        'ply': i,
+                        'original': san,
+                        'suggested': corrected_san,
+                        'num_changes': count_changes(san, corrected_san),
+                        'semantic_reasons': ['inferred capture (added x) loses material'],
+                        'absurd_warning': f"Inferred capture loses material: {explanation}",
+                    }
+                    raise ValueError(f"Needs confirmation: {san} -> {corrected_san}")
+
+            if san != corrected_san and not is_only_disambig_cleanup:
                 # Always auto-apply if only difference is check/checkmate symbols (+/#)
                 # These are pure notation corrections, not semantic changes
                 if san.rstrip('+#') != corrected_san.rstrip('+#'):
@@ -558,6 +774,13 @@ def validate_moves(
 
             board.push(move)
 
+            # Pass original=None for disambig-only cleanup so the frontend
+            # doesn't render a ⚡ "auto-corrected from Nge2" indicator. The
+            # canonical SAN ("Ne2") is what gets stored; the input SAN was
+            # just a redundantly-disambiguated representation of the same
+            # move and there's nothing to surface to the user.
+            _orig_for_validated = None if is_only_disambig_cleanup else (san if san != corrected_san else None)
+
             should_stop, ead_reason, ead_info = check_ead_after_move(i, move, corrected_san)
             if should_stop:
                 stuck_at = i
@@ -567,15 +790,49 @@ def validate_moves(
                 stuck_from_square = chess.square_name(move.from_square)
                 stuck_to_square = chess.square_name(move.to_square)
                 validated.append({'ply': i, 'san': corrected_san, 'status': 'warning',
-                                'warning': ead_info, 'original': san if san != corrected_san else None})
+                                'warning': ead_info, 'original': _orig_for_validated})
                 break
 
             validated.append({'ply': i, 'san': corrected_san, 'status': 'ok',
-                            'original': san if san != corrected_san else None})
+                            'original': _orig_for_validated})
 
-            # If position is checkmate, game is over - remaining moves are noise
+            # Position is checkmate but the scoresheet has more moves.
+            #
+            # Two very different situations look the same here:
+            #   - ONE trailing token  -> genuine noise (a stray mark, or the
+            #     "1-0"/result digit OCR'd as a move). Trim it; the game really
+            #     did end in mate.
+            #   - TWO OR MORE trailing moves -> the players physically kept
+            #     recording moves, so the game did NOT end. This "mate" is a
+            #     reconstruction error UPSTREAM (e.g. 24.Qh6# is only mate
+            #     because 23...Rc8 should have been 23...Qc8, which keeps e8
+            #     open for the king). Silently trimming hides the error and the
+            #     board freezes at a phantom mate. Instead, get stuck on the
+            #     move that can't be played and let the backtracker search the
+            #     earlier plies for the correction that un-mates the position.
+            #
+            # This is a reconstruction-plausibility signal ("the game provably
+            # continued"), NOT a chess-quality judgement, so it belongs here.
             if board.is_checkmate() and i + 1 < len(moves):
-                print(f"[VALIDATE] Checkmate after ply {i} - trimming {len(moves) - i - 1} remaining moves")
+                remaining = len(moves) - i - 1
+                if remaining <= 1:
+                    print(f"[VALIDATE] Checkmate after ply {i} - trimming {remaining} trailing move(s) as noise")
+                    break
+                # Spurious mate: stick on the next (unplayable) move so the
+                # backtracker runs from there back through the earlier plies.
+                stuck_at = i + 1
+                stuck_move = moves[i + 1]
+                stuck_reason = "premature_mate"
+                stuck_explanation = (
+                    f"{corrected_san} is checkmate, but {remaining} more moves were "
+                    f"recorded after it. The game continued, so this mate is likely a "
+                    f"reconstruction error in an earlier move - the engine should "
+                    f"backtrack to find the correction that keeps the game going."
+                )
+                print(f"[VALIDATE] Premature mate at ply {i} ({corrected_san}) "
+                      f"with {remaining} moves still recorded - stuck at ply {i + 1}")
+                validated.append({'ply': i + 1, 'san': moves[i + 1], 'status': 'error',
+                                  'error': stuck_explanation})
                 break
 
         except Exception as e:

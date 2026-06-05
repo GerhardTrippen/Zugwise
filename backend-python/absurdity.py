@@ -169,6 +169,47 @@ def side_has_independent_free_capture(board: chess.Board, by_color: chess.Color)
     return False
 
 
+def move_attacks_compensating_target(
+    board: chess.Board,
+    move: chess.Move,
+    min_value: int,
+) -> bool:
+    """
+    Did the move-just-played itself create an attack on an opponent piece of
+    value >= min_value that is classically free in the resulting position?
+
+    Distinguishes a structural sacrifice (Ulvestad 5...b5: pawn attacks Bc4
+    while leaving Nc6 hanging — the pawn fork IS the compensation) from a
+    coincidental mutual-hang OCR ghost (two unrelated free captures fluking
+    to net 0). In a real fork the moved piece directly threatens the
+    opponent's hanging material; in an OCR ghost the geometry is unrelated.
+
+    Args:
+        board:     position AFTER the move was played
+        move:      the move just played (its to_square is the moved piece's
+                   new location, whose attacks are examined)
+        min_value: minimum value of the attacked piece for it to count as
+                   compensation — typically the value of our hanging piece,
+                   so the trade is at least even.
+
+    Returns: True if at least one opponent piece worth >= min_value is
+             attacked from move.to_square AND is classically free.
+    """
+    moved_piece = board.piece_at(move.to_square)
+    if moved_piece is None:
+        return False
+    side_that_moved = moved_piece.color
+    for atk_sq in board.attacks(move.to_square):
+        opp_piece = board.piece_at(atk_sq)
+        if opp_piece is None or opp_piece.color == side_that_moved:
+            continue
+        if _piece_value(opp_piece) < min_value:
+            continue
+        if is_classically_hanging_free(board, atk_sq, opp_piece):
+            return True
+    return False
+
+
 def find_hanging_pieces(board: chess.Board, side: chess.Color, min_value: int = 3) -> List[Tuple[chess.Square, chess.Piece, int]]:
     """
     Find all pieces of 'side' that are apparently hanging.
@@ -357,6 +398,23 @@ def is_piece_genuinely_hanging(
             attacker_captures.append((_piece_value(att_piece), att_sq, att_piece, capture_move))
         attacker_captures.sort(key=lambda x: x[0])  # Lowest value attacker first
 
+        # No legal captures of the target — the piece is not actually
+        # capturable, so it isn't hanging. Layer 1 (is_apparently_hanging)
+        # returned True based on raw board.attackers() geometry, which can
+        # include pieces that can't legally capture (e.g., a king that
+        # would move into check from a defender). Without this guard, those
+        # cases fell through to the unconditional "hanging (fast mode)"
+        # return at the bottom of this block. Reported: knight on c6 after
+        # 41.W axb5 — only geometric attacker is Kb7, but Kxc6 is illegal
+        # (the b5 pawn defends c6, king would move into check). Knight is
+        # safe; fast-mode falsely flagged it as hanging and made the
+        # algorithms propose spurious upstream fixes.
+        if not attacker_captures:
+            if debug:
+                print(f"    [HANG-DEBUG] {piece.symbol()} on {sq_name}: "
+                      f"fast mode - NOT hanging (no legal captures)")
+            return False, 0, "fast mode: no legal captures"
+
         # Squares attacked by our just-moved piece — used to gate the
         # non-queen trade check (see comment above). Empty when no move
         # context is available; non-queens then fall through to "hanging".
@@ -417,6 +475,45 @@ def is_piece_genuinely_hanging(
             print(f"    [HANG-DEBUG] {piece.symbol()} on {sq_name}: hanging (fast mode)")
         return True, value, "hanging (fast mode)"
 
+    # Promotion-compensation check (mirrors the fast_mode block above).
+    # If opponent captures our hanging piece and on our reply we have a
+    # legal pawn promotion that survives (the new queen isn't immediately
+    # captured), the "hang" is a deliberate sacrifice — the player traded
+    # a minor/rook for a queen. Standard quiescence skips non-capture
+    # promotions, so without this check the EAD non-fast path flagged
+    # promotion-threat sacrifices as OCR errors. Reported case: 33.B c2
+    # (pushing to the 7th) "leaves Bd7 hanging" — but after Qxd7, Black
+    # plays c1=Q for +9 promotion vs −3 bishop, a clear sac.
+    # Cheapest attacker only — opponent will use that one — and we
+    # confirm survival to avoid greenlighting promotions that simply
+    # walk into another capture.
+    _opp = not piece.color
+    _att_list = []
+    for _a_sq in board.attackers(_opp, square):
+        _a_p = board.piece_at(_a_sq)
+        if _a_p is None:
+            continue
+        _cap_mv = chess.Move(_a_sq, square)
+        if _cap_mv not in board.legal_moves:
+            continue
+        _att_list.append((_piece_value(_a_p), _a_sq, _cap_mv))
+    _att_list.sort(key=lambda x: x[0])
+    if _att_list:
+        _att_val, _a_sq, _cap_mv = _att_list[0]
+        _tb = board.copy()
+        _tb.push(_cap_mv)
+        for _promo_mv in _tb.legal_moves:
+            if _promo_mv.promotion is None:
+                continue
+            _tb2 = _tb.copy()
+            _tb2.push(_promo_mv)
+            if not _tb2.is_attacked_by(_opp, _promo_mv.to_square):
+                if debug:
+                    print(f"    [HANG-DEBUG] {piece.symbol()} on {sq_name}: "
+                          f"NOT hanging (promotion compensation: {_tb.san(_promo_mv)} "
+                          f"survives after {board.san(_cap_mv)})")
+                return False, 0, "promotion compensation"
+
     # Full quiescence check - is capturing this piece actually bad for opponent?
     is_trap, net_gain, expl = would_capture_be_bad_quiescence(
         board, square, threshold=0, max_depth=8, debug=debug
@@ -446,34 +543,103 @@ def is_piece_genuinely_hanging(
 # =============================================================================
 
 def count_material(board: chess.Board, color: chess.Color) -> int:
-    """Count total material for one side."""
-    total = 0
-    for sq in chess.SQUARES:
-        p = board.piece_at(sq)
-        if p and p.color == color:
-            total += _piece_value(p)
-    return total
+    """Count total material for one side.
+
+    Bitboard popcount instead of a 64-square piece_at scan: this is called
+    twice per quiescence node (my_mat / opp_mat) and was a top profiler entry
+    (~25M piece_at calls). Values mirror PIECE_VALUES exactly (king=0, so it
+    is omitted). Verified identical to the old scan across 3000 random games.
+    """
+    occ = board.occupied_co[color]
+    return (chess.popcount(board.pawns & occ)
+            + chess.popcount(board.knights & occ) * 3
+            + chess.popcount(board.bishops & occ) * 3
+            + chess.popcount(board.rooks & occ) * 5
+            + chess.popcount(board.queens & occ) * 9)
+
+
+# Full queen-line mask (rank | file | both diagonals, blockers IGNORED) per
+# square, precomputed once. NOT chess.BB_*_MASKS — those are magic occupancy
+# masks that EXCLUDE edge squares (e.g. they drop g8 from the g-file), which
+# would miss edge-square checks. get_forcing_moves_ordered uses this to cheaply
+# pre-filter quiet moves that cannot possibly give check.
+_KING_LINE_MASK = []
+for _k in range(64):
+    _kf, _kr = _k & 7, _k >> 3
+    _m = 0
+    for _s in range(64):
+        _x, _y = _s & 7, _s >> 3
+        if _x == _kf or _y == _kr or abs(_x - _kf) == abs(_y - _kr):
+            _m |= 1 << _s
+    _KING_LINE_MASK.append(_m)
 
 
 def get_forcing_moves_ordered(board: chess.Board) -> List[chess.Move]:
     """
     Get forcing moves, ordered by priority.
-    
+
     CRITICAL: When in check, ALL legal moves are forcing (must escape check).
-    Otherwise, only captures and checks are forcing.
+    Otherwise: captures, checks, AND non-capture promotions are forcing.
+    Promotions are forcing because they swing material by ~8 (queen − pawn);
+    without them quiescence misses winning sacrifices like 51.B Nb4 where
+    Black gives up the knight expecting 52.W Nxb4 a1=Q — the standard
+    "captures only" quiescence let White stand-pat after Nxb4 and never
+    saw a1=Q, falsely flagging Nb4 as a hanging blunder.
+
+    PERF: board.gives_check(m) (an internal push/is_check/pop) was 60% of the
+    quiescence runtime, and ~88% of those calls were on quiet moves just to
+    decide whether they're forcing. A quiet move can only give check if its
+    destination attacks the enemy king (lands on a king queen-line for
+    sliders/pawns, or a knight-jump) or its origin vacates a king queen-line
+    (discovered check) — or it's a castling move (rook can check). That test is
+    a strict SUPERSET of checking moves (over-approximates by ignoring blockers),
+    so we skip gives_check on quiet moves that fail it and still call it on the
+    survivors to confirm. The emitted list is byte-identical to the unfiltered
+    version — verified across ~40k random positions and the superset invariant
+    (gives_check ⟹ filter) across 667k quiet moves. Filters ~61% of quiet
+    moves; gives_check is still used as-is for captures/promos/in-check moves
+    (where it only refines ordering), so their order is untouched.
     """
     moves = []
     in_check = board.is_check()
-    
+
+    # Pre-filter masks (only meaningful when not already in check — in check,
+    # every legal move is forcing and gives_check just orders).
+    if not in_check:
+        opp_king = board.king(not board.turn)
+        my_king = board.king(board.turn)
+        if opp_king is not None:
+            king_lines = _KING_LINE_MASK[opp_king]
+            check_to = king_lines | chess.BB_KNIGHT_ATTACKS[opp_king]
+        else:
+            king_lines = check_to = ~0  # no enemy king (degenerate) → filter nothing
+
     for m in board.legal_moves:
-        is_check = board.gives_check(m)
         is_cap = board.is_capture(m)
-        
-        if in_check or is_check or is_cap:
-            cap_val = _piece_value(board.piece_at(m.to_square)) if is_cap and board.piece_at(m.to_square) else 0
-            priority = (100 if is_check else 0) + cap_val + (0 if (is_check or is_cap) else -50)
-            moves.append((priority, m))
-    
+        is_promo = m.promotion is not None
+
+        if in_check or is_cap or is_promo:
+            # Forcing regardless; gives_check only refines ordering (unchanged).
+            is_check = board.gives_check(m)
+        else:
+            # Quiet move, not in check: forcing iff it gives check. Skip the
+            # expensive gives_check when geometry proves it can't.
+            could_check = (bool(check_to & chess.BB_SQUARES[m.to_square])
+                           or bool(king_lines & chess.BB_SQUARES[m.from_square])
+                           or (m.from_square == my_king
+                               and abs((m.to_square & 7) - (m.from_square & 7)) == 2))
+            if not could_check:
+                continue
+            is_check = board.gives_check(m)
+            if not is_check:
+                continue
+
+        cap_val = _piece_value(board.piece_at(m.to_square)) if is_cap and board.piece_at(m.to_square) else 0
+        promo_bonus = 8 if is_promo else 0  # queen − pawn material swing
+        tactical = is_check or is_cap or is_promo
+        priority = (100 if is_check else 0) + cap_val + promo_bonus + (0 if tactical else -50)
+        moves.append((priority, m))
+
     moves.sort(key=lambda x: x[0], reverse=True)
     return [m for _, m in moves]
 
@@ -522,45 +688,89 @@ def would_capture_be_bad_quiescence(board: chess.Board, capture_square: chess.Sq
     best_gain = -9999
     best_expl = ""
     
+    def _opp_has_near_promo_pawn(b: chess.Board) -> bool:
+        """Does b.turn's opponent have a pawn one ply from promoting?
+        White pawn on rank 7 (index 6) or black pawn on rank 2 (index 1).
+        Such a position is NOT quiet — the side to move cannot stand-pat
+        because the opponent's next move will be a promotion (~+8 material)."""
+        # Bitboard test instead of a 64-square scan: called once per
+        # quiescence node (~120K times) and was a top profiler entry. White
+        # pawn on rank 7 (BB_RANK_7) or black pawn on rank 2 (BB_RANK_2) is one
+        # ply from promoting. Verified identical to the old scan across 3000
+        # random games.
+        opp = not b.turn
+        opp_pawns = b.pawns & b.occupied_co[opp]
+        near_rank = chess.BB_RANK_7 if opp == chess.WHITE else chess.BB_RANK_2
+        return bool(opp_pawns & near_rank)
+
     def quiescence(b: chess.Board, depth: int, alpha: int, beta: int) -> int:
         """Quiescence search from capturer's perspective."""
         in_check = b.is_check()
-        
+        # Disable stand-pat when opponent has a pawn one square from
+        # promoting. Reported case: 39...Ra2 (rook sacrifice). After
+        # 40.Bxa2 bxa2, the b-pawn lands on a2 (rank 2 for Black =
+        # one ply from a1=Q). Standard quiescence let White stand-pat
+        # at +2 (gained rook, lost bishop) and never saw that not
+        # capturing the pawn loses ~8 to the promotion — so it flagged
+        # Ra2 as hanging. Treating "opp has near-promo pawn" the same
+        # as being in check (no stand-pat, must explore forcing moves)
+        # corrects the eval to net 0, well below the hanging threshold.
+        opp_promo_threat = _opp_has_near_promo_pawn(b)
+        must_move = in_check or opp_promo_threat
+
         # Terminal conditions
         if b.is_checkmate():
             return -9999 if b.turn == capturer_color else 9999
-        if b.is_stalemate() or b.can_claim_draw():
+        # Draw detection: use is_repetition(3) (position has actually repeated
+        # 3 times on the board) rather than can_claim_draw(). can_claim_draw()
+        # loops over EVERY legal move pushing/popping each to test a *claimable*
+        # repetition, plus runs the fifty-move scan — both walk the full
+        # real-game move stack carried into quiescence, making each node O(stack
+        # * legal_moves). That dominated runtime (~40% of total, scaling with
+        # game depth). is_repetition(3) is the only draw condition that
+        # meaningfully arises inside a short capture/check quiescence, and is
+        # ~5x cheaper overall. A genuine threefold still evaluates to 0.
+        if b.is_stalemate() or b.is_repetition(3):
             return 0
-        
+
         # Current material advantage for capturer
         my_mat = count_material(b, capturer_color)
         opp_mat = count_material(b, not capturer_color)
         stand_pat = my_mat - opp_mat
-        
-        # Depth limit
+
+        # Depth limit — when opp is about to promote, deduct the queen-pawn
+        # swing so the truncated branch isn't artificially optimistic for
+        # the side to move.
         if depth >= max_depth:
+            if opp_promo_threat:
+                return stand_pat - 8 if b.turn == capturer_color else stand_pat + 8
             return stand_pat
-        
+
         # Get forcing moves
         forcing = get_forcing_moves_ordered(b)
-        
-        # If no forcing moves and not in check, position is quiet
-        if not forcing and not in_check:
+
+        # If no forcing moves and not must-move, position is quiet
+        if not forcing and not must_move:
             return stand_pat
-        
-        # If in check but no legal moves, checkmate
+
+        # If must-move but no legal moves (only possible when in_check):
+        # checkmate. opp_promo_threat without legal moves means stalemate,
+        # already handled above.
         if not forcing and in_check:
             return -9999 if b.turn == capturer_color else 9999
-        
+        if not forcing and opp_promo_threat:
+            # No forcing options to stop the promotion — concede the swing.
+            return stand_pat - 8 if b.turn == capturer_color else stand_pat + 8
+
         if b.turn == capturer_color:
             # Maximize our advantage
-            if not in_check:
+            if not must_move:
                 if stand_pat >= beta:
                     return beta
                 if stand_pat > alpha:
                     alpha = stand_pat
-            
-            best = stand_pat if not in_check else -9999
+
+            best = stand_pat if not must_move else -9999
             for m in forcing:
                 b.push(m)
                 score = quiescence(b, depth + 1, alpha, beta)
@@ -574,13 +784,13 @@ def would_capture_be_bad_quiescence(board: chess.Board, capture_square: chess.Sq
             return best
         else:
             # Opponent minimizes our advantage
-            if not in_check:
+            if not must_move:
                 if stand_pat <= alpha:
                     return alpha
                 if stand_pat < beta:
                     beta = stand_pat
-            
-            best = stand_pat if not in_check else 9999
+
+            best = stand_pat if not must_move else 9999
             for m in forcing:
                 b.push(m)
                 score = quiescence(b, depth + 1, alpha, beta)
@@ -915,10 +1125,19 @@ def detect_absurdity_at_ply(moves: List[str], check_ply: int,
     if not candidates:
         return None
 
-    # If opponent gives CHECK on the very next move, that's a strong
-    # tactical choice — not evidence of OCR error.
-    # We no longer exempt the case where opponent simply captures the hanging piece:
-    # losing material for nothing is absurd regardless of whether the opponent takes.
+    # Two exemptions for the next-move check:
+    #  (a) opponent gives check on the next move — strong tactical choice,
+    #      not evidence of OCR error. Clear all candidates.
+    #  (b) opponent captures the specific hanging candidate on the next
+    #      move — normal exchange, not OCR error. Drop that candidate only.
+    # Symmetric with the play.py/validation.py exemptions: a piece that
+    # gets immediately taken IS a normal exchange, not a multi-ply hanging
+    # absurdity. The persistent-absurdity tracker still flags pieces that
+    # hang across multiple plies with no reaction. Reported case: 41.W axb5
+    # leaves R on c8 attacked by Bf5 (SEE-loss of 2 for white); black plays
+    # Bxc8 immediately. Live walked through cleanly; the algorithms found
+    # the absurdity here via find_all_absurdities → detect_absurdity_at_ply
+    # and proposed spurious upstream fixes.
     if check_ply + 1 < len(moves):
         next_move = try_move(board, moves[check_ply + 1])
         if next_move:
@@ -927,6 +1146,9 @@ def detect_absurdity_at_ply(moves: List[str], check_ply: int,
             board.pop()
             if next_move_gives_check:
                 candidates = []
+            elif board.is_capture(next_move):
+                captured_sq = next_move.to_square
+                candidates = [c for c in candidates if c[0] != captured_sq]
 
     if not candidates:
         return None
@@ -1009,9 +1231,81 @@ def find_first_absurdity_full(moves: List[str], verbose: bool = False,
     return None
 
 
+class AbsurditiesPrefixCache:
+    """Snapshot cache for ``find_all_absurdities`` — board state + accumulated
+    absurdities, snapshotted at each successfully-played ply.
+
+    Lets ``find_all_absurdities`` resume mid-game instead of replaying from
+    ply 0 every call. Search algorithms call it repeatedly across iterations
+    with only a single move differing between calls, so without a cache the
+    work compounds quickly.
+
+    What's stored per ply: a board copy and the absurdities accumulated so
+    far. ``Absurdity`` instances are constructed once and never mutated, so
+    snapshot entries can be shared safely across cache copies (analogous to
+    ``EadPrefixCache``).
+
+    Invariants and rules:
+      - ``snapshots[k]`` is the state AFTER processing ply k: board at
+        position k+1 and absurdities at plies 0..k. Length = plies processed.
+      - The cache is tied to ``fast_mode`` (Layer 2 quiescence on or off).
+        Different ``fast_mode`` values produce different absurdities — never
+        share a cache across them. (severity_threshold is hardcoded to 2.)
+      - ``invalidate_from(F)`` MUST be called after any mutation to
+        ``moves[F]``. ``detect_absurdity_at_ply`` consults ``moves[F+1-1] =
+        moves[F]`` via the opponent-takes-hanging exemption (and
+        ``_detect_hanging_pieces`` likewise), so a snapshot recorded at ply
+        F-1 may have used the old ``moves[F]``. We drop snapshots[F-1:].
+      - Like the other caches: one cache instance per mutating move list.
+        Beam paths and Dijkstra nodes need their own (clone via ``copy``).
+      - The ``verbose`` flag on ``find_all_absurdities`` only logs plies
+        scanned in this call. Plies served from cache do not re-print.
+    """
+
+    __slots__ = ("_snapshots",)
+
+    def __init__(self):
+        self._snapshots: List[Tuple[chess.Board, List[Absurdity]]] = []
+
+    @property
+    def ply(self) -> int:
+        return len(self._snapshots)
+
+    def get_state(self) -> Tuple[chess.Board, List[Absurdity]]:
+        """Fresh, independently-mutable copies of the latest snapshot."""
+        if not self._snapshots:
+            return chess.Board(), []
+        board, absurdities = self._snapshots[-1]
+        return board.copy(), list(absurdities)
+
+    def record(self, board: chess.Board, absurdities: List[Absurdity]):
+        """Append a snapshot. Call once per successfully processed ply."""
+        self._snapshots.append((board.copy(), list(absurdities)))
+
+    def invalidate_from(self, ply: int):
+        """Drop snapshots that may have used moves[ply] in lookahead.
+
+        ``detect_absurdity_at_ply`` and ``_detect_hanging_pieces`` consult
+        ``moves[P+1]`` when processing ply P. Snapshot[P] embeds that lookahead
+        result; if moves[P+1]=moves[ply] is mutated, snapshot[ply-1] is stale.
+        Drop snapshots[ply-1:] (clamped at 0).
+        """
+        drop_from = max(0, ply - 1)
+        if drop_from < len(self._snapshots):
+            del self._snapshots[drop_from:]
+
+    def copy(self) -> "AbsurditiesPrefixCache":
+        """Independent clone sharing the (immutable) snapshot entries."""
+        other = AbsurditiesPrefixCache()
+        other._snapshots = list(self._snapshots)
+        return other
+
+
 def find_all_absurdities(moves: List[str], verbose: bool = False,
                          fast_mode: bool = False,
-                         start_ply: int = 0, board: chess.Board = None) -> List[Absurdity]:
+                         start_ply: int = 0, board: chess.Board = None,
+                         prefix_cache: Optional["AbsurditiesPrefixCache"] = None,
+                         end_ply: Optional[int] = None) -> List[Absurdity]:
     """
     Find all absurdities in the move list.
 
@@ -1021,22 +1315,41 @@ def find_all_absurdities(moves: List[str], verbose: bool = False,
         board: Board position AT start_ply. If provided with start_ply, avoids
                replaying moves 0..start_ply-1 for each ply. If None, builds
                the board incrementally from the start.
+        prefix_cache: Optional snapshot cache. When provided AND non-empty,
+               resume from cache state and ignore ``start_ply``/``board``. Caller
+               is responsible for ensuring the cache was populated with the same
+               ``fast_mode`` and a compatible move list (call
+               ``cache.invalidate_from(F)`` after mutating ``moves[F]``).
+        end_ply: Stop checking BEFORE this ply (exclusive). Default None = scan
+               to the end. Limits only WHICH plies are checked — the full
+               ``moves`` list is still available for detect_absurdity_at_ply's
+               lookahead, so a windowed [start_ply, end_ply) scan yields results
+               identical to a full scan filtered to that range. Lets callers
+               that only consume in-window absurdities avoid re-running the
+               hanging/quiescence check on early, already-confirmed plies every
+               iteration (the per-step cost otherwise grows with game depth).
     """
-    absurdities = []
-    # Build board incrementally to avoid O(n^2) replays
-    if board is not None:
-        incremental_board = board.copy()
-    elif start_ply > 0:
-        incremental_board = chess.Board()
-        for i in range(start_ply):
-            m = try_move(incremental_board, moves[i])
-            if not m:
-                return absurdities
-            incremental_board.push(m)
+    # Resume from cache when available. The cache supersedes start_ply/board.
+    if prefix_cache is not None and prefix_cache.ply > 0:
+        incremental_board, absurdities = prefix_cache.get_state()
+        start_ply = prefix_cache.ply
     else:
-        incremental_board = chess.Board()
+        absurdities = []
+        # Build board incrementally to avoid O(n^2) replays
+        if board is not None:
+            incremental_board = board.copy()
+        elif start_ply > 0:
+            incremental_board = chess.Board()
+            for i in range(start_ply):
+                m = try_move(incremental_board, moves[i])
+                if not m:
+                    return absurdities
+                incremental_board.push(m)
+        else:
+            incremental_board = chess.Board()
 
-    for ply in range(start_ply, len(moves)):
+    scan_end = len(moves) if end_ply is None else min(end_ply, len(moves))
+    for ply in range(start_ply, scan_end):
         # Pass the pre-built board to avoid replay from ply 0
         absurdity = detect_absurdity_at_ply(moves, ply, verbose=False, fast_mode=fast_mode,
                                              board=incremental_board)
@@ -1049,6 +1362,8 @@ def find_all_absurdities(moves: List[str], verbose: bool = False,
         if not m:
             break
         incremental_board.push(m)
+        if prefix_cache is not None:
+            prefix_cache.record(incremental_board, absurdities)
     return absurdities
 
 
@@ -1273,10 +1588,17 @@ def see_at_square(board: chess.Board, square: chess.Square, by_color: chess.Colo
             break
         attackers.sort(key=lambda s: _piece_value(b.piece_at(s)) if b.piece_at(s) else 10**6)
 
-        # Pick the cheapest attacker that can legally capture. A king cannot
-        # capture into a square still defended by the opposite side (would
-        # move into check). Other pieces are assumed legal here — full
-        # pin-aware handling would require a deeper engine.
+        # Pick the cheapest attacker that can legally capture. Two gates:
+        #  1. A king cannot capture into a square still defended by the
+        #     opposite side (would move into check).
+        #  2. A piece pinned along a line that doesn't pass through the
+        #     target cannot legally capture the target (moving it would
+        #     expose its own king to the pinner). Reported case: c8 queen
+        #     pinned along the 8th rank by white Rd8 against black Kb8 —
+        #     Qxc6 would expose the king and is illegal, so SEE must not
+        #     count the queen as a recapturer. Without this filter SEE
+        #     reported opp_gain=3 for Nxc6+, flagging a winning move as a
+        #     bad trade.
         chosen = None
         for att_sq in attackers:
             ap = b.piece_at(att_sq)
@@ -1284,6 +1606,13 @@ def see_at_square(board: chess.Board, square: chess.Square, by_color: chess.Colo
                 continue
             if ap.piece_type == chess.KING and b.is_attacked_by(not side, square):
                 continue  # king can't move into a defended square
+            # Pin filter: pin() returns BB_ALL for unpinned pieces, or
+            # the SquareSet of squares on the pin line for pinned ones.
+            # The destination must be on that line for the capture to be
+            # legal. (King has no pin — pin() handles it correctly.)
+            pin_mask = b.pin(side, att_sq)
+            if pin_mask != chess.BB_ALL and not (pin_mask & chess.BB_SQUARES[square]):
+                continue
             chosen = (att_sq, ap)
             break
 
@@ -1337,34 +1666,87 @@ def _capture_has_tactical_compensation(board: chess.Board, our_move: chess.Move,
     for m in tb.legal_moves:
         gives_check = tb.gives_check(m)
         is_capture = tb.is_capture(m)
-        if not (gives_check or is_capture):
+        is_promo = m.promotion is not None
+        if not (gives_check or is_capture or is_promo):
             continue
 
         if gives_check:
             tb.push(m)
             if tb.is_checkmate():
+                tb.pop()
                 return True
+            # Forced mate-in-2: opp is in check and has legal responses, but
+            # every response leaves them in a position where we have a
+            # mate-in-1 reply. Catches sacrifices that win via a forcing
+            # check sequence, not just an immediate mate. Reported case:
+            # 38.Nxg6 Kxg6 (capture) 39.Qxh5+ Kg7 (only legal) 40.Qh7#
+            # — without this, Nxg6 was flagged as a "minor takes pawn,
+            # loses 2" bad trade even though it's the winning move.
+            legal_responses = list(tb.legal_moves)
+            forced_mate = bool(legal_responses)
+            for resp in legal_responses:
+                tb.push(resp)
+                mate_after_response = False
+                for follow in tb.legal_moves:
+                    if tb.gives_check(follow):
+                        tb.push(follow)
+                        if tb.is_checkmate():
+                            mate_after_response = True
+                        tb.pop()
+                        if mate_after_response:
+                            break
+                tb.pop()
+                if not mate_after_response:
+                    forced_mate = False
+                    break
             tb.pop()
+            if forced_mate:
+                return True
 
-        if is_capture:
-            captured = tb.piece_at(m.to_square)
-            if captured is None:
+        if is_capture or is_promo:
+            # A recapture on the SAME exchange square is NOT compensation —
+            # it's the continuation of the static exchange that see_at_square
+            # already folded into `our_loss`. Crediting it again double-counts
+            # (e.g. N takes pawn, opp recaptures, we recapture the recapturing
+            # pawn: that second pawn is why the net loss is already 1, not a
+            # separate "free capture worth our_loss"). This was harmless at the
+            # default threshold (a 1-point recapture never meets gain >= 2) but
+            # spuriously cancels the flag at threshold=1. Genuine compensation
+            # is mate (handled above) or a gain on a DIFFERENT square.
+            if m.to_square == to_square:
                 continue
-            cap_val = _piece_value(captured)
-            if cap_val < our_loss:
+            # Gross gain from this reply, before opponent's recapture:
+            #   captured opponent piece + promotion bonus (queen - pawn = 8).
+            # A pawn promotion is just as visible as a free capture and is in
+            # scope for compensation (e.g. opp Rxg7 allowing our c8=Q).
+            cap_val = 0
+            if is_capture:
+                captured = tb.piece_at(m.to_square)
+                if captured is None:
+                    continue  # en passant — no piece on to_square
+                cap_val = _piece_value(captured)
+            promo_bonus = 0
+            if is_promo:
+                promoted_val = _piece_value(chess.Piece(m.promotion, tb.turn))
+                promo_bonus = promoted_val - 1  # pawn value
+            gain = cap_val + promo_bonus
+            if gain < our_loss:
                 continue
-            # Confirm capture isn't lost back. After we push, it is opponent's
-            # turn (tb.turn == opponent), so SEE is initiated by tb.turn.
+            # Confirm the piece on the destination square isn't lost back.
+            # After we push, it is opponent's turn (tb.turn == opponent),
+            # so SEE is initiated by tb.turn. SEE reads the current piece
+            # on the square, which is the promoted piece for promotions.
             tb.push(m)
             see_back = see_at_square(tb, m.to_square, tb.turn)
             tb.pop()
-            if cap_val - see_back >= our_loss:
+            if gain - see_back >= our_loss:
                 return True
 
     return False
 
 
-def is_bad_trade_move(board: chess.Board, move: chess.Move) -> Tuple[bool, int, str]:
+def is_bad_trade_move(board: chess.Board, move: chess.Move,
+                      threshold: int = 2) -> Tuple[bool, int, str]:
     """
     Check if a move is a bad trade - BEFORE making the move.
 
@@ -1380,8 +1762,12 @@ def is_bad_trade_move(board: chess.Board, move: chess.Move) -> Tuple[bool, int, 
     this square?") and prevents false positives where a move would be flagged
     because the opponent has an unrelated winning capture elsewhere.
 
-    Fires at our_loss >= 2 to cover exchange sacrifices (rook-for-bishop)
-    and minor-for-pawn — not just full-piece hangs.
+    Fires at our_loss >= ``threshold`` (default 2) to cover exchange
+    sacrifices (rook-for-bishop) and minor-for-pawn — not just full-piece
+    hangs. Callers handling an INFERRED capture (player omitted the 'x', we
+    added it) pass threshold=1: an unmarked capture that even slightly loses
+    material is suspect, whereas an explicitly-written capture is trusted at
+    the default 2.
     """
     capturing = board.piece_at(move.from_square)
     if not capturing:
@@ -1422,7 +1808,7 @@ def is_bad_trade_move(board: chess.Board, move: chess.Move) -> Tuple[bool, int, 
     # pocketed with our original capture.
     our_loss = opp_gain - captured_val
 
-    if our_loss >= 2:
+    if our_loss >= threshold:
         # Tactical sacrifice check: opponent's capture may enable a forcing
         # reply (mate or big free capture) that compensates the material.
         if _capture_has_tactical_compensation(board, move, to_square, our_loss):

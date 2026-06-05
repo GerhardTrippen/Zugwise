@@ -21,6 +21,21 @@
 'use strict';
 
 // =============================================================================
+// FORMAT → COLUMN COUNT
+// =============================================================================
+// Maps the user-selected scoresheet format string to expected number of
+// number-anchor columns. '2col' and '3col' are the per-sheet defaults.
+// '4col'/'5col'/'6col' support pre-split detection on dual-sheet images
+// (two sheets side-by-side share one image; total columns = 2×per-sheet).
+function colCountFromFormat(format) {
+    if (format === '6col') return 6;
+    if (format === '5col') return 5;
+    if (format === '4col') return 4;
+    if (format === '3col') return 3;
+    return 2;
+}
+
+// =============================================================================
 // SMART CROP & COLOR STRIPPING
 // =============================================================================
 
@@ -611,7 +626,7 @@ function alignColumnByHoles(holeData, rowYs, rowCount, isFirstCol, isBackPage, c
     //
     // Total iterations = maxTruncHead + excess + maxTruncTail + 1
 
-    var frontCols = (format === '3col') ? 3 : 2;
+    var frontCols = colCountFromFormat(format);
     var frontRowCount = frontRows || rowCount; // fallback to rowCount if not specified
     var startNum = isBackPage
         ? (frontCols * frontRowCount + colIndex * rowCount + 1)
@@ -1311,11 +1326,74 @@ function interpolateY(x, bi, groupXs, groupYBounds) {
 // DIRECT CELL EXTRACTION (per-cell mini-warp, no global perspective)
 // =============================================================================
 
+// Least-squares line v = a + b*t through points [{t, v}]. Slope clamped to
+// |b| ≤ 0.05 (~3°): a larger slope means the fit is being dragged by bad data,
+// so fall back to vertical rather than tilt the whole column.
+function _lsqLine(pts) {
+    var n = pts.length, st = 0, sv = 0, stv = 0, stt = 0;
+    for (var i = 0; i < n; i++) {
+        var t = pts[i].t, v = pts[i].v;
+        st += t; sv += v; stv += t * v; stt += t * t;
+    }
+    var denom = n * stt - st * st;
+    var b = Math.abs(denom) > 1e-6 ? (n * stv - st * sv) / denom : 0;
+    if (Math.abs(b) > 0.05) b = 0;
+    var a = (sv - b * st) / n;
+    return { a: a, b: b };
+}
+
+// Robust per-column EDGE boundary line x = a + b·y, so move-cell sides form a
+// near-vertical line (modulo page skew) instead of jittering per row. The
+// move number's digit count and alignment (left/center/right) must NOT move
+// the boundary: a single-digit "7" and a double-digit "17" should start the
+// white cell at the SAME X. We achieve that by fitting only the rows that
+// REACH the field boundary:
+//   mode 'right' → number-field RIGHT edge (double-digit numbers reach it,
+//                  single digits fall short) → select the upper-edge half.
+//   mode 'left'  → number-field LEFT edge (for the NEXT column) → lower half.
+// Then one MAD-based outlier-rejection pass drops a mis-merged CC — e.g. the
+// first "0" of a castling "0-0" pulled into the number cluster, which would
+// otherwise shove that row's boundary right.
+function fitColumnEdgeLine(grp, mode) {
+    var rows = [];
+    for (var i = 0; i < grp.length; i++) {
+        var e = (mode === 'right') ? grp[i].right : grp[i].left;
+        if (typeof grp[i].y === 'number' && typeof e === 'number') {
+            rows.push({ t: grp[i].y, v: e });
+        }
+    }
+    var n = rows.length;
+    if (n === 0) return null;
+    if (n <= 2) return { a: rows[0].v, b: 0 };
+    var vs = rows.map(function(r) { return r.v; }).slice().sort(function(a, b) { return a - b; });
+    var medV = vs[Math.floor(vs.length / 2)];
+    var sub = rows.filter(function(r) { return mode === 'right' ? r.v >= medV : r.v <= medV; });
+    if (sub.length < 2) sub = rows.slice();
+    var fit = _lsqLine(sub);
+    var resids = sub.map(function(r) { return Math.abs(r.v - (fit.a + fit.b * r.t)); })
+        .slice().sort(function(a, b) { return a - b; });
+    var medRes = resids[Math.floor(resids.length / 2)] || 0;
+    var keep = sub.filter(function(r) {
+        return Math.abs(r.v - (fit.a + fit.b * r.t)) <= Math.max(4, 3 * medRes);
+    });
+    if (keep.length >= 2) fit = _lsqLine(keep);
+    return fit;
+}
+
 function extractCellsDirect(srcMat, colR, rowCount, format, log) {
     var ww = srcMat.cols, wh = srcMat.rows;
     var numGroups = colR.length;
     var cells = [];
-    var numPadRight = 6;
+    var numPadRight = 6;   // small gap past the number-field right boundary line
+
+    // White/black split position within each move cell, as a fraction of the
+    // [xLeft, xRight] span. 0.5 = even split. Tunable in grid-slide-testbed.html.
+    var WB_SPLIT_FRAC = 0.5;
+
+    // Gap before the NEXT number column's LEFT-boundary line, as a fraction of
+    // median number width — keeps the black cell from eating into the next
+    // number. Tunable.
+    var NEXT_NUM_PAD_FRAC = 0.5;
 
     // Compute dynamic right padding based on median number CC width
     // This ensures move cells don't extend too far into the gap before the next number column
@@ -1328,7 +1406,7 @@ function extractCellsDirect(srcMat, colR, rowCount, format, log) {
     }
     allWidths.sort(function(a,b){return a-b;});
     var medNumW = allWidths.length > 0 ? allWidths[Math.floor(allWidths.length/2)] : 20;
-    var padX = Math.max(5, Math.round(medNumW * 1.1));
+    var padX = Math.max(5, Math.round(medNumW * NEXT_NUM_PAD_FRAC));
 
     log('  Direct extraction from original: '+numGroups+' groups, '+rowCount+' rows','dim');
     log('  Median number CC width: '+Math.round(medNumW)+'px → right padding: '+padX+'px','dim');
@@ -1457,12 +1535,24 @@ function extractCellsDirect(srcMat, colR, rowCount, format, log) {
     // at row N but column B has an interpolated one, adjust B's row N
     // to be consistent with A (accounting for inter-column slope).
     if (filled.length >= 2) {
+        // A row is a genuine CC anchor only if it is NEITHER grid-interpolated
+        // (extractCellsDirect's own `.filled`, set by the GRID PATH above) NOR
+        // upstream-interpolated (the [Alignment Rows] `.interpolated`, which
+        // rides through the FAST PATH untouched). Both must be honored: keying
+        // on `.filled` alone made this whole snap inert for clean columns —
+        // every row passed straight through the FAST PATH carries `.interpolated`
+        // (or nothing) but never `.filled`, so neither branch below could ever
+        // fire. The result was that a single interpolated row (e.g. one GAP slot
+        // in an otherwise-complete column) was never pinned to the shared
+        // physical-row Y its neighbours establish, and was free to sit off-grid
+        // — the diagonal-looking column drift.
+        function _isAnchor(r) { return !r.filled && !r.interpolated; }
         // First compute the typical y-offset between adjacent columns
         // from rows where BOTH have real CCs
         for (var pg = 0; pg < filled.length - 1; pg++) {
             var offsets = [];
             for (var pr = 0; pr < rowCount; pr++) {
-                if (!filled[pg][pr].filled && !filled[pg+1][pr].filled) {
+                if (_isAnchor(filled[pg][pr]) && _isAnchor(filled[pg+1][pr])) {
                     offsets.push(filled[pg+1][pr].y - filled[pg][pr].y);
                 }
             }
@@ -1472,24 +1562,28 @@ function extractCellsDirect(srcMat, colR, rowCount, format, log) {
             log('  Cross-align: Group'+(pg+1)+'→'+(pg+2)+' medOffset='+Math.round(medOffset)
                 +'px (from '+offsets.length+' shared real rows)','dim');
 
-            // Now fix interpolated rows using the other column's real CC + offset
+            // Now fix interpolated rows using the other column's real CC + offset.
+            // Preserve the row's own flags (still interpolated, just repositioned)
+            // so it cannot later act as an anchor for a third column.
             for (var cr = 0; cr < rowCount; cr++) {
                 var a = filled[pg][cr], b = filled[pg+1][cr];
-                if (a.filled && !b.filled) {
-                    // Column pg has interpolated, pg+1 has real → fix pg
-                    var betterY = b.y - medOffset;
-                    if (Math.abs(betterY - a.y) > 3) { // only if meaningful difference
-                        log('    Row '+(cr+1)+': align Group'+(pg+1)+' y='+Math.round(a.y)
-                            +'→'+Math.round(betterY)+' (from Group'+(pg+2)+' real y='+Math.round(b.y)+')','dim');
-                        filled[pg][cr] = {y: betterY, x: a.x, left: a.left, right: a.right, filled: true};
-                    }
-                } else if (!a.filled && b.filled) {
-                    // Column pg has real, pg+1 has interpolated → fix pg+1
+                if (_isAnchor(a) && !_isAnchor(b)) {
+                    // Column pg has a real CC, pg+1 is interpolated → fix pg+1
                     var betterY2 = a.y + medOffset;
                     if (Math.abs(betterY2 - b.y) > 3) {
                         log('    Row '+(cr+1)+': align Group'+(pg+2)+' y='+Math.round(b.y)
                             +'→'+Math.round(betterY2)+' (from Group'+(pg+1)+' real y='+Math.round(a.y)+')','dim');
-                        filled[pg+1][cr] = {y: betterY2, x: b.x, left: b.left, right: b.right, filled: true};
+                        filled[pg+1][cr] = {y: betterY2, x: b.x, left: b.left, right: b.right,
+                            filled: b.filled, interpolated: true};
+                    }
+                } else if (!_isAnchor(a) && _isAnchor(b)) {
+                    // Column pg is interpolated, pg+1 has a real CC → fix pg
+                    var betterY = b.y - medOffset;
+                    if (Math.abs(betterY - a.y) > 3) { // only if meaningful difference
+                        log('    Row '+(cr+1)+': align Group'+(pg+1)+' y='+Math.round(a.y)
+                            +'→'+Math.round(betterY)+' (from Group'+(pg+2)+' real y='+Math.round(b.y)+')','dim');
+                        filled[pg][cr] = {y: betterY, x: a.x, left: a.left, right: a.right,
+                            filled: a.filled, interpolated: true};
                     }
                 }
             }
@@ -1553,7 +1647,28 @@ function extractCellsDirect(srcMat, colR, rowCount, format, log) {
         // Show per-row slopes to diagnose corner overshoot
         var slopeSummary = pairSlopes[0].map(function(s,idx){return 'r'+idx+'='+s.toFixed(1);});
         log('  Per-row slopes: '+slopeSummary.join(' '),'dim');
+        // The LAST group's right edge is extrapolated from pairSlopes[numGroups-2]
+        // (col(N-1)->colN) — NOT pair 0->1. For 3+ columns these differ, so the
+        // line above doesn't describe the geometry actually applied to the last
+        // column. Log the pair the EXTRAP step really uses, or a column lean is
+        // undiagnosable from the report.
+        var lastPair = Math.max(0, numGroups - 2);
+        if (lastPair !== 0 && pairSlopes[lastPair]) {
+            var avgLast = pairSlopes[lastPair].reduce(function(a,b){return a+b;},0)/pairSlopes[lastPair].length;
+            log('  Slope ref (last-group EXTRAP, pair '+lastPair+'->'+(lastPair+1)+'): avg='+avgLast.toFixed(1)
+                +'px over '+Math.round(pairXDists[lastPair])+'px x-distance','dim');
+            var slopeSummaryLast = pairSlopes[lastPair].map(function(s,idx){return 'r'+idx+'='+s.toFixed(1);});
+            log('  Per-row slopes (last-group): '+slopeSummaryLast.join(' '),'dim');
+        }
     }
+
+    // Robust per-column boundary lines so cell sides form near-vertical lines
+    // (single- and double-digit rows start at the same X; outliers rejected).
+    //   colRightLine[g] → this column's number-field RIGHT edge  → white xLeft
+    //   colLeftLine[g]  → this column's number-field LEFT edge   → previous
+    //                     column's black xRight (next number boundary)
+    var colRightLine = filled.map(function(grp) { return fitColumnEdgeLine(grp, 'right'); });
+    var colLeftLine = filled.map(function(grp) { return fitColumnEdgeLine(grp, 'left'); });
 
     // Step 6: For each cell, compute 4 corners and mini-warp
     for (var g = 0; g < numGroups; g++) {
@@ -1566,11 +1681,27 @@ function extractCellsDirect(srcMat, colR, rowCount, format, log) {
         var lastPairIdx = Math.max(0, numGroups - 2);
 
         for (var i = 0; i < rowCount && i < yBoundsG.length - 1; i++) {
-            // X-boundaries
-            var xLeft = grp[i].right + numPadRight;
+            // X-boundaries — from the robust per-column boundary LINES, so the
+            // white cell starts at the same X whether the move number is one or
+            // two digits and whatever its alignment, and a stray mis-merged CC
+            // can't shove a single row.
+            var rowY = grp[i].y;
+            // Synthetic anchors with right <= 0 represent a missing column whose
+            // number CCs are off-page (clipped). No number text to skip past —
+            // start the W cell at x=0 (or the synth right edge if positive).
+            var xLeft;
+            if (grp[i].synthesized && grp[i].right <= 0) {
+                xLeft = Math.max(0, grp[i].right);
+            } else if (colRightLine[g]) {
+                xLeft = (colRightLine[g].a + colRightLine[g].b * rowY) + numPadRight;
+            } else {
+                xLeft = grp[i].right + numPadRight;  // fallback: per-row edge
+            }
             var xRight;
-            if (nextGrp && i < nextGrp.length) {
-                xRight = nextGrp[i].left - padX;
+            if (nextGrp && colLeftLine[g + 1]) {
+                xRight = (colLeftLine[g + 1].a + colLeftLine[g + 1].b * rowY) - padX;
+            } else if (nextGrp && i < nextGrp.length) {
+                xRight = nextGrp[i].left - padX;  // fallback: per-row next edge
             } else if (isLastGroup && medContentWidth > 0) {
                 // Last group: use same content width as first group
                 xRight = xLeft + medContentWidth - numPadRight - padX;
@@ -1580,7 +1711,7 @@ function extractCellsDirect(srcMat, colR, rowCount, format, log) {
             }
             if (xRight <= xLeft + 20) continue;
 
-            var xMid = (xLeft + xRight) / 2;
+            var xMid = xLeft + (xRight - xLeft) * WB_SPLIT_FRAC;
 
             // Y-boundaries at left edge (from this group)
             var yTopLeft = yBoundsG[i];
@@ -1821,7 +1952,7 @@ function cleanCell(cellImg, minLineFrac) {
  */
 function slideAutoFind(srcGray, srcMat, config, log) {
     var format = config.format || '2col';
-    var expCols = format === '3col' ? 3 : 2;
+    var expCols = colCountFromFormat(format);
     var maxWP = config.maxColWidthPct || 7;
     var rowCount = config.rowCount || 20;
     var curMinH = config.minDigitH || 0.8;
@@ -1864,6 +1995,26 @@ function slideAutoFind(srcGray, srcMat, config, log) {
 
     log('  Initial (minH=' + curMinH + '% xW=' + curXW + '): score=' + bestResult.bestScore.toFixed(2)
         + ' minXTight=' + bestResult.minXT.toFixed(2) + ' ~' + bestResult.minRowEst + 'rows at ' + bestResult.bestN + ' clusters');
+
+    // PREDEFINED ANCHORS: skip the parameter sweep. We don't need slideAutoFind
+    // to find columns since the caller is providing them. The CC list from the
+    // initial combination is enough; downstream slideRunPipeline will build
+    // `top` directly from the predefined X positions. Force a positive
+    // bestScore so the caller's "bestScore < 0" guard doesn't return null.
+    if (config.predefinedAnchorXs && config.predefinedAnchorXs.length > 0) {
+        log('  Predefined anchors mode — skipping parameter sweep');
+        // Force a positive bestScore so processScoresheet's "<0 returns null"
+        // guard doesn't fire. Keep the actual bestN from the initial cut so
+        // extractClustersAtN downstream gets a real cluster set rather than
+        // a single mega-cluster (which would make the merge phase yield 0
+        // valid columns and the predefined override never gets to run).
+        if (bestResult.bestScore < 0) bestResult.bestScore = 1;
+        return {
+            bestN: bestResult.bestN || 2, bestResult: bestResult,
+            bestMinH: bestMinH, bestXW: bestXW, bestMaxW: bestMaxW,
+            cands: bestCands, clResult: bestClResult, binary: bestBinary
+        };
+    }
 
     // Phase 2: If x-tightness is low, retry with lower minH%
     if (bestResult.minXT < 0.9 && bestResult.bestScore > 0) {
@@ -1975,7 +2126,7 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
     var rowCount = config.rowCount || 20;
     var numClusters = autoResult.bestN;
     var maxWP = config.maxColWidthPct || 7;
-    var expCols = format === '3col' ? 3 : 2;
+    var expCols = colCountFromFormat(format);
     var isBackPage = (config.pageType === 'back');
 
     var frontRows = config.frontRows || rowCount;
@@ -2080,7 +2231,89 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
              - (b.reduce(function(s, c) { return s + c.cx; }, 0) / b.length);
     });
     log('Selected ' + top.length + ' columns');
-    if (top.length < 2) { log('Need ≥2 columns!'); return null; }
+    // Allow top.length < 2 to pass through when predefinedAnchorXs is set —
+    // the predefined-anchors override below will rebuild `top` from the
+    // caller-supplied X positions, which is the whole point of that mode.
+    if (top.length < 2 && !(config.predefinedAnchorXs && config.predefinedAnchorXs.length > 0)) {
+        log('Need ≥2 columns!');
+        return null;
+    }
+
+    // === MISSING-LEFTMOST-COLUMN DETECTION ===
+    // Trigger if leftmost detected cluster is far from the left edge AND the
+    // best (expCols-1)-sized subset of `top` forms a plausible col2..N pattern.
+    // Handles two cases:
+    //   - top.length === expCols-1: exactly one column missing (no extra noise)
+    //   - top.length >= expCols: a noise cluster (e.g. shadow at right margin)
+    //     was selected; drop it and use the surviving subset
+    // Edge guard at 25% of W stops false-trigger on a true 2-column sheet.
+    var leftmostMissing = false;
+    if (expCols >= 3 && top.length >= expCols - 1
+            && !(config.predefinedAnchorXs && config.predefinedAnchorXs.length > 0)) {
+        var srcW_lm = srcMat.cols;
+        var topCx_lm = top.map(function(c, idx) {
+            return { cl: c, idx: idx, cx: c.reduce(function(s, cc) { return s + cc.cx; }, 0) / c.length };
+        });
+        topCx_lm.sort(function(a, b) { return a.cx - b.cx; });
+        var leftPct0_lm = topCx_lm[0].cx / srcW_lm;
+
+        if (leftPct0_lm < 0.20) {
+            log('  Cluster fit: leftmost at ' + Math.round(leftPct0_lm * 100) + '% of W (<20%) — col1 present, no synthesis');
+        } else {
+            // Score a candidate (expCols-1)-sized subset for the leftmost-missing pattern
+            var scoreLM_lm = function(subset) {
+                if (subset.length !== expCols - 1) return -Infinity;
+                if (subset[0].cx / srcW_lm < 0.25) return -Infinity;          // edge guard
+                if (subset[subset.length - 1].cx / srcW_lm > 0.92) return -Infinity; // shadow guard
+                if (subset.length === 2) {
+                    var g_lm = subset[1].cx - subset[0].cx;
+                    var gp_lm = g_lm / srcW_lm;
+                    if (gp_lm < 0.20 || gp_lm > 0.50) return -Infinity;
+                    return -Math.abs(g_lm - srcW_lm / expCols);
+                }
+                var gs_lm = [];
+                for (var igs = 1; igs < subset.length; igs++) {
+                    gs_lm.push(subset[igs].cx - subset[igs - 1].cx);
+                }
+                var maxG_lm = Math.max.apply(null, gs_lm);
+                var minG_lm = Math.min.apply(null, gs_lm);
+                if (minG_lm / maxG_lm < 0.7) return -Infinity;
+                var avg_lm = gs_lm.reduce(function(a, b) { return a + b; }, 0) / gs_lm.length;
+                return -((maxG_lm - minG_lm) + Math.abs(avg_lm - srcW_lm / expCols));
+            };
+
+            var bestSc_lm = -Infinity, bestSub_lm = null;
+            if (topCx_lm.length === expCols - 1) {
+                var s_lm = scoreLM_lm(topCx_lm);
+                if (s_lm > -Infinity) { bestSc_lm = s_lm; bestSub_lm = topCx_lm; }
+            } else {
+                for (var di_lm = 0; di_lm < topCx_lm.length; di_lm++) {
+                    var subset_lm = topCx_lm.slice(0, di_lm).concat(topCx_lm.slice(di_lm + 1));
+                    if (subset_lm.length > expCols - 1) subset_lm = subset_lm.slice(0, expCols - 1);
+                    var s2_lm = scoreLM_lm(subset_lm);
+                    if (s2_lm > bestSc_lm) { bestSc_lm = s2_lm; bestSub_lm = subset_lm; }
+                }
+            }
+
+            if (bestSub_lm) {
+                leftmostMissing = true;
+                log('  ⚠️ LEFTMOST COLUMN MISSING: keeping ' + bestSub_lm.length + ' clusters (leftmost at '
+                    + Math.round(bestSub_lm[0].cx / srcW_lm * 100) + '% of W, score=' + bestSc_lm.toFixed(1) + ')');
+                if (topCx_lm.length > bestSub_lm.length) {
+                    var keptIdx_lm = {};
+                    bestSub_lm.forEach(function(t) { keptIdx_lm[t.idx] = true; });
+                    var dropped_lm = topCx_lm.filter(function(t) { return !keptIdx_lm[t.idx]; });
+                    log('    Dropped ' + dropped_lm.length + ' cluster(s) as noise: '
+                        + dropped_lm.map(function(d) {
+                            return 'cx=' + Math.round(d.cx) + '(' + Math.round(d.cx / srcW_lm * 100) + '%)';
+                        }).join(', '));
+                }
+                top = bestSub_lm.map(function(s) { return s.cl; });
+            } else {
+                log('  Note: leftmost at ' + Math.round(leftPct0_lm * 100) + '% (>20%) but no valid leftmost-missing subset');
+            }
+        }
+    }
 
     // === Short-cluster rescue: absorb rejected-as-short clusters that are x-aligned ===
     // When a column's anchors get split across clusters, the smaller fragment may be
@@ -2172,6 +2405,180 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
         }
     }
 
+    // === ORPHAN RECOVERY (ported from v9m-orphan-recovery testbed) ===
+    // Rescue CCs that match expected grid positions but weren't connected
+    // to any column cluster by single-linkage (e.g., "1" when "2" merged
+    // with a horizontal line and never became a clean CC, leaving "1"
+    // isolated from "3,4,5..."). Searches the orphan pool (CCs not in any
+    // top cluster) for size-matching candidates at the expected row Y.
+    //
+    // Runs AFTER existing rescues but BEFORE predefined-anchors override
+    // and per-column hole alignment, so recovered CCs participate in all
+    // downstream processing.
+    //
+    // Safe for working sheets: skips columns already at rowCount-1 row
+    // groups, and applies strict quality filters (height, width, aspect
+    // ratio) to avoid mistaking handwriting for move numbers.
+    (function orphanRecovery() {
+        var assignedSet = new Set();
+        for (var oi = 0; oi < top.length; oi++) {
+            for (var oj = 0; oj < top[oi].length; oj++) assignedSet.add(top[oi][oj]);
+        }
+        var orphans = autoResult.cands.filter(function(c) { return !assignedSet.has(c); });
+        if (orphans.length === 0) return;
+        log('[Orphan Recovery] ' + orphans.length + ' orphan CCs (of ' + autoResult.cands.length + ' total)');
+
+        var totalRecovered = 0;
+        for (var ci = 0; ci < top.length; ci++) {
+            var cl = top[ci];
+            if (cl.length < 5) continue;
+
+            var sortedCC = cl.slice().sort(function(a,b){return a.cy-b.cy;});
+            var avgH = sortedCC.reduce(function(s,c){return s+c.h;},0)/sortedCC.length;
+            var orYTol = avgH * 0.6;
+            var orGrps = [[sortedCC[0]]];
+            for (var gi = 1; gi < sortedCC.length; gi++) {
+                var lastG = orGrps[orGrps.length-1];
+                if (sortedCC[gi].cy - lastG[lastG.length-1].cy <= orYTol) lastG.push(sortedCC[gi]);
+                else orGrps.push([sortedCC[gi]]);
+            }
+            var orRowYs = orGrps.map(function(g){return g.reduce(function(s,c){return s+c.cy;},0)/g.length;});
+            if (orRowYs.length < 5) continue;
+
+            // Skip already-complete columns
+            if (orRowYs.length >= rowCount - 1) continue;
+
+            var colX = sortedCC.reduce(function(s,c){return s+c.cx;},0)/sortedCC.length;
+
+            var orSps = [];
+            for (var si = 1; si < orRowYs.length; si++) orSps.push(orRowYs[si] - orRowYs[si-1]);
+            var sortedSp = orSps.slice().sort(function(a,b){return a-b;});
+            var medSpInit = sortedSp[Math.floor(sortedSp.length/2)];
+            var baseSps = sortedSp.filter(function(s){return s < medSpInit * 1.6;});
+            if (baseSps.length < 3) baseSps = sortedSp;
+            var medSp = baseSps[Math.floor(baseSps.length/2)];
+
+            var clHs = sortedCC.map(function(c){return c.h;}).sort(function(a,b){return a-b;});
+            var medCH = clHs[Math.floor(clHs.length/2)];
+            var clWs = sortedCC.map(function(c){return c.w;}).sort(function(a,b){return a-b;});
+            var medCW = clWs[Math.floor(clWs.length/2)];
+
+            var xStdSum = sortedCC.reduce(function(s,c){return s + Math.pow(c.cx - colX, 2);}, 0);
+            var xStd = Math.sqrt(xStdSum / sortedCC.length);
+            var orXTol = Math.max(xStd * 3, srcMat.cols * 0.015);
+            var orYSearchTol = medSp * 0.35;
+
+            // Extrapolate full grid from the lowest detected row going up
+            var lastRowY = orRowYs[orRowYs.length-1];
+            var expectedYs = [];
+            for (var ei = 0; ei < rowCount; ei++) {
+                expectedYs.push(lastRowY - (rowCount - 1 - ei) * medSp);
+            }
+            var covered = expectedYs.map(function(ey) {
+                return orRowYs.some(function(ry){return Math.abs(ry - ey) < orYSearchTol;});
+            });
+            var gapCount = covered.filter(function(c){return !c;}).length;
+            if (gapCount === 0) continue;
+
+            var recovered = 0;
+            for (var ei2 = 0; ei2 < expectedYs.length; ei2++) {
+                if (covered[ei2]) continue;
+                var ey = expectedYs[ei2];
+                var bestO = null, bestDist = Infinity;
+                for (var oi2 = 0; oi2 < orphans.length; oi2++) {
+                    var o = orphans[oi2];
+                    var dx = Math.abs(o.cx - colX);
+                    var dy = Math.abs(o.cy - ey);
+                    if (dx > orXTol || dy > orYSearchTol) continue;
+                    // Quality filter: looks like a move number, not handwriting
+                    if (o.h < medCH * 0.4 || o.h > medCH * 2.5) continue;
+                    if (o.w < medCW * 0.3 || o.w > medCW * 3.0) continue;
+                    if (o.h / o.w < 0.5) continue;
+                    var dist = dx + dy;
+                    if (dist < bestDist) { bestDist = dist; bestO = o; }
+                }
+                if (bestO) {
+                    top[ci].push(bestO);
+                    assignedSet.add(bestO);
+                    var idx = orphans.indexOf(bestO);
+                    if (idx >= 0) orphans.splice(idx, 1);
+                    recovered++;
+                }
+            }
+            totalRecovered += recovered;
+            if (recovered > 0) {
+                log('  Col' + (ci+1) + ': recovered ' + recovered + ' orphan(s) of ' + gapCount + ' gap(s) → '
+                    + top[ci].length + ' components');
+            }
+        }
+        if (totalRecovered > 0) {
+            log('  Total orphan CCs recovered: ' + totalRecovered);
+        }
+    })();
+
+    // PREDEFINED ANCHORS: when the caller provides known column X positions
+    // (e.g. from GridUnsplit anchor detection on the unsplit dual-sheet image),
+    // override the auto-detected `top` with clusters built directly from the
+    // predefined positions. Used when the per-half image alone is too clipped
+    // for SlideGrid's clustering to succeed (Hugh's Scarborough left half).
+    // Existing single-page callers don't pass this flag and behavior is
+    // unchanged for them.
+    if (config.predefinedAnchorXs && config.predefinedAnchorXs.length > 0) {
+        var paXs = config.predefinedAnchorXs;
+        log('Predefined anchors: overriding ' + top.length + ' detected columns with '
+            + paXs.length + ' provided positions [' + paXs.map(function(x) { return Math.round(x); }).join(',') + ']');
+        var paTol = srcMat.cols * 0.04;
+        var newTop = paXs.map(function(targetX) {
+            return autoResult.cands.filter(function(c) {
+                return Math.abs(c.cx - targetX) < paTol;
+            });
+        });
+        var validTop = newTop.filter(function(c) { return c.length > 3; });
+        if (validTop.length >= 2) {
+            top = validTop;
+            // Rebuild mI/usedMIclusters so the alignment-rejection rescue
+            // (which runs later) doesn't reference stale auto-detected clusters.
+            mI = top.map(function(c) {
+                var s = scoreCluster(c, srcMat.rows, srcMat.cols, maxWP, rowCount);
+                return { cl: c, score: s.score, scoring: s };
+            });
+            usedMIclusters = new Set();
+            mI.forEach(function(m) { usedMIclusters.add(m.cl); });
+            log('Predefined anchors active: [' + top.map(function(c) { return c.length; }).join(',')
+                + '] CCs per column');
+        } else {
+            log('Predefined anchors: only ' + validTop.length + ' clusters had >3 CCs — '
+                + 'keeping auto-detected columns');
+        }
+    }
+
+    // ANCHORS-ONLY EARLY RETURN
+    // Skip hole-alignment, alignment-rejection rescue, and cell extraction.
+    // Caller (e.g. GridUnsplit on an unsplit dual-sheet image) wants only
+    // the column positions — alignment is wrong for that scenario because
+    // the start-number-per-column model assumes a single sheet.
+    // Existing single-page callers don't pass this flag and behavior is
+    // unchanged for them.
+    if (config.anchorsOnly) {
+        var anchorCols = top.map(function(cluster) {
+            var xs = cluster.map(function(c) { return c.cx; }).sort(function(a, b) { return a - b; });
+            var ys = cluster.map(function(c) { return c.cy; }).sort(function(a, b) { return a - b; });
+            return {
+                cx: xs[Math.floor(xs.length / 2)],
+                cys: ys,
+                count: cluster.length
+            };
+        });
+        anchorCols.sort(function(a, b) { return a.cx - b.cx; });
+        log('Anchors-only: returning ' + anchorCols.length + ' columns at cx=['
+            + anchorCols.map(function(a) { return Math.round(a.cx); }).join(',') + ']');
+        return {
+            anchorCols: anchorCols,
+            method: 'slide',
+            anchorsOnly: true
+        };
+    }
+
     // === Trim clusters: singleton removal + header/footer classification + hole alignment ===
     var colAlignments = [];
     for (var ti = 0; ti < top.length; ti++) {
@@ -2226,7 +2633,7 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
 
         // Hole-based alignment
         if (binary) {
-            var frontCols = (format === '3col') ? 3 : 2;
+            var frontCols = colCountFromFormat(format);
             var colStartNum;
             if (isBackPage) {
                 colStartNum = frontCols * frontRows + ti * rowCount + 1;
@@ -2354,7 +2761,7 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
                 return candGrps[idx2].reduce(function(s, c) { return s + c.cy; }, 0) / candGrps[idx2].length;
             });
 
-            var frontCols = (format === '3col') ? 3 : 2;
+            var frontCols = colCountFromFormat(format);
             var candStartNum;
             if (isBackPage) {
                 candStartNum = frontCols * frontRows + reji * rowCount + 1;
@@ -2556,15 +2963,618 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
 
     log('  Final: ' + colR.map(function(r, i) { return 'Col' + (i + 1) + '=' + r.length; }).join(', '));
 
+    // =====================================================================
+    // CROSS-COLUMN ROW RECONCILIATION (anchor weak columns to strong ones)
+    // ---------------------------------------------------------------------
+    // Side-by-side columns are physically the SAME rows, so colR[c][i].y must
+    // match across columns at every index i. A column lacking a digit-count
+    // anchor — e.g. an all-double-digit column (moves 21-40 have no 9→10
+    // transition) — can mis-pick its sliding-window offset and land its real
+    // CCs several rows off. That produces a large inter-column Y offset which
+    // extractCellsDirect then misreads as a page "slope", skewing every cell
+    // (Board 5 / Jovan: cols 1↔2 offset -432px ≈ -6 rows). The existing v9l
+    // fallback only catches this when the hole signal is weak (<10%); a
+    // partially-detected column (e.g. 36% signal) slips through.
+    //
+    // Fix: snap each notably-weaker, clearly-misaligned column's REAL rows
+    // onto the highest-confidence column's row grid by nearest Y, keeping the
+    // weak column's own X geometry. Gated so well-aligned sheets are untouched.
+    // =====================================================================
+    if (colR.length >= 2 && binary) {
+        // Anchor = the column whose printed numbers were most COMPLETELY
+        // detected (most non-interpolated rows). The ruled lines are shared by
+        // every column, so the column with the most genuine CCs defines the true
+        // physical row grid. Tie-break by alignment pct. This is more robust
+        // than picking the highest alignment-pct column: on weak-hole back pages
+        // every column scores ~50-71%, but a full 20-real-row column is still a
+        // rock-solid row reference, whereas a column that mis-picked a phantom
+        // header slot loses a real row and should be the one that gets snapped.
+        var anchorIdx = -1, anchorReal = -1, anchorPct = -1;
+        for (var rci = 0; rci < colR.length; rci++) {
+            if (!colR[rci]) continue;
+            var realN = colR[rci].filter(function (r) { return !r.interpolated; }).length;
+            var pctRci = (colAlignments[rci] && colAlignments[rci].alignment
+                && typeof colAlignments[rci].alignment.pct === 'number')
+                ? colAlignments[rci].alignment.pct : 0;
+            if (realN > anchorReal || (realN === anchorReal && pctRci > anchorPct)) {
+                anchorReal = realN; anchorPct = pctRci; anchorIdx = rci;
+            }
+        }
+        // Trust the anchor only if most of its rows are genuine CCs.
+        if (anchorIdx >= 0 && anchorReal >= Math.max(3, Math.ceil(rowCount * 0.7))
+            && colR[anchorIdx] && colR[anchorIdx].length >= 3) {
+            var anchorRows = colR[anchorIdx];
+            var aSps = [];
+            for (var asi = 1; asi < anchorRows.length; asi++) aSps.push(anchorRows[asi].y - anchorRows[asi - 1].y);
+            aSps.sort(function(a, b) { return a - b; });
+            var aMedH = aSps.length ? aSps[Math.floor(aSps.length / 2)] : 0;
+
+            if (aMedH > 0) {
+                for (var rcc = 0; rcc < colR.length; rcc++) {
+                    if (rcc === anchorIdx) continue;
+
+                    // Median Y offset at indices where BOTH have a real (non-interpolated) row.
+                    var rOffs = [];
+                    for (var rk = 0; rk < Math.min(colR[rcc].length, anchorRows.length); rk++) {
+                        if (!colR[rcc][rk].interpolated && !anchorRows[rk].interpolated) {
+                            rOffs.push(colR[rcc][rk].y - anchorRows[rk].y);
+                        }
+                    }
+                    if (rOffs.length < 3) continue;
+                    rOffs.sort(function(a, b) { return a - b; });
+                    var medRO = rOffs[Math.floor(rOffs.length / 2)];
+                    // Side-by-side columns share the SAME ruled rows, so a real
+                    // inter-column offset is only a few px of page skew — never a
+                    // meaningful fraction of a row. |medRO| at/over half a row
+                    // means this column mis-picked its sliding-window offset and
+                    // is shifted by ~one (or more) WHOLE rows (e.g. a phantom
+                    // header slot: offset=1 winning 50% vs 45%). The old 1.5-row
+                    // bound let exactly that one-row shift slip through unfixed —
+                    // the diagonal/shifted last column.
+                    if (Math.abs(medRO) <= aMedH * 0.5) continue; // truly aligned — leave it
+
+                    // MISALIGNED: snap real rows onto the anchor grid by nearest Y.
+                    var realRows = colR[rcc].filter(function(r) { return !r.interpolated; });
+                    var snapped = new Array(anchorRows.length);
+                    for (var rr = 0; rr < realRows.length; rr++) {
+                        var bestJ = -1, bestD = Infinity;
+                        for (var aj = 0; aj < anchorRows.length; aj++) {
+                            var d = Math.abs(realRows[rr].y - anchorRows[aj].y);
+                            if (d < bestD) { bestD = d; bestJ = aj; }
+                        }
+                        if (bestJ >= 0 && bestD <= aMedH * 0.6) {
+                            if (!snapped[bestJ] ||
+                                Math.abs(realRows[rr].y - anchorRows[bestJ].y) < Math.abs(snapped[bestJ].y - anchorRows[bestJ].y)) {
+                                snapped[bestJ] = realRows[rr];
+                            }
+                        }
+                    }
+                    var snappedCount = snapped.filter(function(s) { return !!s; }).length;
+                    if (snappedCount < 2) continue; // not enough to anchor on — leave column as-is
+
+                    // Rebuild: real where snapped (keep its own geometry), else interpolate
+                    // X from the column's neighbours but Y from the anchor grid.
+                    var refsR = [];
+                    for (var jr = 0; jr < anchorRows.length; jr++) if (snapped[jr]) refsR.push({ idx: jr, row: snapped[jr] });
+                    var rebuilt = [];
+                    for (var jb = 0; jb < anchorRows.length; jb++) {
+                        if (snapped[jb]) { snapped[jb].interpolated = false; rebuilt.push(snapped[jb]); continue; }
+                        var aboveR = null, belowR = null;
+                        for (var nr = 0; nr < refsR.length; nr++) {
+                            if (refsR[nr].idx < jb) aboveR = refsR[nr];
+                            if (refsR[nr].idx > jb && belowR === null) belowR = refsR[nr];
+                        }
+                        var src = aboveR || belowR;
+                        var ny = anchorRows[jb].y;
+                        var nx, nl, nrg;
+                        if (aboveR && belowR) {
+                            var fracR = (jb - aboveR.idx) / (belowR.idx - aboveR.idx);
+                            nx = aboveR.row.x + fracR * (belowR.row.x - aboveR.row.x);
+                            nl = aboveR.row.left + fracR * (belowR.row.left - aboveR.row.left);
+                            nrg = aboveR.row.right + fracR * (belowR.row.right - aboveR.row.right);
+                        } else if (src) {
+                            nx = src.row.x; nl = src.row.left; nrg = src.row.right;
+                        } else {
+                            nx = 0; nl = 0; nrg = 0;
+                        }
+                        var halfH = aMedH / 2;
+                        rebuilt.push({ y: ny, x: nx, left: nl, right: nrg,
+                            top: ny - halfH, bottom: ny + halfH, count: 0, interpolated: true });
+                    }
+                    colR[rcc] = rebuilt;
+                    log('  [Reconcile] Col' + (rcc + 1) + ' was '
+                        + Math.round(medRO) + 'px (~' + (medRO / aMedH).toFixed(1) + ' rows) off anchor Col'
+                        + (anchorIdx + 1) + ' (' + anchorReal + ' real rows) — snapped ' + snappedCount
+                        + ' real row(s) to anchor grid');
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    // v9o: HOLE SIGNAL CHECK + V9L FALLBACK
+    // ---------------------------------------------------------------------
+    // Hole-based alignment relies on detecting digit holes (h>0). On low-res
+    // images (e.g. 432-wide Scarborough at 7px digit height), holes are
+    // below the binarization threshold — analyzeRowHoles returns h=0 for
+    // every CC. The alignment-offset trial scores then collapse into a tight
+    // band (e.g. 38-48%) with the winner picked from noise. Different
+    // columns pick different offsets, producing systematic Y misalignment
+    // that breaks cell extraction.
+    //
+    // When the hole signal is too weak, fall back to v9l's row-window
+    // approach: trust CC clustering directly (no phantom header skipping),
+    // align Ys via cross-column consensus, augment short columns from
+    // neighbors, extrapolate edge clipping. Hole-based alignment is
+    // preserved for cases where it works (gaps/scribbles/footer noise on
+    // higher-res sheets).
+    // =====================================================================
+    var holesFound = 0, totalAnalyzed = 0;
+    for (var hci_ = 0; hci_ < colAlignments.length; hci_++) {
+        var hca_ = colAlignments[hci_];
+        if (!hca_ || !hca_.grps || !binary) continue;
+        for (var hgi_ = 0; hgi_ < hca_.grps.length; hgi_++) {
+            totalAnalyzed++;
+            var hga_ = analyzeRowHoles(binary, hca_.grps[hgi_]);
+            if (hga_.signature && hga_.signature.split(',').some(function(s){return parseInt(s,10) > 0;})) {
+                holesFound++;
+            }
+        }
+    }
+    var holeSignalPct = totalAnalyzed > 0 ? (holesFound / totalAnalyzed) : 0;
+    log('  Hole signal: ' + holesFound + '/' + totalAnalyzed + ' = ' + (holeSignalPct*100).toFixed(0) + '%');
+
+    var WEAK_HOLE_PCT = 0.10;
+    if (holeSignalPct < WEAK_HOLE_PCT && top.length >= 2) {
+        log('  ⇒ WEAK hole signal — falling back to v9l row-window path');
+
+        function v9l_medianOf(arr) {
+            var s = arr.slice().sort(function(a,b){return a-b;});
+            var mid = Math.floor(s.length/2);
+            return s.length % 2 === 0 ? (s[mid-1]+s[mid])/2 : s[mid];
+        }
+        function v9l_findBestRowWindow(ys, rc) {
+            if (ys.length <= rc) return {topY: ys[0], botY: ys[ys.length-1], start: 0};
+            var bestVar = Infinity, bestStart = 0;
+            for (var s = 0; s <= ys.length - rc; s++) {
+                var sps = [];
+                for (var i = s+1; i < s+rc; i++) sps.push(ys[i]-ys[i-1]);
+                var mean = sps.reduce(function(a,b){return a+b;},0) / sps.length;
+                var variance = sps.reduce(function(a,b){return a + Math.pow(b-mean,2);},0) / sps.length;
+                if (variance < bestVar) { bestVar = variance; bestStart = s; }
+            }
+            return {topY: ys[bestStart], botY: ys[bestStart + rc - 1], start: bestStart};
+        }
+
+        // === 1. Y-alignment trim ===
+        var v9l_colGroups = [];
+        for (var ai_ = 0; ai_ < top.length; ai_++) {
+            if (top[ai_].length === 0) { v9l_colGroups.push({grps:[], ys:[]}); continue; }
+            var aclS = top[ai_].slice().sort(function(a,b){return a.cy-b.cy;});
+            var aAvgH = aclS.reduce(function(s,c){return s+c.h;},0)/aclS.length;
+            var aYTol = aAvgH * 0.6;
+            var aGrps = [[aclS[0]]];
+            for (var agi_ = 1; agi_ < aclS.length; agi_++) {
+                var aLast = aGrps[aGrps.length-1];
+                if (aclS[agi_].cy - aLast[aLast.length-1].cy <= aYTol) aLast.push(aclS[agi_]);
+                else aGrps.push([aclS[agi_]]);
+            }
+            v9l_colGroups.push({
+                grps: aGrps,
+                ys: aGrps.map(function(g){return g.reduce(function(s,c){return s+c.cy;},0)/g.length;})
+            });
+        }
+        var v9l_tops = [], v9l_bots = [];
+        for (var ci2_ = 0; ci2_ < v9l_colGroups.length; ci2_++) {
+            if (v9l_colGroups[ci2_].ys.length === 0) continue;
+            var win = v9l_findBestRowWindow(v9l_colGroups[ci2_].ys, rowCount);
+            v9l_tops.push(win.topY);
+            v9l_bots.push(win.botY);
+        }
+        if (v9l_tops.length >= 2) {
+            var v9l_cTop = v9l_medianOf(v9l_tops);
+            var v9l_cBot = v9l_medianOf(v9l_bots);
+            log('    Y consensus: top=' + Math.round(v9l_cTop) + ' bot=' + Math.round(v9l_cBot)
+                + ' (per-col tops: [' + v9l_tops.map(function(t){return Math.round(t);}).join(',') + '])');
+            var v9l_allSps = [];
+            for (var csi_ = 0; csi_ < v9l_colGroups.length; csi_++) {
+                var cys = v9l_colGroups[csi_].ys;
+                for (var csj_ = 1; csj_ < cys.length; csj_++) {
+                    var sp = cys[csj_] - cys[csj_-1];
+                    if (sp > 0) v9l_allSps.push(sp);
+                }
+            }
+            var v9l_doTrim = false, v9l_medSp = 0;
+            if (v9l_allSps.length >= 3) {
+                v9l_medSp = v9l_medianOf(v9l_allSps);
+                var v9l_range = v9l_cBot - v9l_cTop;
+                var v9l_expected = (rowCount - 1) * v9l_medSp;
+                var v9l_ratio = v9l_range / v9l_expected;
+                if (v9l_ratio >= 0.65 && v9l_ratio <= 1.5) {
+                    v9l_doTrim = true;
+                    log('    Y guard OK: ratio=' + v9l_ratio.toFixed(2) + ' (medSp=' + Math.round(v9l_medSp) + ')');
+                } else {
+                    log('    Y guard FAILED (ratio ' + v9l_ratio.toFixed(2) + ') — skipping trim');
+                }
+            }
+            if (v9l_doTrim) {
+                for (var ti2_ = 0; ti2_ < top.length; ti2_++) {
+                    var tol = v9l_medSp * 0.5;
+                    var before_ = top[ti2_].length;
+                    top[ti2_] = top[ti2_].filter(function(c) {
+                        return c.cy >= v9l_cTop - tol && c.cy <= v9l_cBot + tol;
+                    });
+                    if (before_ !== top[ti2_].length) {
+                        log('    Col' + (ti2_+1) + ': trim ' + before_ + '→' + top[ti2_].length + ' (consensus range)');
+                    }
+                }
+            }
+        }
+
+        // === Build colR via buildRowsFromCluster (no hole-alignment) ===
+        log('  [v9l Rows] Building from CC clusters...');
+        colR = top.map(function(cl, i) {
+            var rows = buildRowsFromCluster(cl, rowCount);
+            log('    Col' + (i+1) + ': ' + rows.length + ' row groups');
+            return rows;
+        });
+
+        // === 2. Cross-validate ===
+        function v9l_crossValidateRows(rowsA, allOtherRows, labelA) {
+            if (rowsA.length >= rowCount) return rowsA;
+            var refRows = [];
+            allOtherRows.forEach(function(rr){refRows = refRows.concat(rr);});
+            refRows.sort(function(a,b){return a.y-b.y;});
+            var spsA = []; for (var i=1; i<rowsA.length; i++) spsA.push(rowsA[i].y - rowsA[i-1].y);
+            if (spsA.length < 2) return rowsA;
+            var medA = v9l_medianOf(spsA);
+            var spsR = []; for (var j=1; j<refRows.length; j++) spsR.push(refRows[j].y - refRows[j-1].y);
+            var medR = spsR.length >= 2 ? v9l_medianOf(spsR) : medA;
+            var med = Math.round((medA + medR) / 2);
+            var yTol = med * 0.4;
+            var augmented = rowsA.slice(), added = 0;
+            // === 2a. TOP-ALIGNMENT: prepend rows if this column starts well below consensus ===
+            // Without this, gap-fill will fill ABOVE-range space inside the existing range,
+            // producing a column that's the right length but mapped to wrong row indices.
+            // NOTE: use medA (this column's own spacing). medR is unreliable here because
+            // refRows is concat'd-sorted across columns, so adjacent same-row entries from
+            // different columns produce near-zero spacings, halving med.
+            if (refRows.length >= 3 && medA > 0) {
+                var k_ = Math.min(3, refRows.length);
+                var refTop = 0;
+                for (var rk_ = 0; rk_ < k_; rk_++) refTop += refRows[rk_].y;
+                refTop /= k_;
+                var aTop0 = augmented[0].y;
+                if (aTop0 > refTop + 1.5 * medA) {
+                    var offsetRows = Math.round((aTop0 - refTop) / medA);
+                    log('    ' + labelA + ': aTop=' + Math.round(aTop0) + ' vs refTop=' + Math.round(refTop)
+                        + ' (~' + offsetRows + ' rows above, medA=' + medA + ') — prepending');
+                    for (var pi_ = offsetRows - 1; pi_ >= 0 && augmented.length < rowCount; pi_--) {
+                        var pY_ = aTop0 - (offsetRows - pi_) * medA;
+                        augmented.unshift({
+                            y: pY_, x: augmented[0].x,
+                            left: augmented[0].left, right: augmented[0].right,
+                            top: pY_ - medA * 0.3, bottom: pY_ + medA * 0.3,
+                            interpolated: true, count: 0
+                        });
+                        added++;
+                    }
+                }
+            }
+            for (var gi = 0; gi < augmented.length-1 && augmented.length < rowCount; gi++) {
+                var gap = augmented[gi+1].y - augmented[gi].y;
+                if (gap < med * 1.5) continue;
+                var missing = Math.round(gap / med) - 1;
+                if (missing < 1) continue;
+                var gapTop = augmented[gi].y, gapBot = augmented[gi+1].y;
+                var refsInGap = refRows.filter(function(r){return r.y > gapTop+yTol && r.y < gapBot-yTol;});
+                for (var mi2 = 0; mi2 < missing && augmented.length < rowCount; mi2++) {
+                    var expectedY = gapTop + med * (mi2+1);
+                    var matchR = null;
+                    for (var bi = 0; bi < refsInGap.length; bi++) {
+                        if (Math.abs(refsInGap[bi].y - expectedY) < yTol) { matchR = refsInGap[bi]; break; }
+                    }
+                    var newY = matchR ? matchR.y : expectedY;
+                    augmented.splice(gi+1+mi2, 0, {
+                        y: newY, x: (augmented[gi].x+augmented[gi+1].x)/2,
+                        left: (augmented[gi].left+augmented[gi+1].left)/2,
+                        right: (augmented[gi].right+augmented[gi+1].right)/2,
+                        top: newY-med*0.3, bottom: newY+med*0.3,
+                        interpolated: true, count: 0
+                    });
+                    added++;
+                    log('      ' + labelA + ': inserted at y=' + Math.round(newY) + (matchR?' (matched)':' (interp)'));
+                }
+            }
+            if (augmented.length < rowCount && refRows.length > 0) {
+                var aTop = augmented[0].y;
+                var bAbove = refRows.filter(function(r){return r.y < aTop - yTol;});
+                for (var ti3 = bAbove.length-1; ti3 >= 0 && augmented.length < rowCount; ti3--) {
+                    augmented.unshift({y: bAbove[ti3].y, x: augmented[0].x,
+                        left: augmented[0].left, right: augmented[0].right,
+                        top: bAbove[ti3].y-med*0.3, bottom: bAbove[ti3].y+med*0.3,
+                        interpolated: true, count: 0});
+                    added++;
+                }
+                var aBot = augmented[augmented.length-1].y;
+                var bBelow = refRows.filter(function(r){return r.y > aBot + yTol;});
+                for (var bi3 = 0; bi3 < bBelow.length && augmented.length < rowCount; bi3++) {
+                    augmented.push({y: bBelow[bi3].y,
+                        x: augmented[augmented.length-1].x,
+                        left: augmented[augmented.length-1].left,
+                        right: augmented[augmented.length-1].right,
+                        top: bBelow[bi3].y-med*0.3, bottom: bBelow[bi3].y+med*0.3,
+                        interpolated: true, count: 0});
+                    added++;
+                }
+            }
+            if (added > 0) log('    ' + labelA + ': ' + rowsA.length + ' → ' + augmented.length + ' rows (+' + added + ')');
+            if (augmented.length > rowCount) augmented = augmented.slice(0, rowCount);
+            return augmented;
+        }
+
+        var anyShort_ = colR.some(function(r){return r.length < rowCount;});
+        if (anyShort_) {
+            log('  [v9l Cross-validate] Augmenting short columns...');
+            for (var cvi_ = 0; cvi_ < colR.length; cvi_++) {
+                var others_ = colR.filter(function(_, j){return j !== cvi_;});
+                colR[cvi_] = v9l_crossValidateRows(colR[cvi_], others_, 'Col' + (cvi_+1));
+            }
+        }
+
+        // === 3. Extrapolate ===
+        function v9l_extrapolateRows(rows, allRows, label) {
+            if (rows.length >= rowCount) return rows;
+            var sps = []; for (var i=1; i<rows.length; i++) sps.push(rows[i].y - rows[i-1].y);
+            if (sps.length < 2) return rows;
+            var med = v9l_medianOf(sps);
+            var allYs = []; allRows.forEach(function(rr){rr.forEach(function(r){allYs.push(r.y);});});
+            var gridTop = Math.min.apply(null, allYs), gridBot = Math.max.apply(null, allYs);
+            var added = 0;
+            while (rows.length < rowCount) {
+                var topGap = rows[0].y - gridTop, botGap = gridBot - rows[rows.length-1].y;
+                if (topGap > med * 0.5 && topGap >= botGap) {
+                    var nY = rows[0].y - med;
+                    rows.unshift({y: nY, x: rows[0].x, left: rows[0].left, right: rows[0].right,
+                        top: nY-med*0.3, bottom: nY+med*0.3, interpolated: true, count: 0});
+                    added++;
+                } else {
+                    var nY2 = rows[rows.length-1].y + med;
+                    rows.push({y: nY2, x: rows[rows.length-1].x,
+                        left: rows[rows.length-1].left, right: rows[rows.length-1].right,
+                        top: nY2-med*0.3, bottom: nY2+med*0.3, interpolated: true, count: 0});
+                    added++;
+                }
+            }
+            if (added > 0) log('    ' + label + ': extrapolated +' + added);
+            return rows;
+        }
+        anyShort_ = colR.some(function(r){return r.length < rowCount;});
+        if (anyShort_) {
+            log('  [v9l Extrapolate]...');
+            for (var exi_ = 0; exi_ < colR.length; exi_++) {
+                colR[exi_] = v9l_extrapolateRows(colR[exi_], colR, 'Col' + (exi_+1));
+            }
+        }
+
+        log('  [v9l Final] ' + colR.map(function(r,i){return 'Col' + (i+1) + '=' + r.length;}).join(', '));
+    } else {
+        log('  ⇒ STRONG hole signal — keeping alignment-driven colR');
+    }
+    // === END v9o branch ===
+
+    // === X-OUTLIER FILTER ===
+    // Each column's CCs should share roughly the same x position (printed column).
+    // A row whose x deviates wildly from the column median is a noise CC that
+    // slipped past prior filters — it pollutes nextGrp[i].left in extractCellsDirect,
+    // making the previous group's W cell unusually narrow at that one row.
+    // Replace x/left/right with column medians for outlier rows.
+    for (var xfci = 0; xfci < colR.length; xfci++) {
+        var xfcol = colR[xfci];
+        if (xfcol.length < 5) continue;
+        var xfXs = xfcol.map(function(r) { return r.x; }).slice().sort(function(a, b) { return a - b; });
+        var xfLs = xfcol.map(function(r) { return r.left; }).slice().sort(function(a, b) { return a - b; });
+        var xfRs = xfcol.map(function(r) { return r.right; }).slice().sort(function(a, b) { return a - b; });
+        var xfMedX = xfXs[Math.floor(xfXs.length / 2)];
+        var xfMedL = xfLs[Math.floor(xfLs.length / 2)];
+        var xfMedR = xfRs[Math.floor(xfRs.length / 2)];
+        var xfMedW = Math.max(4, xfMedR - xfMedL);
+        // Tolerance: 1.5× the column's typical width (about 1.5 character widths)
+        var xfTol = Math.max(8, xfMedW * 1.5);
+        var xfFixed = 0, xfLogged = [];
+        for (var xfri = 0; xfri < xfcol.length; xfri++) {
+            if (Math.abs(xfcol[xfri].x - xfMedX) > xfTol) {
+                xfLogged.push('r' + xfri + '(x=' + Math.round(xfcol[xfri].x) + '→' + Math.round(xfMedX) + ')');
+                xfcol[xfri].x = xfMedX;
+                xfcol[xfri].left = xfMedL;
+                xfcol[xfri].right = xfMedR;
+                xfcol[xfri].xCorrected = true;
+                xfFixed++;
+            }
+        }
+        if (xfFixed > 0) {
+            log('  [X-Outlier] Col' + (xfci + 1) + ': corrected ' + xfFixed + ' row(s) (medX='
+                + Math.round(xfMedX) + ', tol=' + Math.round(xfTol) + '): ' + xfLogged.join(', '));
+        }
+    }
+
+    // === SYNTHESIZE Col1 if leftmost-missing was detected ===
+    // Insert a synthetic colR[0]:
+    //   y[i] = col2.y[i]  (rows align across columns)
+    //   x    = col2.x - (col3.x - col2.x)  (uniform inter-column spacing)
+    //   left/right mirror col2's typical CC width (clipped to >= 0)
+    // If col1Cx clips to 0 (numbers fully off-page), collapse synth bbox to
+    // left=right=0 so extractCellsDirect starts the W cell at x=0.
+    // Mark synthesized rows with filled:true so cross-align skips them when
+    // computing medOffset (no real CCs to compare against).
+    var leftmostSynthHint = null;
+    if (leftmostMissing && colR.length >= 2 && colR[0].length > 0 && colR[1].length > 0) {
+        log('\n[Synthesize Col1] Building from sibling columns...');
+        var sibCol2 = colR[0]; // sheet's col2 (lowest x of detected)
+        var sibCol3 = colR[1]; // sheet's col3
+        var col2Cx_s = sibCol2.reduce(function(s, r) { return s + r.x; }, 0) / sibCol2.length;
+        var col3Cx_s = sibCol3.reduce(function(s, r) { return s + r.x; }, 0) / sibCol3.length;
+        var dx_s = col3Cx_s - col2Cx_s;
+        var col1Cx_raw = col2Cx_s - dx_s;
+        var col1Cx_s = Math.max(0, col1Cx_raw);
+        // Mirror col2's typical CC width
+        var col2Ws = sibCol2.map(function(r) { return r.right - r.left; }).filter(function(w) { return w > 0; });
+        col2Ws.sort(function(a, b) { return a - b; });
+        var medW_s = col2Ws.length ? col2Ws[Math.floor(col2Ws.length / 2)] : 12;
+        var col1Left_s, col1Right_s;
+        if (col1Cx_raw <= 0) {
+            col1Left_s = 0; col1Right_s = 0;
+        } else {
+            col1Left_s = Math.max(0, col1Cx_s - medW_s / 2);
+            col1Right_s = col1Left_s + medW_s;
+        }
+        var synthCol = sibCol2.map(function(r) {
+            return {
+                y: r.y, x: col1Cx_s,
+                left: col1Left_s, right: col1Right_s,
+                top: r.top, bottom: r.bottom,
+                count: 0, synthesized: true, filled: true
+            };
+        });
+        colR.unshift(synthCol);
+        log('  Col1 SYNTHESIZED at x=' + Math.round(col1Cx_s) + ' (col2 x=' + Math.round(col2Cx_s)
+            + ', dx=' + Math.round(dx_s) + ', medW=' + Math.round(medW_s) + '), '
+            + synthCol.length + ' rows mirroring col2 y-positions');
+        leftmostSynthHint = 'Leftmost number column not detected — extrapolated from col2/col3. Verify the col1 W/B move cells in the extracted output.';
+        if (col1Cx_s === 0) {
+            log('  Col1.x clipped to 0 — leftmost numbers fully off-page; W cells start near left edge');
+        }
+    }
+
     // === Direct cell extraction (no global warp) ===
     log('\n[Direct] Extracting cells from original image (no global warp)...');
     var cells = extractCellsDirect(srcMat, colR, rowCount, format, log);
     log('  ' + cells.length + ' cells');
 
+    // === TEMPLATE-MISMATCH DETECTION ===
+    // Surfaces signals that suggest the user's selected Format / Rows × Cols
+    // doesn't match the actual scoresheet. Caller (sheets.js) shows a banner
+    // recommending the user verify their template selection.
+    //
+    // Signals checked (any one is enough):
+    //   1. Column count mismatch — detected fewer columns than expected
+    //   2. Row count short — at least one column ended up with < 50% rowCount
+    //   3. Cross-column Y disagreement — adjacent groups' median row offset
+    //      exceeds 0.7 × median row spacing (after the v9o fix that catches
+    //      Scarborough-style cases). For mismatched templates the alignment
+    //      lands on different rows in different columns.
+    var templateWarnings = [];
+    var tmExpCols = expCols;
+    if (colR.length < tmExpCols) {
+        templateWarnings.push('detected ' + colR.length + ' column(s) but template expects ' + tmExpCols);
+    }
+    var minColRows = colR.length > 0 ? Math.min.apply(null, colR.map(function(r){return r.length;})) : 0;
+    if (minColRows > 0 && minColRows < Math.floor(rowCount * 0.5)) {
+        templateWarnings.push('row count ' + minColRows + ' < ' + Math.floor(rowCount * 0.5)
+            + ' (template expects ' + rowCount + ')');
+    }
+    if (colR.length >= 2 && colR[0].length >= 5) {
+        // Estimate row spacing from col 0
+        var tmSps = [];
+        for (var tmi = 1; tmi < colR[0].length; tmi++) {
+            tmSps.push(colR[0][tmi].y - colR[0][tmi-1].y);
+        }
+        tmSps.sort(function(a,b){return a-b;});
+        var tmMedSp = tmSps[Math.floor(tmSps.length/2)];
+        if (tmMedSp > 0) {
+            for (var tmpi = 0; tmpi < colR.length - 1; tmpi++) {
+                // Only consider rows where BOTH columns have a real (non-
+                // interpolated) anchor. Interpolated rows can be slightly
+                // off the consensus geometry (especially after grid-fit
+                // for cross-validate fills) and produce false positives.
+                var tmOffsets = [];
+                var tmShared = Math.min(colR[tmpi].length, colR[tmpi+1].length);
+                for (var tmri = 0; tmri < tmShared; tmri++) {
+                    var ra = colR[tmpi][tmri], rb = colR[tmpi+1][tmri];
+                    if (!ra || !rb) continue;
+                    if (ra.interpolated || rb.interpolated) continue;
+                    if (typeof ra.y !== 'number' || typeof rb.y !== 'number') continue;
+                    tmOffsets.push(rb.y - ra.y);
+                }
+                if (tmOffsets.length < 5) continue;  // need enough real-row pairs
+                tmOffsets.sort(function(a,b){return a-b;});
+                var tmMedOff = tmOffsets[Math.floor(tmOffsets.length/2)];
+                if (Math.abs(tmMedOff) > tmMedSp * 0.7) {
+                    templateWarnings.push('cols ' + (tmpi+1) + '↔' + (tmpi+2)
+                        + ' row Y offset ' + Math.round(tmMedOff)
+                        + 'px (~' + (tmMedOff/tmMedSp).toFixed(1) + ' row spacings, '
+                        + tmOffsets.length + ' real-row pairs)');
+                }
+            }
+        }
+    }
+    // 4. Clipped column-group (bad dual-sheet split) — the detected column
+    //    COUNT is right but one data column-group is much narrower than the
+    //    others AND it hugs the image's right edge. That edge-hug is the
+    //    discriminator: a column-group that is narrow BY DESIGN (some 3-col
+    //    scoresheets really do make the rightmost W/B pair narrower) still
+    //    has a page right-margin to its right; a column the seam sliced off
+    //    runs straight into the half edge with no margin. Catches the case
+    //    where GridUnsplit put the dual-sheet cut inside a sheet instead of
+    //    between sheets, lopping the last column — which otherwise sails
+    //    through every check above (count OK, rows OK, slope OK).
+    var clipNumGroups = colR.length;   // slideRunPipeline scope (not extractCellsDirect's numGroups)
+    if (clipNumGroups >= 2 && clipNumGroups === tmExpCols && cells && cells.length > 0) {
+        var imgWForClip = srcMat.cols;
+        var groupExtent = [];           // per-group {medW, maxRight}
+        for (var cg = 0; cg < clipNumGroups; cg++) {
+            var cgLo = cg * rowCount + 1, cgHi = (cg + 1) * rowCount;
+            var byMove = {};            // moveNumber → {l, r} spanning W+B cells
+            for (var cgi = 0; cgi < cells.length; cgi++) {
+                var cgc = cells[cgi];
+                if (!cgc.bbox || cgc.moveNumber < cgLo || cgc.moveNumber > cgHi) continue;
+                var cgR = cgc.bbox.x + cgc.bbox.width;
+                var mv = byMove[cgc.moveNumber];
+                if (!mv) byMove[cgc.moveNumber] = { l: cgc.bbox.x, r: cgR };
+                else { mv.l = Math.min(mv.l, cgc.bbox.x); mv.r = Math.max(mv.r, cgR); }
+            }
+            var cgWidths = [], cgMaxRight = 0;
+            for (var mk in byMove) {
+                cgWidths.push(byMove[mk].r - byMove[mk].l);
+                if (byMove[mk].r > cgMaxRight) cgMaxRight = byMove[mk].r;
+            }
+            cgWidths.sort(function(a, b){ return a - b; });
+            groupExtent.push({
+                medW: cgWidths.length ? cgWidths[Math.floor(cgWidths.length / 2)] : 0,
+                maxRight: cgMaxRight
+            });
+        }
+        // Reference width = median of all groups EXCEPT the last (the last is
+        // the suspect). Compare the last against that consensus.
+        var refWs = groupExtent.slice(0, clipNumGroups - 1)
+            .map(function(o){ return o.medW; }).filter(function(v){ return v > 0; });
+        refWs.sort(function(a, b){ return a - b; });
+        var refMedW = refWs.length ? refWs[Math.floor(refWs.length / 2)] : 0;
+        var lastGrp = groupExtent[clipNumGroups - 1];
+        // Tunables (validate/tune in grid-slide-testbed.html):
+        var CLIP_WIDTH_RATIO = 0.6;     // last < 60% of consensus = "narrow"
+        var CLIP_MARGIN_FRAC = 0.5;     // right margin < 0.5 normal col = "hugs edge"
+        if (refMedW > 0 && lastGrp.medW > 0
+            && lastGrp.medW < refMedW * CLIP_WIDTH_RATIO
+            && (imgWForClip - lastGrp.maxRight) < refMedW * CLIP_MARGIN_FRAC) {
+            templateWarnings.push('rightmost column ~' + Math.round(lastGrp.medW)
+                + 'px vs ~' + Math.round(refMedW) + 'px for the others and hugs the '
+                + 'image edge (right margin ' + Math.round(imgWForClip - lastGrp.maxRight)
+                + 'px) — likely a clipped column from a bad dual-sheet split');
+        }
+    }
+
+    var templateWarning = templateWarnings.length > 0 ? templateWarnings.join('; ') : null;
+    if (templateWarning) {
+        log('⚠ Template-mismatch signal: ' + templateWarning);
+    }
+
     return {
         cells: cells,
         colR: colR,
-        method: 'slide'
+        method: 'slide',
+        templateWarning: templateWarning,
+        leftmostSynthHint: leftmostSynthHint
     };
 }
 
@@ -2588,8 +3598,83 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
  *                          or null on failure. Caller must delete cell images when done.
  */
 function slideProcessScoresheet(srcMat, config, log) {
-    log = log || function(msg) { console.log('[Slide] ' + msg); };
+    // Fallback only when no caller-provided log fn. Callers in
+    // opencv_image_processor.js / sheets.js already gate their wrappers on
+    // window.SLIDE_VERBOSE_LOG; this default does the same so direct
+    // invocations stay silent unless the flag is set.
+    log = log || function(msg) {
+        if (typeof window !== 'undefined' && window.SLIDE_VERBOSE_LOG) {
+            console.log('[Slide] ' + msg);
+        }
+    };
     config = config || {};
+
+    // === AUTO-UPSCALE for low-resolution inputs ===
+    // Hole-detection-based alignment needs digit holes (h>0) to survive
+    // binarization. Digit heights below ~12px lose hole structure to
+    // thresholding noise — common on phone scans, dual-sheet halves
+    // (Hugh Scarborough_black.jpg at 432x641 with medH=7), and
+    // thumbnail-quality scans. Upscale 2-4× with bicubic interpolation
+    // so digit features survive into the alignment pipeline.
+    //
+    // Mid-resolution inputs (e.g. WilliamScanner600.jpg at 5088x7008 ≈ 35.7MP)
+    // are unaffected — the upscale gate fires only when min(w, h) < TARGET_MIN_DIM.
+    //
+    // === AUTO-DOWNSAMPLE for very high-resolution inputs ===
+    // The opposite failure: a 1200-dpi scan (ChristineScanner1200.jpg at
+    // 10192x14016 ≈ 143MP) makes connectedComponentsWithStats allocate a 32-bit
+    // label image (~572MB) on top of the RGBA source — exceeding the OpenCV.js
+    // (WASM) memory ceiling and throwing. Detection doesn't need that resolution
+    // (digit holes are huge), so cap total pixels and downsample with INTER_AREA.
+    // We only fire ABOVE the largest known-good input (William ≈ 35.7MP), so
+    // every currently-working image is byte-for-byte unchanged.
+    //
+    // After processing, cell bboxes and colR positions are scaled back to the
+    // caller's original-image coordinate system (scaleFactor<1 → inv>1) so any
+    // sidecar/overlay consumers see consistent positions. Cell .image Mats stay
+    // at the resampled resolution since OCR (preprocessCellForCTC) resizes them
+    // to 64x256 anyway.
+    var TARGET_MIN_DIM = 1200;
+    var TARGET_MAX_PIXELS = 40000000; // ~40MP: above William (35.7MP), below the ~143MP OOM point
+    var minDim = Math.min(srcMat.cols, srcMat.rows);
+    var scaleFactor = 1;
+    var upscaledMat = null;
+    if (minDim < TARGET_MIN_DIM) {
+        scaleFactor = Math.min(4, Math.round(TARGET_MIN_DIM / minDim));
+        if (scaleFactor > 1) {
+            var upW = srcMat.cols * scaleFactor;
+            var upH = srcMat.rows * scaleFactor;
+            upscaledMat = new cv.Mat();
+            cv.resize(srcMat, upscaledMat, new cv.Size(upW, upH), 0, 0, cv.INTER_CUBIC);
+            log('[Slide] Auto-upscale: ' + srcMat.cols + 'x' + srcMat.rows
+                + ' → ' + upW + 'x' + upH + ' (' + scaleFactor + '× for low-res input, min < ' + TARGET_MIN_DIM + ')');
+            srcMat = upscaledMat;
+            // Scale predefinedAnchorXs into upscaled coords too
+            if (config.predefinedAnchorXs && config.predefinedAnchorXs.length > 0) {
+                config = Object.assign({}, config);
+                config.predefinedAnchorXs = config.predefinedAnchorXs.map(function(x) {
+                    return x * scaleFactor;
+                });
+            }
+        }
+    } else if (srcMat.cols * srcMat.rows > TARGET_MAX_PIXELS) {
+        // Downsample to ~TARGET_MAX_PIXELS, preserving aspect ratio.
+        scaleFactor = Math.sqrt(TARGET_MAX_PIXELS / (srcMat.cols * srcMat.rows));
+        var dnW = Math.round(srcMat.cols * scaleFactor);
+        var dnH = Math.round(srcMat.rows * scaleFactor);
+        upscaledMat = new cv.Mat();
+        cv.resize(srcMat, upscaledMat, new cv.Size(dnW, dnH), 0, 0, cv.INTER_AREA);
+        log('[Slide] Auto-downsample: ' + srcMat.cols + 'x' + srcMat.rows + ' → ' + dnW + 'x' + dnH
+            + ' (' + scaleFactor.toFixed(3) + '× — ' + Math.round(srcMat.cols * srcMat.rows / 1e6)
+            + 'MP > ' + Math.round(TARGET_MAX_PIXELS / 1e6) + 'MP cap, avoids OpenCV OOM)');
+        srcMat = upscaledMat;
+        if (config.predefinedAnchorXs && config.predefinedAnchorXs.length > 0) {
+            config = Object.assign({}, config);
+            config.predefinedAnchorXs = config.predefinedAnchorXs.map(function(x) {
+                return x * scaleFactor;
+            });
+        }
+    }
 
     var srcGray = new cv.Mat();
     cv.cvtColor(srcMat, srcGray, cv.COLOR_RGBA2GRAY);
@@ -2622,11 +3707,40 @@ function slideProcessScoresheet(srcMat, config, log) {
     // Auto-find best clustering parameters
     var autoResult = slideAutoFind(croppedGray, croppedMat, config, log);
 
+    // === OPT-IN DEBUG HOOK (behavior-preserving) ===
+    // When the caller passes config.onStage(name, mat, data), emit the
+    // intermediate cluster-detection stages for visualization (the grid
+    // testbed uses this). onStage runs SYNCHRONOUSLY here, so consumers may
+    // cv.imshow the passed Mats immediately — they are NOT cloned and are
+    // freed by this function as usual right after. The app never passes
+    // onStage, so this is inert in production. Emitted before the failure
+    // guard below so a failed detection still shows candidates/clusters.
+    if (typeof config.onStage === 'function') {
+        try {
+            config.onStage('crop', croppedMat, { cropBox: crop });
+            if (autoResult.binary) config.onStage('binary', autoResult.binary, null);
+            config.onStage('candidates', croppedMat, { boxes: autoResult.cands || [] });
+            if (autoResult.clResult && autoResult.clResult.hist) {
+                config.onStage('dendro', null, {
+                    hist: autoResult.clResult.hist, bestN: autoResult.bestN
+                });
+            }
+            if (autoResult.cands && autoResult.clResult && autoResult.clResult.edges) {
+                var _dbgClusters = extractClustersAtN(
+                    autoResult.cands, autoResult.clResult.edges, autoResult.bestN || 2);
+                config.onStage('clusters', croppedMat, { clusters: _dbgClusters });
+            }
+        } catch (_e) {
+            log('[Slide] onStage debug hook error: ' + (_e && _e.message), 'dim');
+        }
+    }
+
     if (autoResult.bestResult.bestScore < 0) {
         log('[Slide] Detection failed — no valid column clusters found');
         croppedMat.delete();
         croppedGray.delete();
         if (autoResult.binary) autoResult.binary.delete();
+        if (upscaledMat) upscaledMat.delete();
         return null;
     }
 
@@ -2637,6 +3751,57 @@ function slideProcessScoresheet(srcMat, config, log) {
     croppedMat.delete();
     croppedGray.delete();
     if (autoResult.binary) autoResult.binary.delete();
+
+    // === Scale bboxes/colR back to original-image coordinates ===
+    // Cell .image Mats stay at the resampled resolution for OCR fidelity, but
+    // bbox metadata and colR positions are reported in the caller's coordinate
+    // system so sidecars and overlays remain consistent. Handles BOTH upscale
+    // (scaleFactor>1 → inv<1) and downsample (scaleFactor<1 → inv>1).
+    if (scaleFactor !== 1 && result) {
+        var inv = 1 / scaleFactor;
+        if (result.cells) {
+            result.cells.forEach(function(cell) {
+                if (cell.bbox) {
+                    // bbox keys are width/height (see cells.push above), NOT w/h.
+                    // The old .w/.h here were undefined → width/height stayed at
+                    // upscaled (2×) size while x/y were scaled down, making cells
+                    // render/serialize double-wide on every auto-upscaled image
+                    // (low-res scans + all dual-sheet halves, which are <1200px).
+                    cell.bbox.x = Math.round(cell.bbox.x * inv);
+                    cell.bbox.y = Math.round(cell.bbox.y * inv);
+                    cell.bbox.width = Math.round(cell.bbox.width * inv);
+                    cell.bbox.height = Math.round(cell.bbox.height * inv);
+                }
+            });
+        }
+        if (result.colR) {
+            result.colR.forEach(function(rows) {
+                rows.forEach(function(r) {
+                    if (typeof r.y === 'number') r.y *= inv;
+                    if (typeof r.x === 'number') r.x *= inv;
+                    if (typeof r.left === 'number') r.left *= inv;
+                    if (typeof r.right === 'number') r.right *= inv;
+                    if (typeof r.top === 'number') r.top *= inv;
+                    if (typeof r.bottom === 'number') r.bottom *= inv;
+                });
+            });
+        }
+        // CRITICAL for anchorsOnly mode (used by GridUnsplit): scale anchor
+        // X positions back. Without this, the midpoint computed by GridUnsplit
+        // would be in upscaled coords but applied to the original image —
+        // splitting it at ~2× the correct X. Symptom: left half contains
+        // both sheets, right half is a shadow strip on the far edge.
+        if (result.anchorCols) {
+            result.anchorCols.forEach(function(a) {
+                if (typeof a.cx === 'number') a.cx *= inv;
+                if (a.cys && a.cys.length) {
+                    for (var ay = 0; ay < a.cys.length; ay++) a.cys[ay] *= inv;
+                }
+            });
+        }
+    }
+
+    if (upscaledMat) upscaledMat.delete();
 
     return result;
 }

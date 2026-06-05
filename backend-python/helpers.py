@@ -147,14 +147,44 @@ def _is_valid_move_notation(san: str, move: chess.Move, board: chess.Board) -> b
         if '#' in san and not is_checkmate:
             return False
 
-    # Compare against canonical SAN to catch wrong/unnecessary disambiguation
-    # e.g., "Rba1" when canonical is "Ra1" or "R2a1"
-    # Strip check/mate symbols since those are handled above
+    # Compare against canonical SAN to catch wrong/phantom disambiguation
+    # e.g., "Rba1" when the rook is on the a-file (not b).
+    # Strip check/mate symbols since those are handled above.
     canonical = board.san(move).rstrip('+#')
     input_clean = san.rstrip('+#')
     if canonical != input_clean:
-        return False
+        # Tolerate "unnecessary but correct" disambiguation: many PGN tools
+        # emit a file/rank disambiguator even when only one piece can legally
+        # make the move (e.g. "Nge2" when Nc3 is pinned, so canonical is just
+        # "Ne2"). The disambiguator is still meaningful — it just isn't
+        # strictly required. Reject only when the disambiguator points at the
+        # WRONG square (e.g. "Rba1" with rook on a-file).
+        if not _disambig_consistent_with_move(input_clean, move):
+            return False
 
+    return True
+
+
+def _disambig_consistent_with_move(san: str, move: chess.Move) -> bool:
+    """Does the disambiguator in this piece-move SAN match move.from_square?
+
+    Used by _is_valid_move_notation to distinguish "unnecessary but correct"
+    disambiguation (accept) from "wrong/phantom" disambiguation (reject).
+    Pawn moves are out of scope — they never carry an unnecessary
+    disambiguator under standard SAN.
+    """
+    body = re.sub(r'=[QRBNqrbn]$', '', san)
+    # Only piece moves (N/B/R/Q/K) have the unnecessary-disambig case.
+    if not body or body[0] not in 'NBRQK':
+        return False
+    m = re.match(r'^[NBRQK]([a-h]?)([1-8]?)x?[a-h][1-8]$', body)
+    if not m:
+        return False
+    disamb_file, disamb_rank = m.groups()
+    if disamb_file and chess.square_file(move.from_square) != ord(disamb_file) - ord('a'):
+        return False
+    if disamb_rank and chess.square_rank(move.from_square) != int(disamb_rank) - 1:
+        return False
     return True
 
 
@@ -585,6 +615,93 @@ def auto_correct_combined(san: str, board: chess.Board, max_changes: int = 2) ->
     return None
 
 
+def _auto_correct_disambiguation(san: str, board: chess.Board) -> Optional[Tuple[str, str, int]]:
+    """
+    Try inserting a file/rank disambiguator into an ambiguous piece move.
+    Called only when board.parse_san() raised AmbiguousMoveError.
+
+    E.g., "Rd1" with two rooks on c1 and e1 → tries "Rad1".."Rhd1", "R1d1".."R8d1".
+    Applies "One or Nothing": returns (corrected, desc, 1) if exactly one is legal,
+    None if zero or two-or-more legal options exist.
+    """
+    if not san or len(san) < 2 or san[0] not in 'KQRBN':
+        return None
+
+    suffix = ''
+    clean = san
+    if clean.endswith(('+', '#')):
+        suffix = clean[-1]
+        clean = clean[:-1]
+
+    piece = clean[0]
+    rest = clean[1:]  # e.g. 'd1', 'xd1', 'd1=Q'
+
+    legal_variants = []
+    for disambig in 'abcdefgh12345678':
+        variant = piece + disambig + rest + suffix
+        try:
+            m = board.parse_san(variant)
+            if m in board.legal_moves and _is_valid_move_notation(variant, m, board):
+                legal_variants.append((variant, f'disambig +{disambig}', 1))
+        except Exception:
+            pass
+
+    if len(legal_variants) == 1:
+        return legal_variants[0]
+
+    if len(legal_variants) > 1:
+        print(f"  [DISAMBIG] '{san}' still ambiguous: {[v[0] for v in legal_variants]}")
+
+    return None
+
+
+def legal_san_disambiguations(board: chess.Board, san: str) -> List[str]:
+    """Return the legal file/rank-disambiguated variants of an under-specified
+    piece move.
+
+    A move like "Nd7" with knights on b8 AND f6 is genuinely ambiguous: chess.js
+    and python-chess both REFUSE to play it (AmbiguousMoveError), so the
+    interactive validator and the board playback stop there. The search
+    algorithms must stop too — they must NOT silently commit to one reading.
+
+    Returns the list of legal variants (e.g. ['Nbd7', 'Nfd7']). An empty or
+    length-1 result means the move is NOT genuinely ambiguous:
+      - parses cleanly (already unambiguous / fully specified) -> []
+      - exactly one legal disambiguation -> [that variant]  (the normal fix path
+        auto-applies it; "One or Nothing" — no review needed)
+      - >= 2 legal disambiguations -> the genuine-ambiguity case.
+    Mirrors the variant enumeration in ``_auto_correct_disambiguation``.
+    """
+    if not san or len(san) < 2 or san[0] not in 'KQRBN':
+        return []
+    try:
+        board.parse_san(san)
+        return []  # parses cleanly — not ambiguous
+    except chess.AmbiguousMoveError:
+        pass
+    except Exception:
+        return []  # illegal for some other reason — not an ambiguity
+
+    suffix = ''
+    clean = san
+    if clean.endswith(('+', '#')):
+        suffix = clean[-1]
+        clean = clean[:-1]
+    piece = clean[0]
+    rest = clean[1:]  # e.g. 'd7', 'xd7'
+
+    variants: List[str] = []
+    for disambig in 'abcdefgh12345678':
+        variant = piece + disambig + rest + suffix
+        try:
+            m = board.parse_san(variant)
+            if m in board.legal_moves and _is_valid_move_notation(variant, m, board):
+                variants.append(variant)
+        except Exception:
+            pass
+    return variants
+
+
 # =============================================================================
 # MOVE EXECUTION
 # =============================================================================
@@ -596,10 +713,12 @@ def try_move(board: chess.Board, san: str, auto_correct: bool = True, max_change
     Try to parse and validate a SAN move. Returns None if illegal.
 
     If auto_correct=True (default), tries these corrections before giving up:
+    0. Disambiguation (if AmbiguousMoveError: insert file/rank disambiguator)
     1. A->G confusion (descender tail)
     2. Capture notation (add/remove 'x')
     3. Piece confusion (R<->K, B<->R, etc.)
-    4. Combined fixes (piece+file, piece+rank) - with safety limits
+    4. Piece-file capture confusion (K<->h, B<->b)
+    5. Combined fixes (piece+file, piece+rank) - with safety limits
 
     Args:
         board: Current chess board state
@@ -615,6 +734,7 @@ def try_move(board: chess.Board, san: str, auto_correct: bool = True, max_change
         return None
 
     # First, try the move as-is
+    _ambiguous = False
     try:
         m = board.parse_san(san)
         if m in board.legal_moves:
@@ -622,11 +742,29 @@ def try_move(board: chess.Board, san: str, auto_correct: bool = True, max_change
             if _is_valid_move_notation(san, m, board):
                 return m
             # Notation doesn't match - fall through to auto-correct if enabled
-    except:
+    except chess.AmbiguousMoveError:
+        _ambiguous = True
+    except Exception:
         pass
 
     # If auto_correct is disabled, stop here
     if not auto_correct:
+        return None
+
+    # 0. Disambiguation: if the move is ambiguous (multiple pieces can reach that square),
+    # try inserting a file/rank disambiguator. Either way, stop here — applying piece/file
+    # corrections to an ambiguous move would suggest a completely different move.
+    if _ambiguous:
+        disambig_result = _auto_correct_disambiguation(san, board)
+        if disambig_result:
+            corrected, desc, _ = disambig_result
+            print(f"  DISAMBIG: '{san}' -> '{corrected}' ({desc})")
+            try:
+                m = board.parse_san(corrected)
+                if m in board.legal_moves:
+                    return m
+            except Exception:
+                pass
         return None
 
     # Try auto-corrections in order of likelihood
@@ -742,16 +880,36 @@ def play_until_stuck(moves: List[str], board: chess.Board = None, start: int = 0
         b.push(m)
     return len(moves), b
 
-def get_position_at(moves: List[str], ply: int) -> Optional[chess.Board]:
-    """Get the board position after playing moves up to (but not including) ply."""
-    b = chess.Board()
-    for i in range(ply):
-        m = try_move(b, moves[i])
-        if m:
-            b.push(m)
-        else:
-            return None
-    return b
+
+def canonicalize_played_moves(moves: List[str]) -> List[str]:
+    """Return a copy of ``moves`` with each entry replaced by its canonical
+    SAN (``board.san`` of the move parsed in the position before playing it).
+
+    python-chess's ``parse_san`` silently accepts non-canonical forms like
+    "Be5" for a capture whose canonical SAN is "Bxe5". chess.js v0.12.0
+    (used by the frontend's navigation/board renderer) is strict and rejects
+    these. When greedy/beam/dijkstra play through the OCR list with
+    ``auto_correct=False``, the algorithm advances on "Be5" but
+    ``state['moves']`` still holds the raw OCR; copying that into
+    ``state.sans`` on the JS side leaves chess.js unable to replay the move,
+    so the board freezes at the affected ply.
+
+    Stops at the first move that doesn't parse legally; remaining entries
+    are kept as-is (defensive: callers typically pass fully-played lists).
+    """
+    out = list(moves)
+    board = chess.Board()
+    for i, san in enumerate(moves):
+        try:
+            move = board.parse_san(san)
+        except Exception:
+            break
+        if move not in board.legal_moves:
+            break
+        out[i] = board.san(move)
+        board.push(move)
+    return out
+
 
 # =============================================================================
 # NOISE DETECTION AND TRUNCATION

@@ -20,7 +20,7 @@ function initOpenCV() {
     return new Promise((resolve, reject) => {
         if (typeof cv !== 'undefined' && cv.Mat) {
             opencvReady = true;
-            console.log('[OpenCV.js] Already loaded');
+            if (typeof window !== 'undefined' && window.GRID_VERBOSE_LOG) console.log('[OpenCV.js] Already loaded');
             resolve();
             return;
         }
@@ -29,7 +29,7 @@ function initOpenCV() {
         if (typeof cv !== 'undefined') {
             cv['onRuntimeInitialized'] = () => {
                 opencvReady = true;
-                console.log('[OpenCV.js] Initialized');
+                if (typeof window !== 'undefined' && window.GRID_VERBOSE_LOG) console.log('[OpenCV.js] Initialized');
                 resolve();
             };
         } else {
@@ -38,7 +38,7 @@ function initOpenCV() {
                 if (typeof cv !== 'undefined' && cv.Mat) {
                     clearInterval(checkInterval);
                     opencvReady = true;
-                    console.log('[OpenCV.js] Ready');
+                    if (typeof window !== 'undefined' && window.GRID_VERBOSE_LOG) console.log('[OpenCV.js] Ready');
                     resolve();
                 }
             }, 100);
@@ -107,12 +107,25 @@ function toGray(src) {
  * @param {cv.Mat} mat - Source image (any format)
  * @returns {string} - Base64 data URL (image/png)
  */
-function matToDataURL(mat) {
+// Blit a Mat into a fresh canvas. This is the CHEAP half (~0.3 ms/cell) and
+// captures the pixels independently of the Mat, so the Mat can be freed while
+// the canvas lives on. Encoding the canvas to a base64 data URL (toDataURL) is
+// the EXPENSIVE, system-load-sensitive half (~2–17 ms/cell) — callers that can
+// tolerate it deferred should hold the canvas and encode later, off the
+// critical path. See processScoresheet's preview handling.
+function matToCanvas(mat) {
     const canvas = document.createElement('canvas');
     canvas.width = mat.cols;
     canvas.height = mat.rows;
     cv.imshow(canvas, mat);
-    return canvas.toDataURL('image/png');
+    return canvas;
+}
+
+function matToDataURL(mat, format, quality) {
+    const canvas = matToCanvas(mat);
+    // Default PNG (lossless) for debug overlays / grid images. Callers that
+    // produce display-only cell thumbnails can pass 'image/jpeg' + quality.
+    return format ? canvas.toDataURL(format, quality) : canvas.toDataURL('image/png');
 }
 
 /**
@@ -1858,15 +1871,24 @@ function preprocessCellForCTC(cellImage, targetHeight = 64, targetWidth = 256) {
  * @param {Object} gridConfig - Optional {rowCount, format} (default: {20, '2col'})
  * @returns {Promise<{cells: Array, grid: cv.Mat, error?: string}>}
  */
-async function processScoresheet(file, gridConfig, corners, method) {
+async function processScoresheet(file, gridConfig, corners, method, options) {
     if (!opencvReady) {
         await initOpenCV();
     }
 
+    // Preview encoding (cell image → base64 data URL) is expensive and
+    // system-load-sensitive. By DEFAULT we encode eagerly so every caller still
+    // gets imageDataUrl/cellBelowImageUrl on its cells (batch sidecar refresh,
+    // visualization paths, etc. — unchanged). The OCR hot path passes
+    // { deferPreviews: true }: cells come back with previewCanvas/cellBelowCanvas
+    // instead, and worker-api encodes them off the critical path, concurrently
+    // with the pool's OCR.
+    const deferPreviews = !!(options && options.deferPreviews);
+
     try {
-        console.log('[OpenCV] Loading image...');
+        if (typeof window !== 'undefined' && window.GRID_VERBOSE_LOG) console.log('[OpenCV] Loading image...');
         const image = await loadImageToMat(file);
-        console.log(`[OpenCV] Image loaded: ${image.cols}x${image.rows}`);
+        if (typeof window !== 'undefined' && window.GRID_VERBOSE_LOG) console.log(`[OpenCV] Image loaded: ${image.cols}x${image.rows}`);
 
         // Branch on detection method
         var useMethod = method || 'slide';
@@ -1879,7 +1901,7 @@ async function processScoresheet(file, gridConfig, corners, method) {
                 throw new Error('Anchor grid module not loaded (grid-anchor.js)');
             }
 
-            console.log('[OpenCV] Extracting grid (anchor)...');
+            if (typeof window !== 'undefined' && window.GRID_VERBOSE_LOG) console.log('[OpenCV] Extracting grid (anchor)...');
             var anchorConfig = {
                 format: gridConfig ? gridConfig.format : '2col',
                 rowCount: gridConfig ? gridConfig.rowCount : 20,
@@ -1970,17 +1992,70 @@ async function processScoresheet(file, gridConfig, corners, method) {
                 throw new Error('Slide grid module not loaded (grid-slide.js)');
             }
 
-            console.log('[OpenCV] Extracting grid (slide)...');
-            var slideConfig = {
+            if (typeof window !== 'undefined' && window.GRID_VERBOSE_LOG) console.log('[OpenCV] Extracting grid (slide)...');
+            var slideConfigBase = {
                 format: gridConfig ? gridConfig.format : '2col',
                 rowCount: gridConfig ? gridConfig.rowCount : 20,
                 maxColWidthPct: 7,
                 pageType: (gridConfig && gridConfig.pageType) || 'front'
             };
+            // Slide-pipeline per-step trace. Gated behind window.SLIDE_VERBOSE_LOG
+            // (default off) — every page of grid detection emits ~80 of these
+            // lines, drowning out higher-signal batch/orchestrator logs. To
+            // re-enable in DevTools: `window.SLIDE_VERBOSE_LOG = true`.
+            var slideLog = function(msg) {
+                if (window.SLIDE_VERBOSE_LOG) console.log('[Slide] ' + msg);
+                // Route the per-half grid-slide internals into the in-page
+                // Grid Detection Report panel when batch-ocr-queue.js has
+                // armed capture around this OCR call (production equivalent of
+                // the testbed report; never goes only to the console).
+                if (window.GridDebugPanel && window.GridDebugPanel.capturing) {
+                    window.GridDebugPanel.line(msg, 'dim');
+                }
+            };
 
-            var slideResult = window.SlideGrid.processScoresheet(image, slideConfig, function(msg) {
-                console.log('[Slide] ' + msg);
-            });
+            // Predefined anchors come from GridUnsplit, which runs on the
+            // joined dual-sheet image at native resolution. Per-half detection
+            // here runs on the half alone with auto-upscale, so it's intrinsically
+            // more precise when it succeeds.
+            //
+            // Two cases:
+            //   (a) GridUnsplit extrapolated a missing leftmost column
+            //       (inferredLeftColumn). Per-half detection cannot see that
+            //       column — must use the anchors. Skip the clean attempt.
+            //   (b) Otherwise, try clean per-half first. Fall back to anchors
+            //       only if clean returns no cells (defensive net for surprise
+            //       failures we haven't characterized yet).
+            var hasFallback = gridConfig && gridConfig.predefinedAnchorXs && gridConfig.predefinedAnchorXs.length > 0;
+            var requireAnchors = hasFallback && gridConfig.inferredLeftColumn;
+
+            var slideResult;
+            if (requireAnchors) {
+                console.log('[Slide] GridUnsplit inferred clipped leftmost column — using anchors (skipping clean per-half)');
+                if (window.GridDebugPanel && window.GridDebugPanel.capturing) window.GridDebugPanel.line('GridUnsplit inferred clipped leftmost column — using anchors (skipping clean per-half)', 'warn');
+                var slideConfigForced = Object.assign({}, slideConfigBase, {
+                    predefinedAnchorXs: gridConfig.predefinedAnchorXs
+                });
+                slideResult = window.SlideGrid.processScoresheet(image, slideConfigForced, slideLog);
+            } else {
+                slideResult = window.SlideGrid.processScoresheet(image, slideConfigBase, slideLog);
+
+                if ((!slideResult || !slideResult.cells || slideResult.cells.length === 0) && hasFallback) {
+                    console.log('[Slide] Clean per-half detection failed — retrying with GridUnsplit anchors as fallback');
+                    if (window.GridDebugPanel && window.GridDebugPanel.capturing) window.GridDebugPanel.line('Clean per-half detection failed — retrying with GridUnsplit anchors as fallback', 'warn');
+                    if (slideResult && slideResult.cells) {
+                        slideResult.cells.forEach(function(c) {
+                            if (c.image && typeof c.image.delete === 'function') {
+                                try { c.image.delete(); } catch (e) { /* already deleted */ }
+                            }
+                        });
+                    }
+                    var slideConfigFallback = Object.assign({}, slideConfigBase, {
+                        predefinedAnchorXs: gridConfig.predefinedAnchorXs
+                    });
+                    slideResult = window.SlideGrid.processScoresheet(image, slideConfigFallback, slideLog);
+                }
+            }
 
             if (!slideResult || !slideResult.cells || slideResult.cells.length === 0) {
                 throw new Error('Slide grid detection failed - no cells extracted. Try Grid or Anchor method.');
@@ -2004,7 +2079,7 @@ async function processScoresheet(file, gridConfig, corners, method) {
 
         } else {
             // === CONTOUR-BASED DETECTION (v34) ===
-            console.log('[OpenCV] Extracting grid (v34)...');
+            if (typeof window !== 'undefined' && window.GRID_VERBOSE_LOG) console.log('[OpenCV] Extracting grid (v34)...');
             gridResult = corners
                 ? extractGridWithCorners(image, corners, gridConfig)
                 : extractGrid(image, gridConfig);
@@ -2017,7 +2092,7 @@ async function processScoresheet(file, gridConfig, corners, method) {
             }
 
             // Extract cells using detection results
-            console.log('[OpenCV] Extracting cells from grid...');
+            if (typeof window !== 'undefined' && window.GRID_VERBOSE_LOG) console.log('[OpenCV] Extracting cells from grid...');
             cells = extractCellsFromGrid(gridResult.gridImage, gridResult.detectionResult, gridResult.config);
         }
 
@@ -2027,17 +2102,27 @@ async function processScoresheet(file, gridConfig, corners, method) {
             moveNumWarnings.forEach(w => console.warn('[OCR Validation] ' + w));
         }
 
-        // Preprocess each cell for OCR and save images as base64
+        // Preprocess each cell for OCR, and capture a canvas of each cell image
+        // for the OCR-context preview. We deliberately do NOT base64-encode the
+        // previews here: toDataURL is the expensive, system-load-sensitive step
+        // (it was ~77% of "grid detect" wall time and froze the main thread
+        // before OCR could even start). matToCanvas keeps the pixels cheaply;
+        // worker-api encodes them to imageDataUrl/cellBelowImageUrl later, in
+        // the background, concurrently with the pool's OCR. The public shape of
+        // each move (imageDataUrl/cellBelowImageUrl strings) is unchanged — the
+        // strings are just produced off the critical path.
         const processedCells = cells.map((cell, idx) => {
             const preprocessed = preprocessCellForCTC(cell.image);
-
-            // Convert cell image to base64 data URL BEFORE deleting
-            const imageDataUrl = matToDataURL(cell.image);
+            // Cheap: blit the Mat into a canvas (~0.3 ms). Encode to a data URL
+            // now (eager) or hand the canvas back for deferred encoding.
+            const previewCanvas = matToCanvas(cell.image);
+            const imageDataUrl = deferPreviews ? null : previewCanvas.toDataURL('image/jpeg', 0.85);
 
             // Get cell_below for A/G tail detection
             // Only use the next same-color cell if it's from the same physical column
             // (i.e., similar x position — not a jump to a different scoresheet column)
             let cellBelow = null;
+            let cellBelowCanvas = null;
             let cellBelowImageUrl = null;
             const cellBelowIdx = idx + 2; // Same color pattern: w,b,w,b...
             if (cellBelowIdx < cells.length && cells[cellBelowIdx].color === cell.color) {
@@ -2050,8 +2135,10 @@ async function processScoresheet(file, gridConfig, corners, method) {
                 }
                 if (sameColumn) {
                     cellBelow = preprocessCellForCTC(cells[cellBelowIdx].image);
-                    // Store cell below image for g-tail area display in OCR context panel
-                    cellBelowImageUrl = matToDataURL(cells[cellBelowIdx].image);
+                    cellBelowCanvas = matToCanvas(cells[cellBelowIdx].image);
+                    if (!deferPreviews) {
+                        cellBelowImageUrl = cellBelowCanvas.toDataURL('image/jpeg', 0.85);
+                    }
                 }
             }
 
@@ -2060,13 +2147,17 @@ async function processScoresheet(file, gridConfig, corners, method) {
                 color: cell.color,
                 preprocessed: preprocessed,
                 cellBelow: cellBelow,
+                // Eager path: imageDataUrl set, canvas dropped. Deferred path:
+                // canvas kept, imageDataUrl null until worker-api encodes it.
+                imageDataUrl: imageDataUrl,
                 cellBelowImageUrl: cellBelowImageUrl,
-                bbox: cell.bbox,
-                imageDataUrl: imageDataUrl  // Store cell image for OCR Context panel
+                previewCanvas: deferPreviews ? previewCanvas : null,
+                cellBelowCanvas: deferPreviews ? cellBelowCanvas : null,
+                bbox: cell.bbox
             };
         });
 
-        // Cleanup cell images (we have base64 versions now)
+        // Cleanup cell Mats — the canvases above hold the pixels independently.
         cells.forEach(cell => cell.image.delete());
 
         image.delete();

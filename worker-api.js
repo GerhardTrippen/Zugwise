@@ -2,157 +2,16 @@
 // worker-api.js - Promise-based API for the Zugwise Web Worker
 // =============================================================================
 
-// =============================================================================
-// NOISE FILTERING - Port of bilstm_ocr.py filter_noise_tail()
-// =============================================================================
-
-/**
- * Filter out noise tail from OCR results.
- * Detects the pattern where empty cells produce repeated garbage like:
- * 26.e4 e4, 27.e4 e4, 28.c4 e4, ...
- *
- * @param {Array} moves - Array of {num, color, move, confidence, ...}
- * @param {number} confidenceThreshold - Below this is "suspicious" (default 0.40)
- * @param {number} minRealMoves - Minimum moves to keep (default 5)
- * @returns {Array} - Filtered moves
- */
-function filterNoiseTail(moves, confidenceThreshold = 0.40, minRealMoves = 5) {
-    if (!moves || moves.length < minRealMoves * 2) {
-        return moves || [];
-    }
-
-    // Group by move number
-    const byNum = {};
-    moves.forEach(m => {
-        if (!byNum[m.num]) byNum[m.num] = {};
-        byNum[m.num][m.color] = m;
-    });
-
-    const moveNums = Object.keys(byNum).map(Number).sort((a, b) => a - b);
-    if (moveNums.length === 0) return moves;
-
-    // Simple pawn moves that are common noise patterns
-    const NOISE_MOVES = new Set([
-        'e4', 'e5', 'd4', 'd5', 'c4', 'c5', 'c3', 'e3', 'd3',
-        'a3', 'a4', 'b3', 'b4', 'f3', 'f4', 'g3', 'g4', 'h3', 'h4',
-        'a6', 'b6', 'c6', 'd6', 'e6', 'f6', 'g6', 'h6'
-    ]);
-
-    // Find where noise starts by looking for the pattern
-    let noiseStart = null;
-    let consecutiveSuspicious = 0;
-
-    for (const n of moveNums) {
-        const w = byNum[n]['w'];
-        const b = byNum[n]['b'];
-
-        let suspiciousSignals = 0;
-
-        // Signal 1: Both colors have low confidence
-        if (w && b) {
-            if (w.confidence < confidenceThreshold && b.confidence < confidenceThreshold) {
-                suspiciousSignals += 1;
-            }
-        }
-
-        // Signal 2: Both colors show the same move (very suspicious)
-        if (w && b && w.move === b.move) {
-            suspiciousSignals += 2; // Strong signal
-        }
-
-        // Signal 3: Both are simple pawn moves commonly seen as noise AND low confidence
-        if (w && b) {
-            const wIsNoise = NOISE_MOVES.has(w.move) && w.confidence < confidenceThreshold;
-            const bIsNoise = NOISE_MOVES.has(b.move) && b.confidence < confidenceThreshold;
-            if (wIsNoise && bIsNoise) {
-                suspiciousSignals += 1;
-            }
-        }
-
-        // Signal 4: One side is missing (White-only or Black-only after complete moves)
-        if ((w && !b) || (!w && b)) {
-            const move = w || b;
-            if (NOISE_MOVES.has(move.move) && move.confidence < confidenceThreshold) {
-                suspiciousSignals += 1;
-            }
-        }
-
-        console.log(`[NOISE DEBUG] Move ${n}: signals=${suspiciousSignals}, consecutive=${consecutiveSuspicious}, w=${w?.move}(${w?.confidence?.toFixed(2)}), b=${b?.move}(${b?.confidence?.toFixed(2)})`);
-
-        // Track consecutive suspicious moves - require 3+ signals and 4+ consecutive
-        if (suspiciousSignals >= 3) {
-            consecutiveSuspicious += 1;
-            if (consecutiveSuspicious >= 4 && noiseStart === null) {
-                // Found noise start - back up to first suspicious move
-                noiseStart = n - consecutiveSuspicious + 1;
-            }
-        } else {
-            consecutiveSuspicious = 0;
-        }
-    }
-
-    // Also check for massive repetition - ONLY LOW CONFIDENCE MOVES
-    const moveCounts = {};
-    moves.forEach(m => {
-        if (m.move && m.confidence < 0.50) {
-            moveCounts[m.move] = (moveCounts[m.move] || 0) + 1;
-        }
-    });
-
-    // If any simple move appears 5+ times at low confidence, find where CONSECUTIVE repetition starts
-    // IMPORTANT: Both colors at a move number must look noisy for it to count.
-    // A move number with one real-looking move (e.g. Rxe1) should NOT be treated as noise.
-    for (const [mv, count] of Object.entries(moveCounts)) {
-        if (NOISE_MOVES.has(mv) && count >= 5) {
-            let consecutiveStart = null;
-            let consecutiveCount = 0;
-
-            for (const n of moveNums) {
-                const w = byNum[n]['w'];
-                const b = byNum[n]['b'];
-
-                // A move number counts as noisy only if BOTH sides look suspicious:
-                // - Both present and both are low-confidence noise moves
-                // - Or only one side present and it matches the noise pattern
-                let moveNumIsNoisy = false;
-                if (w && b) {
-                    const wNoisy = NOISE_MOVES.has(w.move) && w.confidence < 0.50;
-                    const bNoisy = NOISE_MOVES.has(b.move) && b.confidence < 0.50;
-                    moveNumIsNoisy = wNoisy && bNoisy;
-                } else if (w || b) {
-                    const move = w || b;
-                    moveNumIsNoisy = move.move === mv && move.confidence < 0.50;
-                }
-
-                if (moveNumIsNoisy) {
-                    if (consecutiveStart === null) consecutiveStart = n;
-                    consecutiveCount++;
-                } else {
-                    consecutiveStart = null;
-                    consecutiveCount = 0;
-                }
-
-                if (consecutiveCount >= 5) {
-                    console.log(`[NOISE DEBUG] Repetition detected: '${mv}' x${consecutiveCount} starting at move ${consecutiveStart}`);
-                    if (noiseStart === null || consecutiveStart < noiseStart) {
-                        noiseStart = consecutiveStart;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    if (noiseStart !== null) {
-        console.log(`[NOISE] Detected noise tail starting at move ${noiseStart}`);
-        const filtered = moves.filter(m => m.num < noiseStart);
-        console.log(`[NOISE] Kept ${filtered.length}/${moves.length} moves`);
-        return filtered;
-    }
-
-    return moves;
-}
-
+// OCR worker pool. When true, per-cell OCR and constrained re-OCR run in a
+// dedicated pool of lightweight ocr-worker.js instances instead of the
+// monolithic Pyodide worker, and processScoresheet dispatches cells
+// concurrently across the pool. OCR_POOL_SIZE = 0 means auto-size from core
+// count (OcrPool caps it at min(4, cores/2), leaving headroom for the main
+// thread and the Pyodide worker). Set a positive integer to pin the size, or
+// USE_OCR_POOL=false for an instant rollback to the serial in-Pyodide-worker
+// OCR path.
+const USE_OCR_POOL = true;
+const OCR_POOL_SIZE = 0;
 
 class ZugwiseAPI {
     constructor() {
@@ -162,11 +21,30 @@ class ZugwiseAPI {
         this.isReady = false;
         this.onStatusChange = null;
         this.useWorker = true; // Toggle between worker and Flask backend
+        this.ocrPool = null;   // OcrPool instance when USE_OCR_POOL
     }
 
     async init(onStatus) {
         this.onStatusChange = onStatus;
 
+        // Bring up the Pyodide worker (chess logic) first, then the OCR pool.
+        await this._initPyodideWorker();
+
+        if (USE_OCR_POOL) {
+            if (typeof OcrPool === 'undefined') {
+                throw new Error('OcrPool not loaded — include ocr-pool.js before worker-api.js');
+            }
+            // Emit ONE recognized status for the loading bar rather than letting
+            // each pool worker's "Loading ONNX model..." reset it (those strings
+            // aren't in the bar's stage map, so they'd snap it backward). Init
+            // the pool without a status callback to keep it quiet.
+            if (onStatus) onStatus('Loading OCR workers...');
+            this.ocrPool = new OcrPool(OCR_POOL_SIZE);
+            await this.ocrPool.init();
+        }
+    }
+
+    _initPyodideWorker() {
         return new Promise((resolve, reject) => {
             this.worker = new Worker('zugwise-worker.js');
 
@@ -207,8 +85,12 @@ class ZugwiseAPI {
                 reject(new Error(`Worker error: ${e.message}`));
             };
 
-            // Trigger initialization
-            this.worker.postMessage({ type: 'init' });
+            // Trigger initialization. When the OCR pool is enabled it owns all
+            // ONNX work, so tell the Pyodide worker to skip loading the model
+            // (saves a redundant download + session + heap). The flag is tied
+            // to USE_OCR_POOL so OCR routing and ONNX loading can never drift:
+            // if the pool is off, the worker loads ONNX and serves OCR itself.
+            this.worker.postMessage({ type: 'init', data: { loadOnnx: !USE_OCR_POOL } });
         });
     }
 
@@ -222,6 +104,16 @@ class ZugwiseAPI {
             this.callbacks.set(id, { resolve, reject });
             this.worker.postMessage({ id, type, data });
         });
+    }
+
+    // Route a single-cell OCR request to the pool when enabled, else fall back
+    // to the Pyodide worker. Affinity (ply → worker) is computed inside the
+    // pool from data.moveInfo, keeping logits and constrained re-OCR colocated.
+    _sendOCR(data) {
+        if (USE_OCR_POOL && this.ocrPool) {
+            return this.ocrPool.runOCR(data);
+        }
+        return this._send('ocr', data);
     }
 
     // API methods matching Flask endpoints
@@ -284,6 +176,9 @@ class ZugwiseAPI {
      * @returns {Promise<{candidates: Array, error: string|null}>}
      */
     async constrainedReOCR(ply, legalMoves, ocrMoves) {
+        if (USE_OCR_POOL && this.ocrPool) {
+            return this.ocrPool.constrainedReOCR(ply, legalMoves, ocrMoves);
+        }
         return this._send('constrained-reocr', { ply, legalMoves, ocrMoves });
     }
 
@@ -296,6 +191,9 @@ class ZugwiseAPI {
      * @returns {Promise<{candidates: Array, top5: Array, scoreMap: Object, error: string|null}>}
      */
     async constrainedReOCRDual(ply, legalMoves) {
+        if (USE_OCR_POOL && this.ocrPool) {
+            return this.ocrPool.constrainedReOCRDual(ply, legalMoves);
+        }
         return this._send('constrained-reocr-dual', { ply, legalMoves });
     }
 
@@ -388,15 +286,23 @@ class ZugwiseAPI {
             throw new Error('OpenCV.js image processor not loaded');
         }
 
+        const _tT0 = performance.now();
+
         if (onProgress) onProgress('Initializing OpenCV...');
 
         // Ensure OpenCV is initialized
         await window.OpenCVImageProcessor.initOpenCV();
 
+        const _tAfterInit = performance.now();
+
         if (onProgress) onProgress('Extracting grid...');
 
-        // Use OpenCV for grid extraction (deskew, perspective transform, cell extraction)
-        const result = await window.OpenCVImageProcessor.processScoresheet(file, gridConfig, corners, method);
+        // Use OpenCV for grid extraction (deskew, perspective transform, cell extraction).
+        // deferPreviews: return cell images as cheap canvases instead of eagerly
+        // base64-encoding them here — we encode below, concurrently with OCR.
+        const result = await window.OpenCVImageProcessor.processScoresheet(file, gridConfig, corners, method, { deferPreviews: true });
+
+        const _tAfterGrid = performance.now();
 
         if (!result.gridDetected || result.cells.length === 0) {
             return {
@@ -408,27 +314,49 @@ class ZugwiseAPI {
 
         if (onProgress) onProgress(`Running OCR on ${result.cells.length} cells...`);
 
-        // Run OCR inference on each cell using the Pyodide worker
+        // Per-sheet OCR timing accumulators (populated when worker returns `timing`)
+        const _sum = { onnx: 0, softmax: 0, decodeStrict: 0, decodeLenient: 0, total: 0, workerWall: 0, rtOverhead: 0, count: 0 };
+
+        // Run OCR inference on every cell via the OCR pool. The pool routes
+        // each cell to a worker by ply affinity; with size > 1 the workers run
+        // concurrently. We therefore dispatch ALL cells up front and reassemble
+        // in cell order afterwards — worker completion order is
+        // non-deterministic, but the output array must stay in cell order. At
+        // pool size 1 this is equivalent to the old serial loop.
         const moves = [];
-        for (let i = 0; i < result.cells.length; i++) {
-            const cell = result.cells[i];
+        const _cellResults = new Array(result.cells.length).fill(null);
+        let _completed = 0;
 
-            if (onProgress && i % 5 === 0) {
-                onProgress(`OCR: ${i + 1}/${result.cells.length}`);
-            }
+        const _ocrTasks = result.cells.map((cell, i) => {
+            // Send preprocessed cell data for ONNX inference.
+            // Include cellBelow for A/G tail detection.
+            const moveInfo = { num: cell.moveNumber, color: cell.color };
+            if (sheetId) moveInfo.sheet = sheetId;
+            const _tSendStart = performance.now();
+            return this._sendOCR({
+                imageData: cell.preprocessed,
+                width: 256,
+                height: 64,
+                cellBelow: cell.cellBelow,
+                moveInfo: moveInfo
+            }).then((ocrResult) => {
+                const _tRoundtrip = performance.now() - _tSendStart;
 
-            try {
-                // Send preprocessed cell data to worker for ONNX inference
-                // Include cellBelow for A/G tail detection
-                const moveInfo = { num: cell.moveNumber, color: cell.color };
-                if (sheetId) moveInfo.sheet = sheetId;
-                let ocrResult = await this._send('ocr', {
-                    imageData: cell.preprocessed,
-                    width: 256,
-                    height: 64,
-                    cellBelow: cell.cellBelow,
-                    moveInfo: moveInfo
-                });
+                if (ocrResult && ocrResult.timing) {
+                    _sum.onnx          += ocrResult.timing.onnx;
+                    _sum.softmax       += ocrResult.timing.softmax;
+                    _sum.decodeStrict  += ocrResult.timing.decodeStrict;
+                    _sum.decodeLenient += ocrResult.timing.decodeLenient;
+                    _sum.total         += ocrResult.timing.total;
+                    _sum.workerWall    += (ocrResult.timing.workerWall || ocrResult.timing.total);
+                    // NOTE: under concurrent dispatch a cell's roundtrip includes
+                    // time spent queued behind other cells on its worker, so
+                    // rtOverhead/workerWall sums overlap and are no longer a clean
+                    // transport measure. The OCR-loop WALL time logged below is the
+                    // real throughput metric once the pool size is > 1.
+                    _sum.rtOverhead    += (_tRoundtrip - (ocrResult.timing.workerWall || ocrResult.timing.total));
+                    _sum.count         += 1;
+                }
 
                 // Apply g-tail boost if available (JS-side detection)
                 if (ocrResult && ocrResult.move && window.GTailDetection && cell.cellBelow) {
@@ -441,21 +369,66 @@ class ZugwiseAPI {
                     }
                 }
 
-                if (ocrResult && ocrResult.move) {
-                    moves.push({
-                        num: cell.moveNumber,
-                        color: cell.color,
-                        move: ocrResult.move,
-                        confidence: ocrResult.confidence || 0.9,
-                        alternatives: ocrResult.alternatives || [],
-                        lenientAlternatives: ocrResult.lenientAlternatives || [],
-                        logits: ocrResult.logits || null,
-                        imageDataUrl: cell.imageDataUrl,  // Pass through cell image for OCR Context
-                        cellBelowImageUrl: cell.cellBelowImageUrl || null  // G-tail area image
-                    });
-                }
-            } catch (e) {
+                _cellResults[i] = ocrResult;
+            }).catch((e) => {
                 console.warn(`OCR failed for cell ${cell.moveNumber}${cell.color}: ${e.message}`);
+                _cellResults[i] = null;
+            }).finally(() => {
+                _completed++;
+                if (onProgress && _completed % 5 === 0) {
+                    onProgress(`OCR: ${_completed}/${result.cells.length}`);
+                }
+            });
+        });
+
+        // Encode cell previews to base64 OFF the OCR critical path. The grid
+        // processor now returns each cell's image as a cheap canvas
+        // (previewCanvas/cellBelowCanvas) rather than an eagerly-encoded data
+        // URL, because toDataURL is expensive and system-load-sensitive (it was
+        // ~77% of "grid detect" time and froze the main thread before OCR could
+        // start). This task runs on the main thread concurrently with the pool's
+        // OCR (which is on worker threads), so the encode hides behind inference.
+        // It yields periodically so OCR result callbacks and the UI interleave,
+        // and it populates the SAME cell objects the assembly loop reads, so the
+        // move shape (imageDataUrl/cellBelowImageUrl) is unchanged.
+        const _encodePreviews = (async () => {
+            for (let i = 0; i < result.cells.length; i++) {
+                const cell = result.cells[i];
+                try {
+                    if (cell.previewCanvas) {
+                        cell.imageDataUrl = cell.previewCanvas.toDataURL('image/jpeg', 0.85);
+                        cell.previewCanvas = null;  // release the backing store
+                    }
+                    if (cell.cellBelowCanvas) {
+                        cell.cellBelowImageUrl = cell.cellBelowCanvas.toDataURL('image/jpeg', 0.85);
+                        cell.cellBelowCanvas = null;
+                    }
+                } catch (e) {
+                    console.warn(`[Preview] encode failed for cell ${cell.moveNumber}${cell.color}: ${e.message}`);
+                }
+                if ((i & 7) === 0) await new Promise(r => setTimeout(r, 0));  // yield
+            }
+        })();
+
+        await Promise.all([..._ocrTasks, _encodePreviews]);
+
+        // Reassemble results in cell order (completion order was concurrent).
+        for (let i = 0; i < result.cells.length; i++) {
+            const cell = result.cells[i];
+            const ocrResult = _cellResults[i];
+            if (ocrResult && ocrResult.move) {
+                moves.push({
+                    num: cell.moveNumber,
+                    color: cell.color,
+                    move: ocrResult.move,
+                    confidence: ocrResult.confidence || 0.9,
+                    alternatives: ocrResult.alternatives || [],
+                    lenientAlternatives: ocrResult.lenientAlternatives || [],
+                    logits: ocrResult.logits || null,
+                    imageDataUrl: cell.imageDataUrl,  // Pass through cell image for OCR Context
+                    cellBelowImageUrl: cell.cellBelowImageUrl || null,  // G-tail area image
+                    bbox: cell.bbox || null  // Pixel bounding box in warped grid image
+                });
             }
         }
 
@@ -467,6 +440,38 @@ class ZugwiseAPI {
                 console.log(`  ${m.num}.${m.color}: ${m.move} + lenient=[${m.lenientAlternatives.map(a => a.move).join(', ')}]`);
             });
         }
+
+        const _tAfterOcr = performance.now();
+
+        if (_sum.count > 0) {
+            const n = _sum.count;
+            const fmt = (ms) => ms.toFixed(1).padStart(7) + ' ms';
+            const fmtAvg = (ms) => (ms / n).toFixed(2).padStart(6) + ' ms';
+            const initMs    = _tAfterInit - _tT0;
+            const gridMs    = _tAfterGrid - _tAfterInit;
+            const ocrLoopMs = _tAfterOcr - _tAfterGrid;
+            const workerNonInner = _sum.workerWall - _sum.total;  // un-instrumented worker-side work
+            const sheetTag = sheetId ? `sheet ${sheetId}` : 'sheet';
+            console.log(
+                `[OCR-TIMING] ${sheetTag} (${n} cells, method=${method || 'default'}):\n` +
+                `  OpenCV init      : ${fmt(initMs)}\n` +
+                `  Grid detect      : ${fmt(gridMs)}\n` +
+                `  OCR loop         : ${fmt(ocrLoopMs)}  (avg ${(ocrLoopMs/n).toFixed(2)} ms/cell)\n` +
+                `  ── per-cell breakdown (sum over ${n} cells | avg/cell) ──\n` +
+                `  ONNX run         : ${fmt(_sum.onnx)}  | ${fmtAvg(_sum.onnx)}\n` +
+                `  log_softmax      : ${fmt(_sum.softmax)}  | ${fmtAvg(_sum.softmax)}\n` +
+                `  Beam strict      : ${fmt(_sum.decodeStrict)}  | ${fmtAvg(_sum.decodeStrict)}\n` +
+                `  Beam lenient     : ${fmt(_sum.decodeLenient)}  | ${fmtAvg(_sum.decodeLenient)}\n` +
+                `  Inner total      : ${fmt(_sum.total)}  | ${fmtAvg(_sum.total)}  (sum of above)\n` +
+                `  Worker wall      : ${fmt(_sum.workerWall)}  | ${fmtAvg(_sum.workerWall)}  (recv → just-before-postMessage)\n` +
+                `  Worker non-inner : ${fmt(workerNonInner)}  | ${fmtAvg(workerNonInner)}  (input prep + storedLogits + response build)\n` +
+                `  postMessage cost : ${fmt(_sum.rtOverhead)}  | ${fmtAvg(_sum.rtOverhead)}  (roundtrip − workerWall = pure transport)`
+            );
+        }
+
+        // Capture dimensions before deleting the grid Mat
+        const gridWidth = (result.grid && result.grid.cols) ? result.grid.cols : 0;
+        const gridHeight = (result.grid && result.grid.rows) ? result.grid.rows : 0;
 
         // Cleanup grid Mat if it exists
         if (result.grid && result.grid.delete) {
@@ -482,7 +487,9 @@ class ZugwiseAPI {
             has_grid_image: true,
             warnings: result.warnings || [],
             gridOverlayUrl: result.gridOverlayUrl || null,
-            rowsPerColumn: result.rowsPerColumn || null
+            rowsPerColumn: result.rowsPerColumn || null,
+            imageWidth: gridWidth,
+            imageHeight: gridHeight
         };
     }
 

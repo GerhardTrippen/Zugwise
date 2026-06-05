@@ -26,10 +26,10 @@ Usage:
 
 import chess
 from typing import List, Tuple, Optional, Dict, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # Import from existing modules
-from helpers import try_move, piece_value
+from helpers import try_move, piece_value, legal_san_disambiguations
 from absurdity import (
     detect_absurdity_at_ply,
     would_capture_be_bad,
@@ -39,6 +39,7 @@ from absurdity import (
     is_piece_genuinely_hanging,  # SINGLE SOURCE OF TRUTH for hanging detection
     is_classically_hanging_free,  # EAD-only stricter check, no cross-board offset
     side_has_independent_free_capture,  # gate: distinguish mutual-hang from overloaded trade
+    move_attacks_compensating_target,  # gate: distinguish structural sacrifice (Ulvestad b5) from OCR ghost
 )
 
 
@@ -81,6 +82,7 @@ def check_piece_hanging(
         return None
 
     side_that_moved = not board.turn  # Side that just moved
+    opponent = not side_that_moved
 
     # If the move was a capture, determine what was captured.
     # Pieces hanging elsewhere worth <= captured value are not absurd
@@ -92,6 +94,13 @@ def check_piece_hanging(
         cap_piece = board_before.piece_at(move_just_played.to_square)
         if cap_piece:
             captured_value = piece_value(cap_piece)
+
+    # Pre-existing hang guard: if the moving side was in check, the move was
+    # forced to address check. Any piece that was already under attack before
+    # the move is the previous move's problem, not this one's. Example:
+    # 16.Bxg7 (white walks into trouble) 16...Qg5+ 17.Kb1 — Kb1 is forced,
+    # the bishop on g7 was already doomed before Kb1 was played.
+    was_in_check_before = board_before.is_check()
 
     for sq in chess.SQUARES:
         piece = board.piece_at(sq)
@@ -109,6 +118,15 @@ def check_piece_hanging(
 
         # Skip pieces worth <= what we just captured (capture priority is rational)
         if captured_value > 0 and value <= captured_value:
+            continue
+
+        # Pre-existing hang guard (see comment above). Applies only to pieces
+        # that sat still through this move (not the moved piece itself — that
+        # one is covered by bad_trade and the same-square check above).
+        if (was_in_check_before
+                and sq != move_just_played.to_square
+                and sq != move_just_played.from_square
+                and board_before.is_attacked_by(opponent, sq)):
             continue
 
         # Use SINGLE SOURCE OF TRUTH from absurdity.py
@@ -130,20 +148,26 @@ def check_piece_hanging(
         # EAD-only fallback: fire classical-hang ONLY when quiescence
         # deemed the hang "not bad enough" due to cross-board compensation
         # (the "minor gain only" branch — net_gain < 2 after offsetting
-        # captures elsewhere). This branch has two sub-cases:
-        #   - independent mutual-hang: both sides already have a classical
-        #     free capture that happen to net out → two absurdities, flag.
+        # captures elsewhere). This branch has three sub-cases:
+        #   - independent mutual-hang OCR ghost: two unrelated classical
+        #     free captures fluke-cancel → flag (real OCR fingerprint).
         #   - overloaded-defender trade: the compensation only exists
         #     *because* the opponent's capture removes a defender (e.g. a
         #     pawn attacks our bishop AND defends a knight we can take —
         #     capturing the bishop uncovers the knight) → valid exchange,
         #     don't flag.
-        # side_has_independent_free_capture distinguishes them by checking
-        # whether side_that_moved already has a pre-existing classical free
-        # capture in the *current* position, before any hypothetical trade.
+        #   - structural-fork sacrifice: the move-just-played itself attacks
+        #     an opponent piece of comparable value (e.g. Ulvestad 5...b5
+        #     leaves Nc6 hanging while the same b5 pawn attacks Bc4) → real
+        #     opening theory, don't flag.
+        # side_has_independent_free_capture detects mutual-hang vs overloaded
+        # trade. move_attacks_compensating_target then peels structural forks
+        # off the mutual-hang case by checking whether the moved piece itself
+        # threatens the opponent's hanging target.
         if (reason.startswith("minor gain only")
                 and is_classically_hanging_free(board, sq, piece)
-                and side_has_independent_free_capture(board, side_that_moved)):
+                and side_has_independent_free_capture(board, side_that_moved)
+                and not move_attacks_compensating_target(board, move_just_played, value)):
             sq_name = chess.square_name(sq)
             piece_name_str = {3: "minor piece", 5: "Rook", 9: "Queen"}.get(value, f"piece({value})")
             explanation = f"Move leaves {piece_name_str} on {sq_name} hanging (classical)"
@@ -165,10 +189,101 @@ class PersistentAbsurdity:
     square: str
     severity: int
     persistence: int  # How many half-moves it's been ignored
-    
+
     def __str__(self):
         return (f"{self.piece_symbol} hanging on {self.square} "
                 f"for {self.persistence} moves (severity {self.severity})")
+
+
+class EadPrefixCache:
+    """Snapshot cache of EAD state at each successfully-replayed ply.
+
+    Lets ``play_until_absurd_or_stuck`` resume mid-game instead of replaying
+    from ply 0 every call. Greedy/Beam call EAD on each iteration of their
+    fix loop, so without this cache every iteration redoes work for the
+    unchanged prefix.
+
+    What's stored per ply: a board copy AND a copy of ``active_absurdities``.
+    The dict copy matters — ``PersistentAbsurdity.persistence`` is mutated in
+    place by EAD (``existing.persistence += 1``), so a shallow snapshot would
+    silently update when a later ply bumps the same square. Each snapshot
+    owns its own ``PersistentAbsurdity`` instances via ``dataclasses.replace``.
+
+    Invariants and rules:
+      - ``snapshots[k]`` is the (board, active_absurdities) state AFTER ply k
+        has been played and EAD state has been advanced. Length = plies cached.
+      - Only fully-clean plies are recorded. Abnormal EAD exits (illegal,
+        bad_trade, piece_hanging, persistent_absurdity) MUST NOT record — the
+        cache must allow re-detection of those conditions on the next call.
+      - ``invalidate_from(F)`` MUST be called after any mutation to
+        ``moves[F]``. It drops snapshots[F:], so the resume point falls back
+        to F-1 (or 0). This also discards any persistence increments that
+        happened during the now-stale plies.
+      - The cache assumes a single mutating move list. Greedy uses one cache;
+        each Beam path needs its own. Sharing breaks the invariant.
+      - The cache is tied to the EAD knobs used when populating it
+        (severity_threshold, persistence_threshold, auto_correct,
+        approved_plies). Changing those between calls means the snapshots no
+        longer reflect what fresh EAD would compute. Callers that vary these
+        knobs must reset the cache, not just invalidate from a ply.
+    """
+
+    __slots__ = ("_snapshots",)
+
+    def __init__(self):
+        self._snapshots: List[Tuple[chess.Board, Dict[str, PersistentAbsurdity]]] = []
+
+    @property
+    def ply(self) -> int:
+        return len(self._snapshots)
+
+    def get_state(self) -> Tuple[chess.Board, Dict[str, PersistentAbsurdity]]:
+        """Fresh, mutable copies of the latest snapshot (or initial state)."""
+        if not self._snapshots:
+            return chess.Board(), {}
+        board, abs_dict = self._snapshots[-1]
+        return (
+            board.copy(),
+            {sq: replace(a) for sq, a in abs_dict.items()},
+        )
+
+    def record(self, board: chess.Board, active_absurdities: Dict[str, PersistentAbsurdity]):
+        """Append a deep-copied snapshot. Call once per successful ply."""
+        self._snapshots.append((
+            board.copy(),
+            {sq: replace(a) for sq, a in active_absurdities.items()},
+        ))
+
+    def invalidate_from(self, ply: int):
+        """Drop snapshots that may have been computed using moves[ply].
+
+        EAD processing at ply P consults ``moves[P+1]`` for the
+        opponent-takes-hanging / opponent-gives-check exemptions in both
+        ``play_until_absurd_or_stuck`` and ``_detect_hanging_pieces``. So
+        a snapshot recorded at ply F-1 may have used ``moves[F]`` to decide
+        whether to fire ``piece_hanging`` and what entries land in
+        ``active_absurdities``. When ``moves[F]`` changes, snapshot[F-1]
+        is stale — we have to drop it along with everything past it.
+
+        Concretely: drop snapshots with index >= F-1 (clamped at 0).
+        """
+        drop_from = max(0, ply - 1)
+        if drop_from < len(self._snapshots):
+            del self._snapshots[drop_from:]
+
+    def copy(self) -> "EadPrefixCache":
+        """Independent clone with the same snapshot history.
+
+        Beam paths diverge after branching and each needs its own snapshot
+        list (so independent ``invalidate_from`` / ``record`` calls don't
+        interfere). Snapshot entries (``board`` copy + ``replace``-copied
+        dict) are deep-copied at record time and never mutated afterwards,
+        so two caches sharing entries cannot corrupt each other. We only
+        need to clone the list structure, not the entries.
+        """
+        other = EadPrefixCache()
+        other._snapshots = list(self._snapshots)
+        return other
 
 
 def play_until_absurd_or_stuck(
@@ -178,6 +293,8 @@ def play_until_absurd_or_stuck(
     auto_correct: bool = False,
     verbose: bool = False,
     approved_plies: Optional[Set[int]] = None,  # User-confirmed: skip EAD
+    prefix_cache: Optional[EadPrefixCache] = None,
+    forced_stop_plies: Optional[Set[int]] = None,  # Dual-sheet ambiguity: stop here
 ) -> Tuple[int, str, Optional[PersistentAbsurdity]]:
     """
     Play through moves, stopping at:
@@ -232,19 +349,61 @@ def play_until_absurd_or_stuck(
     else:
         print("Game completed successfully")
     """
-    board = chess.Board()
     approved_plies = approved_plies or set()
+    forced_stop_plies = forced_stop_plies or set()
 
-    # Track active absurdities by square: {square_name: PersistentAbsurdity}
-    active_absurdities: Dict[str, PersistentAbsurdity] = {}
+    # Resume from cache when provided, else start fresh. ``get_state`` hands
+    # back deep copies so in-place mutations below (board.push, persistence
+    # increments) don't bleed into the cached snapshots.
+    if prefix_cache is not None and prefix_cache.ply > 0:
+        board, active_absurdities = prefix_cache.get_state()
+        start_ply = prefix_cache.ply
+    else:
+        board = chess.Board()
+        # Track active absurdities by square: {square_name: PersistentAbsurdity}
+        active_absurdities: Dict[str, PersistentAbsurdity] = {}
+        start_ply = 0
 
-    for ply, san in enumerate(moves):
-        # Try to make the move
+    for ply in range(start_ply, len(moves)):
+        san = moves[ply]
+        # Try to make the move. LEGALITY IS CHECKED FIRST — before the forced-stop
+        # flag — because an illegal reading must be handled as 'illegal' (the
+        # normal fix search corrects it) even when the cell is also flagged
+        # forced_stop. The dual-sheet merge can pick an ILLEGAL higher-confidence
+        # reading (e.g. merge emits 1.B 'Kc5' @52%, illegal); if forced_stop won
+        # the race here we'd return 'ambiguous' and the algorithms would "keep"
+        # the illegal move (Kc5 -> Kc5) and dead-end. So: illegal first, then
+        # forced-stop only on a LEGAL move.
         move = try_move(board, san, auto_correct=auto_correct)
         if not move:
+            # SAN-AMBIGUITY: a move that's illegal ONLY because >= 2 same-type
+            # pieces can legally reach the destination (the player wrote an
+            # under-specified move like "Nd7" with knights on b8 and f6). This is
+            # NOT corruption to silently auto-correct: chess.js refuses to play
+            # it and the interactive validator stops for the user to choose. The
+            # algorithms must stop too, or they'd commit to one disambiguation
+            # (Nbd7 vs Nfd7) on a coin flip. Route it through the SAME 'ambiguous'
+            # review path as a dual-sheet forced stop — resolve_forced_stop_choice
+            # surfaces both variants and applies the higher-reach one for review.
+            # (Exactly ONE legal disambiguation is NOT ambiguous — it falls
+            # through to 'illegal' so the normal fix path auto-applies it.)
+            if len(legal_san_disambiguations(board, san)) >= 2:
+                if verbose:
+                    print(f"  [STOP] SAN-ambiguous at ply {ply}: '{san}'")
+                return ply, "ambiguous", None
             if verbose:
                 print(f"  [X] Illegal at ply {ply}: '{san}'")
             return ply, "illegal", None
+        # Forced-stop ambiguity (dual-sheet near-tie disagreement) on a LEGAL
+        # move. Stop here so the user resolves it rather than the algorithm
+        # committing to the higher-confidence reading and barrelling onward
+        # (which is how the 12.B Rb8/Qb8 corruption slipped through). Mirrors
+        # validate_moves' forced_stop. Skipped once the user confirms the ply
+        # (approved_plies).
+        if ply in forced_stop_plies and ply not in approved_plies:
+            if verbose:
+                print(f"  [STOP] Forced-stop (ambiguous) at ply {ply}: '{san}'")
+            return ply, "ambiguous", None
 
         # User-confirmed (or tier-1 merge-locked) move — skip every EAD check
         # and just play it. This mirrors validation.py::check_ead_after_move's
@@ -257,6 +416,8 @@ def play_until_absurd_or_stuck(
         if ply in approved_plies:
             board.push(move)
             active_absurdities = {}
+            if prefix_cache is not None:
+                prefix_cache.record(board, active_absurdities)
             continue
 
         # NEW: Check for bad trade BEFORE playing the move
@@ -316,14 +477,30 @@ def play_until_absurd_or_stuck(
             sq_name, piece_val, explanation = hanging_result
             hanging_square = chess.parse_square(sq_name)
 
-            # If opponent gives CHECK on the very next move, that's a strong
-            # tactical choice — not evidence of OCR error.
-            # We no longer exempt the case where opponent captures the hanging piece:
-            # losing a piece for nothing is absurd even if the opponent takes it.
+            # Two exemptions for the "piece hanging" immediate flag:
+            #  (a) opponent gives check on the next move — they made a
+            #      tactical choice that took priority over capturing our
+            #      piece. Not OCR evidence.
+            #  (b) opponent captures the hanging piece on the next move —
+            #      it's a normal exchange, not a multi-ply hanging absurdity.
+            #      The whole point of "persistent absurdity" detection is
+            #      *piece hangs across multiple plies with no reaction* —
+            #      an immediate capture is a reaction. Real OCR errors leave
+            #      pieces hanging and the opponent ignores them; deliberate
+            #      tactical sacrifices get taken right away.
+            #
+            # Aligns play_until_absurd_or_stuck with validation.py's
+            # check_ead_after_move, which already had exemption (b). The
+            # divergence was firing on legitimate exchange sacrifices in PGN
+            # review and OCR'd tactical games alike — reported case: 41.W
+            # axb5 in a real game where black plays Bxc8 immediately after.
             opponent_gives_check = False
+            opponent_takes_hanging = False
             if ply + 1 < len(moves):
                 next_move = try_move(board, moves[ply + 1], auto_correct=auto_correct)
                 if next_move:
+                    if next_move.to_square == hanging_square and board.is_capture(next_move):
+                        opponent_takes_hanging = True
                     board.push(next_move)
                     opponent_gives_check = board.is_check()
                     board.pop()
@@ -333,6 +510,11 @@ def play_until_absurd_or_stuck(
                     print(f"  [EAD] Piece hanging on {sq_name} but opponent "
                           f"gives check instead — tactical choice, not absurd")
                 # Don't return — opponent chose check over capture, that's fine
+            elif opponent_takes_hanging:
+                if verbose:
+                    print(f"  [EAD] Piece hanging on {sq_name} but opponent "
+                          f"captures it next move — normal exchange, not absurd")
+                # Don't return — opponent captured, it's just an exchange
             else:
                 piece_at_sq = board.piece_at(hanging_square)
                 hanging_abs = PersistentAbsurdity(
@@ -398,9 +580,11 @@ def play_until_absurd_or_stuck(
             for sq in resolved:
                 print(f"  [OK] Ply {ply}: Absurdity resolved - "
                       f"{active_absurdities[sq].piece_symbol} on {sq}")
-        
+
         active_absurdities = new_active
-    
+        if prefix_cache is not None:
+            prefix_cache.record(board, active_absurdities)
+
     # Made it through all moves!
     return len(moves), "complete", None
 

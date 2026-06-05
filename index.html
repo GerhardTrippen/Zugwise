@@ -12,8 +12,70 @@
   <script async src="https://docs.opencv.org/4.9.0/opencv.js" onload="console.log('OpenCV.js loaded')"></script>
   <link rel="manifest" href="manifest.json">
   <meta name="theme-color" content="#1a1a2e">
+  <!-- SEO & social metadata -->
+  <meta name="description" content="Zugwise turns handwritten chess scoresheets into PGN. Free, private, offline-first browser tool with BiLSTM OCR and engine-validated game reconstruction. No uploads, no accounts, no fees.">
+  <meta name="author" content="Gerhard Trippen">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://gerhardtrippen.github.io/Zugwise/">
+
+  <!-- Open Graph (Facebook, LinkedIn, Discord, Slack) -->
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://gerhardtrippen.github.io/Zugwise/">
+  <meta property="og:title" content="Zugwise — Handwritten Chess Scoresheet to PGN">
+  <meta property="og:description" content="Free, private, offline-first browser tool that converts handwritten chess scoresheets to PGN using BiLSTM OCR and engine-validated reconstruction.">
+  <meta property="og:image" content="https://gerhardtrippen.github.io/Zugwise/icons/zugwise-icon-512.png">
+  <meta property="og:site_name" content="Zugwise">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Zugwise — Handwritten Chess Scoresheet to PGN">
+  <meta name="twitter:description" content="Free, private, offline-first chess scoresheet to PGN converter. BiLSTM OCR plus engine-validated reconstruction.">
+  <meta name="twitter:image" content="https://gerhardtrippen.github.io/Zugwise/icons/zugwise-icon-512.png">
+
+  <!-- Structured data: schema.org SoftwareApplication -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Zugwise",
+    "description": "Free, private, offline-first browser tool that converts handwritten chess scoresheets to PGN format using BiLSTM optical character recognition and engine-validated game reconstruction.",
+    "url": "https://gerhardtrippen.github.io/Zugwise/",
+    "applicationCategory": "UtilityApplication",
+    "applicationSubCategory": "Chess Tools",
+    "operatingSystem": "Web Browser (Chrome, Firefox, Safari, Edge)",
+    "browserRequirements": "Requires JavaScript. Works offline after first load.",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "author": {
+      "@type": "Person",
+      "name": "Gerhard Trippen"
+    },
+    "license": "https://polyformproject.org/licenses/noncommercial/1.0.0/",
+    "featureList": [
+      "Handwritten chess scoresheet OCR using BiLSTM neural network",
+      "Engine-validated chess game reconstruction",
+      "Offline operation — runs entirely in browser",
+      "No data uploaded to external servers",
+      "Batch processing for tournament directors",
+      "PGN export compatible with Lichess and Chess.com",
+      "Dual-sheet support for cross-validation"
+    ]
+  }
+  </script>
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col">
+  <noscript>
+    <div style="max-width:800px;margin:2rem auto;padding:1.5rem;background:#1f2937;color:#f3f4f6;border-radius:8px;font-family:system-ui,sans-serif;line-height:1.6">
+      <h1 style="margin-top:0">Zugwise — Handwritten Chess Scoresheet to PGN Converter</h1>
+      <p>Zugwise is a free, open-source tool that converts handwritten chess scoresheets to PGN format. It runs entirely in your browser — no uploads, no accounts, no fees. Your scoresheet photos never leave your device.</p>
+      <p>The tool uses a BiLSTM optical character recognition model trained on the HCS handwritten chess scoresheet dataset, combined with engine-validated game reconstruction. When the OCR is ambiguous, Zugwise uses chess rules and tactical plausibility to recover the most likely move sequence.</p>
+      <p><strong>Zugwise requires JavaScript to function.</strong> Please enable JavaScript in your browser to use the tool.</p>
+      <p>Features: handwritten chess notation OCR, engine-validated reconstruction, dual-sheet cross-validation, batch processing for tournament directors, and PGN export compatible with Lichess and Chess.com.</p>
+    </div>
+  </noscript>
   <div id="offline-status" class="hidden bg-yellow-500 text-white text-center py-2"></div>
   <header class="bg-gray-800 border-b border-gray-700 px-6 py-4">
     <div class="max-w-7xl mx-auto flex items-center justify-between">
@@ -108,36 +170,46 @@
           </div>
         </div>
         <div id="mode-pgn" class="input-content hidden">
-          <!-- Single PGN input (default) -->
-          <div id="pgn-single-input">
-            <textarea id="pgn-input" placeholder="1. e4 e5 2. Nf3 Nc6..." class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-3 text-gray-200 font-mono text-sm"></textarea>
-          </div>
-          <!-- Two-player PGN input (hidden by default) -->
-          <div id="pgn-dual-input" class="hidden">
-            <div class="grid grid-cols-2 gap-3">
-              <div>
-                <label class="text-xs text-gray-400 mb-1 block">&#9818; White's moves:</label>
-                <textarea id="pgn-input-white" placeholder="1. e4&#10;2. Nf3&#10;3. Bc4" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-sm"></textarea>
-              </div>
-              <div>
-                <label class="text-xs text-gray-400 mb-1 block">&#9812; Black's moves:</label>
-                <textarea id="pgn-input-black" placeholder="1... e5&#10;2... Nc6&#10;3... Bc5" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-sm"></textarea>
-              </div>
+          <!-- Disclosure wrapper: in PGN-batch mode this is collapsed (the
+               user is reviewing an already-loaded multi-game PGN, so the
+               textareas + dual-input toggle + image picker are clutter).
+               PgnBatch.initBatch closes it on entry and PgnBatch.reset
+               re-opens it. In single-game PGN mode it stays open by
+               default so the user sees the input area without an extra
+               click. -->
+          <details id="pgn-input-disclosure" open>
+            <summary id="pgn-input-disclosure-summary" class="text-sm text-blue-400 hover:text-blue-300 cursor-pointer select-none mb-2">Paste a PGN</summary>
+            <!-- Single PGN input (default) -->
+            <div id="pgn-single-input">
+              <textarea id="pgn-input" placeholder="1. e4 e5 2. Nf3 Nc6..." class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-3 text-gray-200 font-mono text-sm"></textarea>
             </div>
-            <p class="text-xs text-gray-500 mt-1">Moves are interleaved automatically</p>
-          </div>
-          <!-- Toggle for dual input -->
-          <div class="flex items-center justify-center mt-2">
-            <button id="btn-toggle-pgn-dual" class="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1">
-              <span id="pgn-dual-toggle-icon">&#9660;</span>
-              <span id="pgn-dual-toggle-text">Separate White/Black input</span>
-            </button>
-          </div>
-          <div class="mt-2 flex items-center gap-2">
-            <label class="text-xs text-gray-400">Optional image for context:</label>
-            <input type="file" id="pgn-image-input" accept="image/*" class="text-xs text-gray-400">
-          </div>
-          <button id="btn-load-pgn" class="mt-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm">Load PGN</button>
+            <!-- Two-player PGN input (hidden by default) -->
+            <div id="pgn-dual-input" class="hidden">
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="text-xs text-gray-400 mb-1 block">&#9818; White's moves:</label>
+                  <textarea id="pgn-input-white" placeholder="1. e4&#10;2. Nf3&#10;3. Bc4" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-sm"></textarea>
+                </div>
+                <div>
+                  <label class="text-xs text-gray-400 mb-1 block">&#9812; Black's moves:</label>
+                  <textarea id="pgn-input-black" placeholder="1... e5&#10;2... Nc6&#10;3... Bc5" class="w-full h-16 bg-gray-700 border border-gray-600 rounded-lg p-2 text-gray-200 font-mono text-sm"></textarea>
+                </div>
+              </div>
+              <p class="text-xs text-gray-500 mt-1">Moves are interleaved automatically</p>
+            </div>
+            <!-- Toggle for dual input -->
+            <div class="flex items-center justify-center mt-2">
+              <button id="btn-toggle-pgn-dual" class="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1">
+                <span id="pgn-dual-toggle-icon">&#9660;</span>
+                <span id="pgn-dual-toggle-text">Separate White/Black input</span>
+              </button>
+            </div>
+            <div class="mt-2 flex items-center gap-2">
+              <label class="text-xs text-gray-400">Optional image for context:</label>
+              <input type="file" id="pgn-image-input" accept="image/*" class="text-xs text-gray-400">
+            </div>
+            <button id="btn-load-pgn" class="mt-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm">Load PGN</button>
+          </details>
         </div>
         <div id="mode-ocr" class="input-content hidden">
           <!-- Single OCR input (default) -->
@@ -194,9 +266,9 @@
                 <button class="batch-help-btn w-4 h-4 rounded-full bg-gray-600 hover:bg-blue-500 text-[10px] leading-4 text-center text-gray-300 hover:text-white" data-help="scans" title="Help: Scan folder structure">?</button>
               </div>
               <div class="flex items-center gap-2">
-                <button id="btn-batch-folder" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-sm">Select Scan Folder</button>
+                <button id="btn-batch-folder" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-sm" title="Chrome / Edge only. Reusable folder handle; OCR sidecars + PGNs written back into the folder.">Select Scan Folder</button>
                 <input type="file" id="batch-file-input" webkitdirectory multiple accept="image/*,.pdf" class="hidden">
-                <button id="btn-batch-files" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm" title="Fallback: select individual files">Select Files</button>
+                <button id="btn-batch-files" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm" title="Chrome, Edge, Firefox, Safari. Fallback when folder picker isn't supported; outputs go through browser save-as.">Select Files</button>
                 <span id="batch-folder-status" class="text-xs text-gray-500"></span>
               </div>
             </div>
@@ -207,18 +279,19 @@
                 <button class="batch-help-btn w-4 h-4 rounded-full bg-gray-600 hover:bg-blue-500 text-[10px] leading-4 text-center text-gray-300 hover:text-white" data-help="tournament" title="Help: Tournament files">?</button>
               </div>
               <div class="flex items-center gap-2">
-                <button id="btn-batch-tournament" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm">Load Tournament File</button>
-                <input type="file" id="batch-tournament-input" accept=".xls,.xlsx,.sjson,.json" class="hidden">
+                <button id="btn-batch-tournament" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm">Load Tournament File(s)</button>
+                <input type="file" id="batch-tournament-input" accept=".xls,.xlsx,.sjson,.json,.csv,.pgn" multiple class="hidden">
                 <span id="batch-tournament-status" class="text-xs text-gray-500"></span>
               </div>
             </div>
-            <!-- Step 4: Round selection -->
+            <!-- Step 4: Round (and optional section) selection -->
             <div id="batch-round-selector" class="hidden">
               <div class="flex items-center gap-1 mb-1">
-                <label class="text-xs text-gray-400">Step 4: Select round</label>
+                <label class="text-xs text-gray-400">Step 4: Select <span id="batch-step4-label">round</span></label>
                 <button class="batch-help-btn w-4 h-4 rounded-full bg-gray-600 hover:bg-blue-500 text-[10px] leading-4 text-center text-gray-300 hover:text-white" data-help="round" title="Help: Round selection">?</button>
               </div>
               <div class="flex items-center gap-2">
+                <select id="batch-section-select" class="bg-gray-700 text-gray-200 rounded px-2 py-1 text-sm border border-gray-600 hidden" title="Section"></select>
                 <select id="batch-round-select" class="bg-gray-700 text-gray-200 rounded px-2 py-1 text-sm border border-gray-600">
                   <option value="">-- Select Round --</option>
                 </select>
@@ -353,7 +426,13 @@
       </div>
       <div id="panel-fixes" class="col-span-4">
         <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 h-full flex flex-col relative">
-          <h2 id="fix-panel-title" class="text-lg font-semibold mb-1 text-gray-200">Fix Suggestions</h2>
+          <div class="flex items-start justify-between gap-2 mb-1">
+            <h2 id="fix-panel-title" class="text-lg font-semibold text-gray-200">Fix Suggestions</h2>
+            <!-- Persistent batch-mode game nav (Next ready). Owned by
+                 batch-game-list.js; shown in both interactive and review modes
+                 so the user can hop to the next ready game without scrolling. -->
+            <div id="batch-next-ready-nav" class="hidden flex-shrink-0"></div>
+          </div>
           <div id="stuck-info" class="text-sm text-gray-400 mb-2">No issues detected</div>
           <button id="btn-apply" title="Apply selected fix (Enter)" disabled class="w-full mb-3 py-3 rounded-lg font-semibold bg-gray-700 text-gray-500 cursor-not-allowed">Select a fix</button>
           <div id="source-preview" class="hidden mb-3 p-2 bg-gray-700 rounded border border-gray-600">
@@ -616,8 +695,11 @@
   <script src="js/grid-detection.js"></script>
   <script src="js/grid-anchor.js"></script>
   <script src="js/grid-slide.js"></script>
+  <script src="js/grid-debug-panel.js"></script>
+  <script src="js/grid-unsplit.js"></script>
   <script src="js/g-tail-detection.js"></script>
   <script src="opencv_image_processor.js"></script>
+  <script src="ocr-pool.js"></script>
   <script src="worker-api.js"></script>
   <script src="js/settings.js"></script>
   <script src="js/sheet-profiles.js"></script>
@@ -637,6 +719,7 @@
   <script src="search-manager.js"></script>
   <script src="js/beam.js"></script>
   <script src="js/batch-naming.js"></script>
+  <script src="js/batch-folder-paths.js"></script>
   <script src="js/batch-ocr-queue.js"></script>
   <script src="js/batch-triage.js"></script>
   <script src="js/batch-nw-autoapply.js"></script>
@@ -652,6 +735,18 @@
   <script src="js/verification-ui.js"></script>
   <script src="js/batch-dashboard.js"></script>
   <script src="js/batch-game-list.js"></script>
+  <script src="js/pgn-batch.js"></script>
   <script src="app.js"></script>
+
+  <!-- Suggested values shared by all rowCount inputs (per-sheet override + profile editor) -->
+  <datalist id="rowcount-suggestions">
+    <option value="15">
+    <option value="20">
+    <option value="24">
+    <option value="25">
+    <option value="26">
+    <option value="30">
+    <option value="35">
+  </datalist>
 </body>
 </html>

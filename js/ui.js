@@ -90,13 +90,69 @@ function toggleInputArea(collapsed){
   }
 }
 
-function log(msg){
+// Verbose-only prefixes — gated behind window.GRID_VERBOSE_LOG. grid-slide.js
+// and similar grid-detection modules call the global log() directly with
+// these prefixes (~80 lines per scoresheet half), drowning the high-signal
+// batch / orchestrator / noise diagnostics. Keep the code emitting them so
+// the data is available when needed; just suppress unless explicitly enabled.
+// To re-enable in DevTools: window.GRID_VERBOSE_LOG = true.
+var _VERBOSE_LOG_PREFIXES = ['[SmartCrop]', '[CC]', '[GridUnsplit]'];
+
+function log(msg, severity){
+  if (!window.GRID_VERBOSE_LOG) {
+    // 'dim' is the slide-grid convention for sub-lines under a [CC] / [Slide]
+    // parent (Filters / Reject / Accepted heights / AutoFind, etc.).
+    // ui.js doesn't render styling distinctions, but the marker is the
+    // simplest way to suppress those continuation lines as a group.
+    if (severity === 'dim') return;
+    if (typeof msg === 'string') {
+      for (var _vpi = 0; _vpi < _VERBOSE_LOG_PREFIXES.length; _vpi++) {
+        // Trim leading whitespace so callers that indent (e.g., "  [Slide] ...")
+        // still match. indexOf with start=0 + ltrim handles both bare and indented.
+        var trimmed = msg.replace(/^\s+/, '');
+        if (trimmed.indexOf(_VERBOSE_LOG_PREFIXES[_vpi]) === 0) return;
+      }
+    }
+  }
   var el = document.getElementById('debug-log');
   var div = document.createElement('div');
   div.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
   el.appendChild(div);
   el.scrollTop = el.scrollHeight;
   console.log(msg);
+}
+
+/**
+ * Show a top-of-page hint banner that's visible without opening the debug log.
+ * Use for actionable warnings the user should notice (e.g., grid-detection
+ * fallback hints suggesting a Format / Cols × Rows change). Replaces any
+ * existing hint banner so messages don't stack. Auto-dismisses after 12s,
+ * or sooner via the close button.
+ */
+function showHintBanner(msg) {
+  var existing = document.getElementById('hint-banner');
+  if (existing) existing.remove();
+
+  var banner = document.createElement('div');
+  banner.id = 'hint-banner';
+  banner.className = 'fixed top-0 left-0 right-0 bg-yellow-500 text-gray-900 text-sm py-2 px-4 z-50 shadow-lg flex items-center justify-center gap-3';
+
+  var span = document.createElement('span');
+  span.textContent = msg;
+  banner.appendChild(span);
+
+  var closeBtn = document.createElement('button');
+  closeBtn.textContent = '✕';
+  closeBtn.className = 'ml-2 font-bold hover:text-white';
+  closeBtn.setAttribute('aria-label', 'Dismiss hint');
+  closeBtn.onclick = function() { banner.remove(); };
+  banner.appendChild(closeBtn);
+
+  document.body.appendChild(banner);
+
+  setTimeout(function() {
+    if (banner.parentNode) banner.remove();
+  }, 12000);
 }
 
 /**
@@ -393,10 +449,16 @@ function renderMoveList(){
   tbody.innerHTML = '';
   var valid = 0, total = 0;
 
-  // Detect suspicious tail (low confidence moves at end + repetition run)
-  var suspiciousTailStart = detectSuspiciousTail();
-  if(suspiciousTailStart === null) suspiciousTailStart = detectRepeatingTail();
-  if(suspiciousTailStart === null) suspiciousTailStart = detectTrailingNoise();
+  // Detect suspicious tail. Use the EARLIEST point any detector flags (shared
+  // with ocr.js::showOcrResults) so the 🗑️ markers land at the true start of
+  // the noise. First-non-null priority was wrong: when a confidence-based
+  // detector fired on a downstream low-confidence patch (e.g. 68.W) it
+  // short-circuited the per-color pawn-push detector that had spotted the real
+  // start earlier (e.g. 59.B), so cans appeared mid-noise; and when ONLY the
+  // pawn-push detector fired (game ended in a repeated push), the old renderer
+  // chain didn't call it at all, so no cans appeared. _earliestNoiseStart runs
+  // all four and takes the min.
+  var suspiciousTailStart = _earliestNoiseStart().start;
 
   state.moves.forEach(function(m, idx){
     var tr = document.createElement('tr');
@@ -463,6 +525,26 @@ function renderMoveList(){
       }
     };
 
+    // Forced-stop badge: 🔍 ("investigate") on plies the validator will stop at
+    // for mandatory review — either a dual-sheet near-tie disagreement
+    // (state.ambiguousPlies) OR a very-low-confidence single reading. Hidden
+    // once the user has resolved the ply (fixed/locked). Mirrors the
+    // forced_stop logic stamped into ocrData (validation.js) so the badge and
+    // the actual stop stay in sync; keep the threshold here equal to
+    // window.FORCED_STOP_MIN_CONFIDENCE.
+    var _ambigForRender = (typeof getAmbiguousPlies === 'function')
+      ? getAmbiguousPlies() : (state.ambiguousPlies || []);
+    var forcedStopInd = function(ply, status, conf){
+      if(status === 'fixed' || status === 'locked') return '';
+      var ambig = _ambigForRender.indexOf(ply) >= 0;
+      var lowConf = (typeof conf === 'number') && conf > 0 &&
+                    conf < (window.FORCED_STOP_MIN_CONFIDENCE || 0.50);
+      if(!ambig && !lowConf) return '';
+      var title = ambig ? 'Sheets disagree on this move — should be reviewed'
+                        : 'Low OCR confidence — should be reviewed';
+      return ' <span class="text-amber-400 text-xs cursor-help" title="' + title + '">🔍</span>';
+    };
+
     if(m.white){ total++; if(m.wStatus === 'ok' || m.wStatus === 'fixed' || m.wStatus === 'locked') valid++; }
     if(m.black){ total++; if(m.bStatus === 'ok' || m.bStatus === 'fixed' || m.bStatus === 'locked') valid++; }
 
@@ -471,7 +553,7 @@ function renderMoveList(){
     if(wSuspicious) wClass += ' bg-red-900/20';
     wTd.className = wClass;
     wTd.title = m.wOriginal ? 'was: ' + m.wOriginal + (m.wStatus === 'fixed' ? ' — double-click ✓ to revert' : '') : 'Click to view • Double-click to edit • Right-click for insert/delete';
-    wTd.innerHTML = tierInd(wPly) + (m.white || '') + corrInd(m.wOriginal, m.wOcrAlt, m.wStatus, m.wAlgoProposed) + confInd(m.wConf) + icon(m.wStatus, m.wOriginal, m.num, 'w') + (wSuspicious ? deleteBtn(wPly, 'w') : '');
+    wTd.innerHTML = tierInd(wPly) + (m.white || '') + corrInd(m.wOriginal, m.wOcrAlt, m.wStatus, m.wAlgoProposed) + confInd(m.wConf) + forcedStopInd(wPly, m.wStatus, m.wConf) + icon(m.wStatus, m.wOriginal, m.num, 'w') + (wSuspicious ? deleteBtn(wPly, 'w') : '');
     wTd.onclick = function(e){ if(!e.target.classList.contains('delete-from-here')) goToPly(idx*2 + 1, { skipScroll: true }); };
     wTd.ondblclick = function(e){ if(e.target.classList.contains('delete-from-here')) return; if(e.target.classList.contains('revert-fix')){ e.stopPropagation(); revertToOriginalOcr(parseInt(e.target.dataset.num), e.target.dataset.color); return; } e.stopPropagation(); enterEditMode(m.num, 'w'); };
     wTd.oncontextmenu = function(e){ e.preventDefault(); showMoveContextMenu(e, idx*2, m.num, 'w'); };
@@ -481,7 +563,7 @@ function renderMoveList(){
     if(bSuspicious) bClass += ' bg-red-900/20';
     bTd.className = bClass;
     bTd.title = m.bOriginal ? 'was: ' + m.bOriginal + (m.bStatus === 'fixed' ? ' — double-click ✓ to revert' : '') : 'Click to view • Double-click to edit • Right-click for insert/delete';
-    bTd.innerHTML = tierInd(bPly) + (m.black || '') + corrInd(m.bOriginal, m.bOcrAlt, m.bStatus, m.bAlgoProposed) + confInd(m.bConf) + icon(m.bStatus, m.bOriginal, m.num, 'b') + (bSuspicious && m.black ? deleteBtn(bPly, 'b') : '');
+    bTd.innerHTML = tierInd(bPly) + (m.black || '') + corrInd(m.bOriginal, m.bOcrAlt, m.bStatus, m.bAlgoProposed) + confInd(m.bConf) + forcedStopInd(bPly, m.bStatus, m.bConf) + icon(m.bStatus, m.bOriginal, m.num, 'b') + (bSuspicious && m.black ? deleteBtn(bPly, 'b') : '');
     bTd.onclick = function(e){ if(!e.target.classList.contains('delete-from-here')) goToPly(idx*2 + 2, { skipScroll: true }); };
     bTd.ondblclick = function(e){ if(e.target.classList.contains('delete-from-here')) return; if(e.target.classList.contains('revert-fix')){ e.stopPropagation(); revertToOriginalOcr(parseInt(e.target.dataset.num), e.target.dataset.color); return; } e.stopPropagation(); enterEditMode(m.num, 'b'); };
     bTd.oncontextmenu = function(e){ e.preventDefault(); showMoveContextMenu(e, idx*2+1, m.num, 'b'); };
@@ -576,8 +658,17 @@ function getMoveComplexity(san){
 function detectSuspiciousTail(){
   // After user has done cleanup, don't re-detect (they made their choice)
   if(state.noiseCleanupDone) return null;
+  return _detectSuspiciousTailFromPaired(state.moves);
+}
 
-  if(!state.moves || state.moves.length < 3) return null;
+// Pure variant: takes a paired-moves array ([{num, white, black, wConf, bConf}, ...])
+// directly. No state.* reads. Used by both the live UI (state.moves) and the
+// batch reconstruction orchestrator's enqueue gate (a paired array built from
+// the post-merge OCR result). Keeping the detection logic identical across
+// both call sites is the whole point — interactive and batch flag the same
+// games with the same cut points.
+function _detectSuspiciousTailFromPaired(pairedMoves){
+  if(!pairedMoves || pairedMoves.length < 3) return null;
 
   // Different confidence thresholds by complexity level
   // Aggressive thresholds are OK: user must click 🗑️ to confirm deletion
@@ -591,11 +682,16 @@ function detectSuspiciousTail(){
   // so a game with missing cells produces indices the renderer's
   // comparison (wPly = stateIdx * 2) can match against. Flat-list index
   // diverges from real ply when Black is blank for several consecutive
-  // rows (state.moves index stays 0-based contiguous but real ply jumps).
+  // rows (pairedMoves index stays 0-based contiguous but real ply jumps).
+  // `locked` flags a cell reconstruction has already fixed/locked (wStatus/
+  // bStatus carried on state.moves). Such a move is reconstruction-owned —
+  // its raw OCR confidence is moot, so it can never be "noise". Raw OCR
+  // paired arrays (orchestrator gate) carry no status, so locked stays false
+  // and behavior there is unchanged.
   var moves = [];
-  state.moves.forEach(function(m){
-    if(m.white) moves.push({ply: (m.num - 1) * 2, conf: m.wConf || 0.9, san: m.white});
-    if(m.black) moves.push({ply: (m.num - 1) * 2 + 1, conf: m.bConf || 0.9, san: m.black});
+  pairedMoves.forEach(function(m){
+    if(m.white) moves.push({ply: (m.num - 1) * 2, conf: m.wConf || 0.9, san: m.white, locked: (m.wStatus === 'fixed' || m.wStatus === 'locked')});
+    if(m.black) moves.push({ply: (m.num - 1) * 2 + 1, conf: m.bConf || 0.9, san: m.black, locked: (m.bStatus === 'fixed' || m.bStatus === 'locked')});
   });
 
   if(moves.length < 4) return null;
@@ -611,6 +707,8 @@ function detectSuspiciousTail(){
   // "consecutive good" moves and break the backward scan BEFORE it could
   // reach the low-confidence cells that preceded the run.
   function isSuspicious(mv, neighbor){
+    // Reconstruction-owned (fixed/locked) moves are never noise.
+    if(mv.locked) return false;
     var complexity = getMoveComplexity(mv.san);
     // Same-SAN rule catches scribble-scribble noise patterns (c4 c4 c4 …)
     // but EXEMPT captures/checks/castling/promotion (complexity 2). Those
@@ -639,9 +737,13 @@ function detectSuspiciousTail(){
   for(var i = moves.length - 1; i >= 0; i--){
     // Compare each cell against the NEXT-in-flat-order neighbor (which we
     // already scanned in the previous iteration since we're walking
-    // backwards). Mid-run and run-start cells get flagged by the same-SAN
-    // rule; only the tail cell has no neighbor.
-    var neighbor = (i + 1 < moves.length) ? moves[i + 1] : null;
+    // backwards). For the very last cell there is no next; fall back to
+    // the PREVIOUS neighbor so an intra-row dup tail (the f4/f4 c4/c4
+    // pattern) flags the trailing half-move too. Without the fallback,
+    // intra-row dup tails contribute only one suspicious cell per pair
+    // — short of MIN_SUSPICIOUS=3 even when noise spans 2+ rows.
+    var neighbor = (i + 1 < moves.length) ? moves[i + 1]
+                                           : (i > 0 ? moves[i - 1] : null);
     if(isSuspicious(moves[i], neighbor)){
       suspiciousCount++;
       consecutiveGood = 0;
@@ -698,7 +800,11 @@ function detectSuspiciousTail(){
  */
 function detectRepeatingTail(){
   if(state.noiseCleanupDone) return null;
-  if(!state.moves || state.moves.length < 2) return null;
+  return _detectRepeatingTailFromPaired(state.moves);
+}
+
+function _detectRepeatingTailFromPaired(pairedMoves){
+  if(!pairedMoves || pairedMoves.length < 2) return null;
 
   // Use the REAL game ply (derived from m.num + color) rather than the
   // flat-list index. For games with missing cells (e.g. Black's column is
@@ -707,17 +813,24 @@ function detectRepeatingTail(){
   // and the renderer's `wPly = idx * 2` comparison would miss the first
   // row of the run.
   var moves = [];
-  state.moves.forEach(function(m){
-    if(m.white) moves.push({ply: (m.num - 1) * 2, san: m.white});
-    if(m.black) moves.push({ply: (m.num - 1) * 2 + 1, san: m.black});
+  pairedMoves.forEach(function(m){
+    if(m.white) moves.push({ply: (m.num - 1) * 2, san: m.white, locked: (m.wStatus === 'fixed' || m.wStatus === 'locked')});
+    if(m.black) moves.push({ply: (m.num - 1) * 2 + 1, san: m.black, locked: (m.bStatus === 'fixed' || m.bStatus === 'locked')});
   });
   if(moves.length < 3) return null;
+
+  // A reconstruction-owned (fixed/locked) tail move is a real move, not a
+  // scribble run — so it can't anchor the noise tail. Bail rather than flag.
+  if(moves[moves.length - 1].locked) return null;
 
   // Walk backwards from the tail. Count the run of identical SANs.
   var tailSan = moves[moves.length - 1].san;
   if(!tailSan) return null;
   var runStartIdx = moves.length - 1;
   for(var i = moves.length - 2; i >= 0; i--){
+    // A locked move breaks the run — reconstruction confirmed it, so the
+    // repetition above it isn't a continuous OCR-noise tail.
+    if(moves[i].locked) break;
     if(moves[i].san === tailSan){
       runStartIdx = i;
     } else {
@@ -740,13 +853,94 @@ function detectRepeatingTail(){
 }
 
 /**
+ * Per-color repeated-pawn-push tail detector.
+ *
+ * _detectRepeatingTailFromPaired only catches CONSECUTIVE identical plies. It
+ * misses the very common case where one player's column is a scribble/signature
+ * that OCR's as the SAME pawn push over and over (e.g. White = f4 ×30) while the
+ * other player's column varies — the flat ply sequence then reads
+ * "f4, c4, f4, h4, …" with no two consecutive plies equal, so the run length
+ * stays 1 and nothing fires.
+ *
+ * The decisive signal: a NON-CAPTURING pawn push (SAN matches /^[a-h][1-8]$/)
+ * can legally occur AT MOST ONCE per color in a whole game — a pawn reaches f4
+ * exactly once. So a tail suffix made up entirely of pawn pushes that contains
+ * ANY repeat is unambiguously illegal = noise. We flag from the start of that
+ * suffix. A legitimate endgame run of DISTINCT pawn pushes (a4 b4 c4 …) has no
+ * repeat and is left alone.
+ *
+ * Returns: earliest ply index to flag from (min across both colors), or null.
+ */
+function detectRepeatedPawnPushTail(){
+  if(state.noiseCleanupDone) return null;
+  return _detectRepeatedPawnPushTailFromPaired(state.moves);
+}
+
+function _detectRepeatedPawnPushTailFromPaired(pairedMoves){
+  if(!pairedMoves || pairedMoves.length < 4) return null;
+
+  function isPawnPush(san){
+    return !!san && /^[a-h][1-8][+#]?$/.test(san);
+  }
+
+  // Walk one color's moves backward over the maximal suffix of pure pawn
+  // pushes; if that suffix repeats any SAN, return the suffix's first ply.
+  function scanColor(color){
+    var seq = [];
+    pairedMoves.forEach(function(m){
+      var san = (color === 'w') ? m.white : m.black;
+      var status = (color === 'w') ? m.wStatus : m.bStatus;
+      if(san){
+        seq.push({
+          ply: (m.num - 1) * 2 + (color === 'w' ? 0 : 1),
+          san: san.replace(/[+#]$/, ''),
+          // A reconstruction-confirmed (fixed/locked) move is a real move and
+          // breaks the noise suffix.
+          locked: (status === 'fixed' || status === 'locked')
+        });
+      }
+    });
+    if(seq.length < 3) return Infinity;
+
+    var startIdx = seq.length;
+    for(var i = seq.length - 1; i >= 0; i--){
+      if(seq[i].locked) break;
+      if(!isPawnPush(seq[i].san)) break;
+      startIdx = i;
+    }
+    var suffix = seq.slice(startIdx);
+    if(suffix.length < 3) return Infinity;  // need a few to be confident
+
+    var counts = {};
+    for(var j = 0; j < suffix.length; j++){
+      var s = suffix[j].san;
+      counts[s] = (counts[s] || 0) + 1;
+      if(counts[s] >= 2) return suffix[0].ply;  // an illegal repeat → noise
+    }
+    return Infinity;
+  }
+
+  var earliest = Math.min(scanColor('w'), scanColor('b'));
+  if(earliest === Infinity) return null;
+  if(typeof log === 'function'){
+    var mv = (Math.floor(earliest / 2) + 1) + '.' + (earliest % 2 === 0 ? 'W' : 'B');
+    log('🗑️ Repeated pawn-push tail flagged from ' + mv + ' (ply ' + earliest + ')');
+  }
+  return earliest;
+}
+
+/**
  * Check the very last 1-2 moves for low confidence, bypassing MIN_SUSPICIOUS.
  * Called after detectSuspiciousTail() returns null for the main scan.
  * Returns: ply index to flag from, or null.
  */
 function detectTrailingNoise(){
   if(state.noiseCleanupDone) return null;
-  if(!state.moves || state.moves.length < 3) return null;
+  return _detectTrailingNoiseFromPaired(state.moves);
+}
+
+function _detectTrailingNoiseFromPaired(pairedMoves){
+  if(!pairedMoves || pairedMoves.length < 3) return null;
 
   var THRESHOLD_MODERATE = 0.50;
   var THRESHOLD_PAIR = 0.55;
@@ -755,11 +949,11 @@ function detectTrailingNoise(){
   // so a game with missing cells produces indices the renderer's
   // comparison (wPly = stateIdx * 2) can match against. Flat-list index
   // diverges from real ply when Black is blank for several consecutive
-  // rows (state.moves index stays 0-based contiguous but real ply jumps).
+  // rows (pairedMoves index stays 0-based contiguous but real ply jumps).
   var moves = [];
-  state.moves.forEach(function(m){
-    if(m.white) moves.push({ply: (m.num - 1) * 2, conf: m.wConf || 0.9, san: m.white});
-    if(m.black) moves.push({ply: (m.num - 1) * 2 + 1, conf: m.bConf || 0.9, san: m.black});
+  pairedMoves.forEach(function(m){
+    if(m.white) moves.push({ply: (m.num - 1) * 2, conf: m.wConf || 0.9, san: m.white, locked: (m.wStatus === 'fixed' || m.wStatus === 'locked')});
+    if(m.black) moves.push({ply: (m.num - 1) * 2 + 1, conf: m.bConf || 0.9, san: m.black, locked: (m.bStatus === 'fixed' || m.bStatus === 'locked')});
   });
 
   if(moves.length < 4) return null;
@@ -767,19 +961,145 @@ function detectTrailingNoise(){
   var last = moves[moves.length - 1];
   var secondLast = moves[moves.length - 2];
 
+  // A reconstruction-owned (fixed/locked) move is not noise regardless of its
+  // raw OCR confidence — treat it as confident. This is the B3 case: 39.W
+  // axb6+ OCR'd at conf 0.49 but reconstruction fixed it to Qxf5+ and the
+  // game validated; without this it was flagged as trailing noise forever.
+  var lastConf = last.locked ? 1.0 : last.conf;
+  var secondLastConf = secondLast.locked ? 1.0 : secondLast.conf;
+
   // Check pair FIRST (returns earlier ply, covering both moves)
   // If the last 2 moves both have confidence < 50% → flag from earlier one
-  if(last.conf < THRESHOLD_PAIR && secondLast.conf < THRESHOLD_PAIR){
+  if(lastConf < THRESHOLD_PAIR && secondLastConf < THRESHOLD_PAIR){
     return secondLast.ply;
   }
 
   // If only the absolute last move has confidence < 40% → flag it
-  if(last.conf < THRESHOLD_MODERATE){
+  if(lastConf < THRESHOLD_MODERATE){
     return last.ply;
   }
 
   return null;
 }
+
+// Run all four tail-noise detectors against the live `state.moves` and return
+// the EARLIEST flagged ply (the true start of the noise) plus the individual
+// results for logging. Each detector self-suppresses via state.noiseCleanupDone,
+// so this returns {start:null} once the user has committed a truncation.
+// Single source of truth for both renderMoveList (🗑️ placement) and
+// ocr.js::showOcrResults (the noise-review trigger + cut point) — they must
+// agree or the cans land at a different spot than the flow expects.
+function _earliestNoiseStart(){
+  var d1 = detectSuspiciousTail();
+  var d2 = detectRepeatingTail();
+  var d3 = detectRepeatedPawnPushTail();
+  var d4 = detectTrailingNoise();
+  var cands = [d1, d2, d3, d4].filter(function(v){ return v !== null && v !== undefined; });
+  return {
+    start: cands.length ? Math.min.apply(null, cands) : null,
+    suspiciousTail: d1,
+    repeatingTail: d2,
+    pawnPushRepeat: d3,
+    trailingNoise: d4
+  };
+}
+
+// Shared module exposed for the batch reconstruction orchestrator (and any
+// other caller that has paired moves but not the global `state`). Lets the
+// orchestrator's noise gate match exactly what `showOcrResults` will flag
+// when the user opens the game — same four detectors, same cut point.
+window.NoiseDetection = {
+  detectSuspiciousTailFromPaired: _detectSuspiciousTailFromPaired,
+  detectRepeatingTailFromPaired: _detectRepeatingTailFromPaired,
+  detectRepeatedPawnPushTailFromPaired: _detectRepeatedPawnPushTailFromPaired,
+  detectTrailingNoiseFromPaired: _detectTrailingNoiseFromPaired,
+  isTailNoisy: function(pairedMoves){
+    return _detectSuspiciousTailFromPaired(pairedMoves) !== null ||
+           _detectRepeatingTailFromPaired(pairedMoves) !== null ||
+           _detectRepeatedPawnPushTailFromPaired(pairedMoves) !== null ||
+           _detectTrailingNoiseFromPaired(pairedMoves) !== null;
+  },
+  // Returns the earliest ply index where any of the three tail-noise
+  // detectors flag the start of the noisy region, or null if none fire.
+  // Callers use this for position-aware suppression: noise that starts
+  // far downstream of the user's working position should NOT block
+  // alignment / reconstruction work happening upstream of it.
+  tailNoiseStartPly: function(pairedMoves){
+    var starts = [];
+    var a = _detectSuspiciousTailFromPaired(pairedMoves);
+    var b = _detectRepeatingTailFromPaired(pairedMoves);
+    var d = _detectRepeatedPawnPushTailFromPaired(pairedMoves);
+    var c = _detectTrailingNoiseFromPaired(pairedMoves);
+    if (typeof a === 'number') starts.push(a);
+    if (typeof b === 'number') starts.push(b);
+    if (typeof d === 'number') starts.push(d);
+    if (typeof c === 'number') starts.push(c);
+    if (!starts.length) return null;
+    return Math.min.apply(null, starts);
+  }
+};
+
+// Render the yellow "Potential OCR noise at end" panel into #stuck-info /
+// #fix-list, and wire the green "Continue to Validation" button to a
+// caller-provided onContinue callback. Single source of truth for the panel
+// HTML — both showOcrResults (ocr.js) and renderQuickFixes (fixes.js) call
+// this so the markup, button id, and pre/post-click state transitions stay
+// in lockstep. The two callers differ only in what they do *after* the user
+// confirms (showOcrResults validates the freshly-paired OCR; renderQuickFixes
+// just calls revalidate against current state.moves), so that part is the
+// callback's responsibility.
+function renderNoiseReviewPanel(onContinue){
+  document.getElementById('stuck-info').innerHTML =
+    '<div class="text-yellow-400">⚠️ Potential OCR noise at end</div>' +
+    '<div class="text-xs text-gray-400 mt-1">Review highlighted moves and delete noise before continuing</div>';
+  document.getElementById('fix-list').innerHTML =
+    '<div class="p-3 bg-yellow-900/30 rounded border border-yellow-700 mb-3">' +
+      '<div class="text-yellow-300 text-sm font-medium mb-2">🗑️ Low-confidence moves detected</div>' +
+      '<div class="text-xs text-gray-300 mb-3">Click 🗑️ next to any move to delete it and all moves after.</div>' +
+      '<button id="btn-continue-validation" class="w-full py-2 bg-green-600 hover:bg-green-500 rounded text-sm font-medium">✓ Continue to Validation</button>' +
+    '</div>';
+
+  document.getElementById('btn-continue-validation').onclick = function(){
+    state.pendingNoiseReview = false;
+    // User has explicitly confirmed their truncation choice. Mark the
+    // noise concern as dismissed so the alignment-banner gate in
+    // _runNWAlignmentCheck (sheet-alignment.js:2019-2024) doesn't keep
+    // tearing the banner down on residual low-confidence cells in the
+    // truncated tail. Without this, a freshly surfaced alignment
+    // suggestion can flash and disappear on the next structural-check
+    // tick — reported as "this adjustment popped up very briefly but
+    // instantly disappeared" after confirming noise truncation.
+    state.noiseBannerDismissed = true;
+    document.getElementById('stuck-info').innerHTML = '<span class="text-blue-300">🔍 Validating...</span>';
+    document.getElementById('fix-list').innerHTML = '<div class="text-gray-400 text-sm p-4 text-center">Checking moves...</div>';
+    if (typeof onContinue === 'function') onContinue();
+  };
+}
+
+// Notify batch mode that the user just committed a truncation. Both panel
+// callers run this after their validation step. Safe no-op outside batch mode.
+//
+// gameId is optional. When provided (callers should capture it synchronously
+// at button-click time), it pins the truncation completion to the right game
+// even if the user switches games before the caller's async validate resolves.
+// Without this, notifyBatchTruncationComplete would read currentGameId
+// post-await, route the noiseResolved=true flip + reconstruct enqueue to
+// whatever the user clicked LATER, and leave the originally-truncated game
+// stuck (no noiseResolved, no enqueue) — reported by user as "both games
+// sitting idle after I confirmed truncation".
+function notifyBatchTruncationComplete(gameId){
+  if (window.BatchGameList && window.BatchGameList.batchState &&
+      window.BatchGameList.batchState.active &&
+      typeof window.BatchGameList.onTruncationComplete === 'function') {
+    try {
+      var target = gameId || window.BatchGameList.batchState.currentGameId;
+      window.BatchGameList.onTruncationComplete(target);
+    } catch (e) { /* non-fatal */ }
+  }
+}
+
+window.renderNoiseReviewPanel = renderNoiseReviewPanel;
+window.notifyBatchTruncationComplete = notifyBatchTruncationComplete;
 
 /**
  * Auto-truncate very obvious tail noise without user confirmation.

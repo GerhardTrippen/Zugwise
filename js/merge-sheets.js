@@ -64,6 +64,57 @@ function mergeAlternatives(alts1, alts2) {
   return result.slice(0, 10);
 }
 
+// When the two sheets disagree on the top move and their confidences are
+// within this margin, the pick is a coin flip — emit an ambiguity marker
+// (forced illegal stop) instead of silently committing to one. TUNABLE: too
+// loose floods the user with stops; too tight lets silent wrong picks through.
+// 12.B Qb8/Rb8 had a 0.030 gap; Bh7/Qb2 both-0.90 has 0.000.
+var AMBIGUITY_TIE_MARGIN = 0.15;
+
+// ...AND at least one reading must clear this confidence floor. The marker
+// means "two REASONABLY-CONFIDENT sheets disagree" (12.B 0.557/0.527; Bh7/Qb2
+// 0.90/0.90), NOT "both sheets emitted weak OCR noise that happens to be
+// close" (e.g. both ~0.2). Without this floor a game with pervasively bad OCR
+// on one sheet marks the majority of plies — 25/39 on a real test — which is
+// a broken pairing, not 25 resolvable ambiguities. A both-low disagreement is
+// just an ordinary low-confidence cell; let the normal pick/tier path handle
+// it. TUNABLE alongside the margin.
+var AMBIGUITY_MIN_CONFIDENCE = 0.45;
+
+// Tier-1 consensus elevation. A legal disagree-cell move (the sheets' raw TOP
+// moves differ) is still elevated to Tier 1 (auto-lockable, never touched by the
+// algorithms) when BOTH sheets saw the chosen move AND its SUMMED cross-sheet
+// confidence clears this bar. Rationale: a move both passes saw strongly (e.g.
+// 6.B Bb7 = sheet1 0.719 + sheet2 0.321 = 1.04) is at least as trustworthy as a
+// bare raw-top agreement, and locking it prevents the algorithms from
+// mis-attributing a downstream error onto it (the 6.B Rb7-garbage class). The
+// min-each floor excludes "one sheet ~1.0, the other a trace" — that is one
+// confident sheet, not a consensus. TUNABLE.
+var TIER1_CONSENSUS_SUMMED = 1.0;
+var TIER1_CONSENSUS_MIN_EACH = 0.15;
+
+/**
+ * Confidence a single sheet cell assigns to `move` — whether it is the cell's
+ * top move OR sits in its alternatives. Returns 0 if absent. Used to sum a
+ * candidate's confidence symmetrically across both sheets so the top-move
+ * promotion compares like with like (see mergePly).
+ */
+function confForMoveInCell(cell, move) {
+  if (!cell || !move) return 0;
+  var norm = normalizeSanForComparison(move);
+  if (cell.move && normalizeSanForComparison(cell.move) === norm) {
+    return cell.confidence || 0;
+  }
+  var alts = cell.alternatives || [];
+  for (var i = 0; i < alts.length; i++) {
+    var am = alts[i].move || (Array.isArray(alts[i]) ? alts[i][0] : null);
+    if (am && normalizeSanForComparison(am) === norm) {
+      return alts[i].confidence || (Array.isArray(alts[i]) ? (alts[i][1] || 0) : 0);
+    }
+  }
+  return 0;
+}
+
 // =============================================================================
 // SINGLE PLY MERGE
 // =============================================================================
@@ -92,16 +143,32 @@ function mergePly(cell1, cell2, num, color) {
   // Choose the top move: if they agree, boost confidence; otherwise pick higher confidence
   var topMove, topConf;
   if (agree) {
-    topMove = cell1.move; // prefer sheet 1's exact notation
+    // Use the normalized form (strips +/#, canonicalizes 0-0 → O-O).
+    // If one sheet has h6+ and the other h6, the sheets agree on the
+    // underlying move but disagree on the check annotation; keeping S1's
+    // raw "h6+" lets a spurious + ride into a Tier 1–locked ply and blocks
+    // deep search (chess.js v0.12 doesn't validate +/#, so the ply passes
+    // classifyTiers' legality check even though python-chess later rejects
+    // it). Chess validation reattaches +/# canonically when the move is
+    // actually check, so nothing is lost.
+    topMove = norm1;
     topConf = Math.min(cell1.confidence + cell2.confidence * 0.5, 1.5);
   } else {
-    // Pick the one with higher confidence as top
-    if (cell1.confidence >= cell2.confidence) {
+    // Disagreement: pick the reading with the higher SUMMED cross-sheet
+    // confidence (consensus), NOT the higher single-sheet top. A move both
+    // sheets saw accumulates more total evidence; single-sheet max ignored that
+    // and disagreed with the promotion + near-tie logic (both summed). Example
+    // (6.B): sheet1 Bb7@0.719 vs sheet2 Nb7@0.618 by raw tops, but Bb7's
+    // cross-sheet sum is 0.719+0.321=1.04 vs Nb7's 0.618 -> Bb7 is the consensus
+    // pick. See project_merge_promotion_asymmetry.
+    var _c1Summed = Math.min(confForMoveInCell(cell1, cell1.move) + confForMoveInCell(cell2, cell1.move), 1.5);
+    var _c2Summed = Math.min(confForMoveInCell(cell1, cell2.move) + confForMoveInCell(cell2, cell2.move), 1.5);
+    if (_c1Summed >= _c2Summed) {
       topMove = cell1.move;
-      topConf = cell1.confidence;
+      topConf = _c1Summed;
     } else {
       topMove = cell2.move;
-      topConf = cell2.confidence;
+      topConf = _c2Summed;
     }
   }
 
@@ -150,15 +217,132 @@ function mergePly(cell1, cell2, num, color) {
   // but both sheets' alts contain Rxd7 — summed to 0.76. Without this
   // promotion, Rfc1 stays as top and the DUAL SEARCH secondary/primary
   // slots get inverted relative to true confidence.
-  if (mergedAlts.length > 0 && mergedAlts[0].confidence > topConf) {
+  // Compare against the top move's SYMMETRIC cross-sheet confidence. The raw
+  // topConf above is only one sheet's value (the disagreement branch took
+  // max(cell1.top, cell2.top)), but the same move usually ALSO appears in the
+  // other sheet's alternatives. mergedAlts entries are already summed across
+  // both sheets, so comparing a summed alt against an un-summed top
+  // systematically over-promotes alternatives. Sum the top too before the
+  // compare. Confirmed regression: 12.B top Qb8 (sheet1 0.557) lost to Rb8
+  // (summed 0.394+0.527=0.921) even though Qb8's true cross-sheet sum is
+  // 0.557+0.345=0.902 — see project_merge_promotion_asymmetry.
+  var topConfSummed = Math.min(
+    confForMoveInCell(cell1, topMove) + confForMoveInCell(cell2, topMove), 1.5);
+  if (mergedAlts.length > 0 && mergedAlts[0].confidence > topConfSummed) {
     var newTop = mergedAlts.shift();
-    // Demote the old top into alts, then re-sort + cap at 10.
-    mergedAlts.push({ move: topMove, confidence: topConf });
+    // Demote the old top into alts at its SUMMED confidence. Remove any
+    // existing entry for it first: the demoted move frequently already sits in
+    // mergedAlts from the other sheet's alt list (e.g. Qb8 demoted while a
+    // stale Qb8@0.345 lingers), which would otherwise leave a duplicate.
+    var demotedNorm = normalizeSanForComparison(topMove);
+    mergedAlts = mergedAlts.filter(function(a) {
+      return normalizeSanForComparison(a.move) !== demotedNorm;
+    });
+    mergedAlts.push({ move: topMove, confidence: topConfSummed });
     mergedAlts.sort(function(a, b) { return b.confidence - a.confidence; });
     if (mergedAlts.length > 10) mergedAlts.length = 10;
     topMove = newTop.move;
     topConf = newTop.confidence;
   }
+
+  // ---------------------------------------------------------------------------
+  // FORCED STOP on ambiguous near-tie disagreement.
+  // When both sheets disagree on the top move AND their confidences are a coin
+  // flip, committing to either is a silent guess that only detonates downstream
+  // (e.g. 12.B Rb8 vs Qb8: both legal, but Rb8 hangs the queen 9 plies later).
+  // Instead emit an illegal marker so the move list stops AT this ply, with
+  // both readings in `alternatives` for the fix-finder; reach then ranks the
+  // candidate that lets the game continue. This is the same mechanism as the
+  // '???' insertion placeholder (shift-ops.js) — an illegal token that forces
+  // a stuck point — just with the two real candidates attached. classifyTiers
+  // already maps illegal → Tier 3 + stop, so this subsumes a separate
+  // "down-tier disagreements" rule. See project_merge_promotion_asymmetry.
+  //
+  // Guard: skip if top-move promotion elevated a CONSENSUS alternative (a move
+  // both sheets saw, summed above either top). That's more reliable than either
+  // sheet's pick, not a coin flip — trust it. Detected by the final topMove no
+  // longer matching either sheet's raw top.
+  var _fNorm = normalizeSanForComparison(topMove);
+  var _topIsSheetPick = (_fNorm === norm1 || _fNorm === norm2);
+  // Near-tie must compare the two competing readings' TOTAL cross-sheet evidence,
+  // NOT each sheet's raw top conf — those are confidences for DIFFERENT moves
+  // (cell1.move vs cell2.move). A move that one sheet tops and the other ALSO saw
+  // (as top or alt) accumulates a far higher summed conf. Example (6.B): sheet1
+  // Bb7@0.719, sheet2 Nb7@0.618 — by raw tops |0.719-0.618|=0.10 looks like a
+  // coin flip, but Bb7's cross-sheet sum is 0.719+0.321=1.04 vs Nb7's 0.618, so
+  // Bb7 DOMINATES — there is no ambiguity. (12.B stays a genuine tie: Qb8 summed
+  // 0.902 vs Rb8 0.921 -> |Δ|=0.019.) This is the "use sums everywhere" fix:
+  // compare summed-vs-summed, like the top-move promotion above already does.
+  var _top1Summed = Math.min(
+    confForMoveInCell(cell1, cell1.move) + confForMoveInCell(cell2, cell1.move), 1.5);
+  var _top2Summed = Math.min(
+    confForMoveInCell(cell1, cell2.move) + confForMoveInCell(cell2, cell2.move), 1.5);
+  var _nearTie = Math.abs(_top1Summed - _top2Summed) < AMBIGUITY_TIE_MARGIN;
+  // Floor: don't force a stop on a disagreement between two weak readings —
+  // that's a bad cell, not a genuine "two strong opinions" tie.
+  var _bothNotNoise = Math.max(cell1.confidence || 0, cell2.confidence || 0) >= AMBIGUITY_MIN_CONFIDENCE;
+  if (!agree && _nearTie && _topIsSheetPick && _bothNotNoise) {
+    // Default to the higher SUMMED reading (consensus), consistent with the
+    // disagree pick + near-tie above. _top1Summed/_top2Summed (computed for the
+    // near-tie) are cell1.move and cell2.move summed across both sheets.
+    var hiMove = (_top1Summed >= _top2Summed) ? cell1.move : cell2.move;
+    var loMove = (_top1Summed >= _top2Summed) ? cell2.move : cell1.move;
+    var hiSummed = Math.max(_top1Summed, _top2Summed);
+    var loSummed = Math.min(_top1Summed, _top2Summed);
+    // Both competing readings MUST be in alternatives (with cross-sheet summed
+    // conf) so the fix-finder tries both. Remove any existing entries first to
+    // avoid stale-conf duplicates, then unshift both.
+    var hiN = normalizeSanForComparison(hiMove);
+    var loN = normalizeSanForComparison(loMove);
+    mergedAlts = mergedAlts.filter(function(a) {
+      var n = normalizeSanForComparison(a.move);
+      return n !== hiN && n !== loN;
+    });
+    mergedAlts.unshift({ move: loMove, confidence: loSummed });
+    mergedAlts.unshift({ move: hiMove, confidence: hiSummed });
+    mergedAlts.sort(function(a, b) { return b.confidence - a.confidence; });
+    if (mergedAlts.length > 10) mergedAlts.length = 10;
+    // Emit the higher-confidence REAL move as the cell text (legal, replayable,
+    // visible to noise truncation/export/navigation as ordinary data) plus an
+    // `_ambiguous` flag. The flag — NOT an illegal text token — is what makes
+    // interactive validation and the algorithms stop at this ply (see
+    // validate_moves / play_until_absurd_or_stuck forced_stop handling). A text
+    // marker ("Q/Rb8") was tried first but leaked into every consumer that
+    // assumes move text is a real move (silent auto-apply, broken noise
+    // truncation); the flag is checked only where stopping matters.
+    // _ambiguousCandidates carries both readings for the fix UI to surface;
+    // the 🔍 badge is rendered from `_ambiguous`.
+    return {
+      num: num,
+      color: color,
+      move: hiMove,
+      confidence: hiSummed,
+      alternatives: mergedAlts,
+      lenientAlternatives: mergedLenient,
+      _sheet1Move: cell1.move,
+      _sheet2Move: cell2.move,
+      _sheet1Conf: cell1.confidence,
+      _sheet2Conf: cell2.confidence,
+      _agree: false,
+      _ambiguous: true,
+      _ambiguousCandidates: [hiMove, loMove],
+      _hasCheck: hasCheck,
+      _sheetCount: 2
+    };
+  }
+
+  // Consensus-top: does the final top move have strong cross-sheet support?
+  // True if the sheets AGREED on it, OR (tops disagreed but) BOTH sheets saw it
+  // with at least TIER1_CONSENSUS_MIN_EACH and its summed conf clears
+  // TIER1_CONSENSUS_SUMMED. classifyTiers elevates such a legal move to Tier 1
+  // (auto-locked) even without raw top-agreement — see the constants above.
+  var _topC1 = confForMoveInCell(cell1, topMove);
+  var _topC2 = confForMoveInCell(cell2, topMove);
+  var _consensusTop = agree || (
+    _topC1 >= TIER1_CONSENSUS_MIN_EACH &&
+    _topC2 >= TIER1_CONSENSUS_MIN_EACH &&
+    Math.min(_topC1 + _topC2, 1.5) >= TIER1_CONSENSUS_SUMMED
+  );
 
   return {
     num: num,
@@ -172,6 +356,7 @@ function mergePly(cell1, cell2, num, color) {
     _sheet1Conf: cell1.confidence,
     _sheet2Conf: cell2.confidence,
     _agree: agree,
+    _consensusTop: _consensusTop,
     _hasCheck: hasCheck,
     _sheetCount: 2
   };
@@ -379,6 +564,18 @@ function classifyTiers(mergedMoves, currentMovesMap) {
     var agree = m._agree;
     var sheetCount = m._sheetCount || 1;
 
+    // Forced-stop ambiguity (dual-sheet near-tie disagreement): the cell text is
+    // the higher-confidence reading, but it's unresolved, so the board beyond
+    // this ply is uncertain. Tier 3 + stop — never auto-lockable, user must
+    // resolve. Mirrors the old illegal-token behaviour without corrupting the
+    // move text. Skip once the user has confirmed the ply (currentMovesMap holds
+    // their pick and the cell is no longer flagged on re-merge).
+    if (m._ambiguous && !(currentMovesMap && currentMovesMap[ply] !== undefined)) {
+      tierMap[ply] = 3;
+      stopped = true;
+      return;
+    }
+
     // Use current (possibly fixed) move for legality, fall back to original OCR
     var moveToPlay = (currentMovesMap && currentMovesMap[ply] !== undefined) ? currentMovesMap[ply] : m.move;
 
@@ -391,7 +588,11 @@ function classifyTiers(mergedMoves, currentMovesMap) {
       }
     } catch (e) {}
 
-    if (sheetCount === 2 && agree && isLegal) {
+    // Tier 1 = both sheets, legal, AND strong cross-sheet support: either the
+    // raw tops agreed (_agree) OR the chosen move is a summed-consensus pick both
+    // sheets saw (_consensusTop, set in mergePly per TIER1_CONSENSUS_*). The
+    // latter elevates e.g. 6.B Bb7 (summed 1.04) so the algorithms never touch it.
+    if (sheetCount === 2 && (agree || m._consensusTop) && isLegal) {
       tierMap[ply] = 1;
     } else if (isLegal) {
       tierMap[ply] = 2;

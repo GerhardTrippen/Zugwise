@@ -32,6 +32,7 @@ var SCORE_COMPONENT_DESCRIPTIONS = {
   near:        'Bonus for being near the stuck ply (smaller edits preferred)',
   ocr_c:       'Bonus scaled by OCR confidence of the candidate',
   ocr_pat:     'Bonus if this candidate was already in the OCR alternatives',
+  piece:       'Bonus: a common piece-letter OCR confusion (R↔K, B↔R, …)',
   abs_pen:     'Penalty: leaves a piece hanging (quiescence-backed)',
   hang:        '(legacy, unused) simple hanging penalty',
   pwn_h:       '(legacy, unused) pawn-hanging penalty',
@@ -140,21 +141,37 @@ function createRevertToOcrButton(originalOcr, container) {
   var currentMove = state.stuckInfo.move;
   var ply = state.stuckPly;
 
+  // Reverting applies the OCR move, so it only makes sense if that move is
+  // actually LEGAL at this ply. When the stuck reason is that the OCR move
+  // itself is illegal, "revert to OCR" would just restore the broken state
+  // the algorithm is fixing (user-reported: "❌ 31.B Rxa7+ is illegal" still
+  // offered "↩ Revert to OCR: Rxa7+"). Replay the move prefix and test the
+  // OCR move: suppress the button only when the prefix replays cleanly AND
+  // the move is illegal. If the prefix can't be replayed we can't judge, so
+  // fall back to showing the button (and skip the arrow). We reuse this
+  // replay to compute the arrow squares.
+  var fromSq = null, toSq = null;
+  if (ply !== null && typeof Chess === 'function' && Array.isArray(state.sans)) {
+    var prefixOk = true;
+    var tempChess = new Chess();
+    try {
+      for (var j = 0; j < ply; j++) {
+        if (!tempChess.move(state.sans[j], { sloppy: true })) { prefixOk = false; break; }
+      }
+    } catch (e) { prefixOk = false; }
+    if (prefixOk) {
+      var moveObj = null;
+      try { moveObj = tempChess.move(originalOcr, { sloppy: true }); } catch (e) {}
+      if (!moveObj) return null;  // OCR move is illegal here — don't offer revert
+      fromSq = moveObj.from;
+      toSq = moveObj.to;
+    }
+  }
+
   var btn = document.createElement('button');
   btn.className = 'w-full text-left p-2 rounded-lg border bg-blue-600/30 border-blue-500 mb-2 hover:bg-blue-500/40';
-  btn.title = 'Revert to the original OCR text before manual edits';
-  btn.innerHTML = '<span class="text-blue-300 font-medium">↩ Revert to OCR: <span class="font-mono">' + originalOcr + '</span></span> <span class="text-blue-400/70 text-xs">— undo manual edit</span>';
-
-  // Compute arrow squares for the revert move
-  var fromSq = null, toSq = null;
-  if (ply !== null) {
-    try {
-      var tempChess = new Chess();
-      for (var j = 0; j < ply; j++) { tempChess.move(state.sans[j]); }
-      var moveObj = tempChess.move(originalOcr);
-      if (moveObj) { fromSq = moveObj.from; toSq = moveObj.to; }
-    } catch (e) {}
-  }
+  btn.title = 'Restore the original OCR text';
+  btn.innerHTML = '<span class="text-blue-300 font-medium">↩ Revert to OCR: <span class="font-mono">' + originalOcr + '</span></span>';
 
   var revertFix = {
     ocr: currentMove,
@@ -193,23 +210,52 @@ function createKeepAsIsButton(container) {
   var btn = document.createElement('button');
   btn.className = 'w-full text-left p-2 rounded-lg border bg-yellow-600/30 border-yellow-500 mb-2 hover:bg-yellow-500/40';
   btn.title = 'Accept this move despite the warning (may be an intentional sacrifice or gambit) — click to select, then commit with the main button';
-  btn.innerHTML = '<span class="text-yellow-300 font-medium">✓ Keep ' + move + '</span> <span class="text-yellow-400/70 text-xs">— accept as-is</span>';
 
   // Compute arrow squares so the kept move's from/to lights up like
-  // any other selected fix.
+  // any other selected fix — and, while we have chess.js replaying the
+  // move, recover its CANONICAL SAN so the Keep label carries the correct
+  // check/mate marker AND capture "x". OCR routinely drops the trailing "+"
+  // (reads "Rf4" for an actual "Rf4+") and the capture "x" (reads "Kh5" for
+  // an actual "Kxh5"). Keeping the stripped form then silently promotes to
+  // the full SAN on apply, which the user found confusing — so show
+  // "Keep Rf4+" / "Keep Kxh5" up front and lock the canonical form.
   var fromSq = null, toSq = null;
+  var keepSan = move;
   if (ply !== null) {
     try {
       var tempChess = new Chess();
       for (var j = 0; j < ply; j++) { tempChess.move(state.sans[j]); }
       var moveObj = tempChess.move(move);
-      if (moveObj) { fromSq = moveObj.from; toSq = moveObj.to; }
+      if (moveObj) {
+        fromSq = moveObj.from; toSq = moveObj.to;
+        // Only adopt the canonical SAN when the move BODY is unchanged
+        // (strip +/#/x before comparing). Stripping "x" lets a dropped
+        // capture marker be restored (Kh5 → Kxh5) without masking a real
+        // change: chess.js replays the OCR text, so from/to are fixed and
+        // "x" only flips capture-vs-not for that same move. If chess.js
+        // resolved a different disambiguator (e.g. "Red8" → "Rad8"), keep
+        // the OCR text verbatim so the strict-disambig guard in applyFix
+        // still surfaces the divergence instead of silently locking a
+        // different-looking move.
+        if (moveObj.san && moveObj.san.replace(/[+#x]/g, '') === move.replace(/[+#x]/g, '')) {
+          keepSan = moveObj.san;
+        }
+      }
     } catch (e) {}
   }
 
+  // Show the kept move's OWN score (when the review plumbed it through
+  // state.stuckInfo.keepScore from the cached candidate) so the user can
+  // compare "keep" against the deep-search / quick-fix alternatives — the kept
+  // move is a scored candidate too, not an un-scored escape hatch.
+  var _keepScoreSuffix = (state.stuckInfo && typeof state.stuckInfo.keepScore === 'number')
+    ? ' <span class="text-gray-400 text-xs">score=' + Math.round(state.stuckInfo.keepScore) + '</span>'
+    : '';
+  btn.innerHTML = '<span class="text-yellow-300 font-medium">✓ Keep ' + keepSan + '</span> <span class="text-yellow-400/70 text-xs">— accept as-is</span>' + _keepScoreSuffix;
+
   var keepFix = {
     ocr: move,
-    san: move,
+    san: keepSan,
     ply: ply,
     ply_str: lbl,
     similarity: 100,
@@ -221,6 +267,15 @@ function createKeepAsIsButton(container) {
     ocr_from_square: state.errorArrow ? state.errorArrow.from : null,
     ocr_to_square: state.errorArrow ? state.errorArrow.to : null
   };
+  // Carry the kept move's real score (plumbed by the review from the cached
+  // candidate) so selecting this button shows the score=N + component pills in
+  // showFixDetails, exactly like the other candidates.
+  if (state.stuckInfo) {
+    if (typeof state.stuckInfo.keepScore === 'number') keepFix.unified_score = state.stuckInfo.keepScore;
+    if (state.stuckInfo.keepComponents) keepFix.score_components = state.stuckInfo.keepComponents;
+    if (typeof state.stuckInfo.keepCharSim === 'number') keepFix.char_sim = state.stuckInfo.keepCharSim;
+    if (typeof state.stuckInfo.keepOcrConf === 'number') keepFix.ocr_conf = state.stuckInfo.keepOcrConf;
+  }
 
   btn.onclick = function() { selectFix(keepFix, btn); };
   btn.ondblclick = function() { selectFix(keepFix, btn); applyFix(); };
@@ -255,9 +310,12 @@ function renderFixes(fixes){
   var container = document.getElementById('fix-list');
   container.innerHTML = '';
 
-  // Show "Keep it" button for bad trades, persistent absurdities, or piece hanging
+  // Show "Keep it" button for bad trades, persistent absurdities, piece
+  // hanging, or forced-stop ambiguity. For 'ambiguous', the displayed move
+  // is the higher-confidence REAL reading (e.g. Qb8) — a valid choice the
+  // user can lock as-is rather than picking an algorithm proposal.
   var reason = state.stuckInfo ? state.stuckInfo.reason : null;
-  if(reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging'){
+  if(reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging' || reason === 'ambiguous'){
     createKeepAsIsButton(container);
 
     var sep = document.createElement('div');
@@ -380,9 +438,10 @@ function renderSimpleFixes(){
   var ocr = state.stuckInfo.move;
   var lbl = state.stuckInfo.num + '.' + state.stuckInfo.color.toUpperCase();
 
-  // Show "Keep it" button for bad trades, persistent absurdities, or piece hanging
+  // Show "Keep it" button for bad trades, persistent absurdities, piece
+  // hanging, or forced-stop ambiguity (see renderFixes note).
   var reason = state.stuckInfo.reason || 'illegal';
-  if(reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging'){
+  if(reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging' || reason === 'ambiguous'){
     createKeepAsIsButton(container);
 
     var sep = document.createElement('div');
@@ -509,6 +568,68 @@ function selectFix(fix, btn){
     btn.classList.add(hlClass.split(' ')[0], hlClass.split(' ')[1]);
   }
   
+  // Navigate the move list + board to the fix's ply FIRST. Using goToPly
+  // (not showPositionAtPly) here so state.currentPly and the move-list
+  // highlight follow along — showPositionAtPly only updates the board and
+  // leaves the move-list yellow cursor wherever the user last clicked.
+  // goToPly clears state.fixArrow / state.ocrArrow / state.errorArrow
+  // (unless preserveErrorArrow is set), so we re-set the arrows below.
+  // Reported case: user scrolls move list to 21.W, clicks a fix
+  // suggestion, board updates but move list stays at 21.W with the
+  // yellow box and scroll position.
+  // fix.ply is the 0-indexed POSITION of the move being fixed (5.B = 9,
+  // 26.B = 51, 35.B = 69). goToPly expects the 1-indexed "after N plies
+  // played" form — same convention the move-list click handlers use
+  // (ui.js:508/518 pass idx*2+1 for white, idx*2+2 for black). Add 1 to
+  // align: goToPly(10) shows the board after 5.B and the highlight code
+  // at navigation.js:245-251 paints the 5.B cell. Without the +1, a fix
+  // at 5.B (ply=9) routes through goToPly(9), which navigation interprets
+  // as "after 5.W played" and highlights 5.W instead of 5.B.
+  //
+  // Branch 1 at navigation.js:232-243 hides this for the stuck-point fix
+  // only (currentPly === stuckPly diverts to stuckInfo.color). For
+  // non-stuck fixes — verification-mode walkthrough, backtrack
+  // candidates at other plies — the off-by-one surfaces as ".B fixes
+  // highlighting .W of the same move" (or .W fixes highlighting the
+  // previous row's .B).
+  var fixPly = null;
+  if(typeof fix.ply === 'number'){
+    fixPly = fix.ply + 1;
+  } else if(fix.ply_str){
+    var plyMatch = fix.ply_str.match(/^(\d+)\.(W|B)$/i);
+    if(plyMatch){
+      var num = parseInt(plyMatch[1]);
+      var color = plyMatch[2].toLowerCase();
+      fixPly = (num - 1) * 2 + (color === 'w' ? 1 : 2);
+    }
+  }
+  if(fixPly !== null && !fix.isEditMode && !state.editMode && typeof goToPly === 'function'){
+    // In review mode, state.sans contains the algorithm's full reconstruction
+    // (including the algorithm's proposed move at the stuck ply). goToPly(fixPly)
+    // would play that proposed move and show the wrong board position when the
+    // user clicks a candidate at the stuck ply — the user expects to see the
+    // position BEFORE the candidate move, with arrows showing what's proposed.
+    //
+    // Interactive mode is fine: state.sans stops at stuck_ply there, so
+    // goToPly(stuck_ply+1) clamps to stuck_ply via Math.min in navigation.js
+    // and naturally lands on the pre-move position. Review mode has the
+    // full game in state.sans, so the clamp doesn't fire and we'd play
+    // through the algorithm's pick.
+    //
+    // The move-list highlight still lands on the right cell: when
+    // state.currentPly === state.stuckPly, navigation.js's highlightCurrentMove
+    // (the stuckInfo branch at lines 232-243) paints the stuck cell directly.
+    var _reviewActiveNav = window.VerificationUI &&
+                           typeof window.VerificationUI.isActive === 'function' &&
+                           window.VerificationUI.isActive();
+    var _navPly = fixPly;
+    if(_reviewActiveNav && typeof fix.ply === 'number' &&
+       typeof state.stuckPly === 'number' && fix.ply === state.stuckPly){
+      _navPly = fix.ply;
+    }
+    goToPly(_navPly, { preserveErrorArrow: true });
+  }
+
   // Green arrow = the fix suggestion
   if(fix.from_square && fix.to_square){
     state.fixArrow = {from: fix.from_square, to: fix.to_square};
@@ -527,25 +648,9 @@ function selectFix(fix, btn){
   } else {
     state.ocrArrow = null;
   }
-  
+
   // DEBUG
   log('selectFix: fix_arrow from=' + fix.from_square + ' to=' + fix.to_square + ' | ocr_arrow from=' + fix.ocr_from_square + ' to=' + fix.ocr_to_square);
-
-  // Navigate board to the fix's position (unless in edit mode)
-  var fixPly = null;
-  if(typeof fix.ply === 'number'){
-    fixPly = fix.ply;
-  } else if(fix.ply_str){
-    var plyMatch = fix.ply_str.match(/^(\d+)\.(W|B)$/i);
-    if(plyMatch){
-      var num = parseInt(plyMatch[1]);
-      var color = plyMatch[2].toLowerCase();
-      fixPly = (num - 1) * 2 + (color === 'w' ? 0 : 1);
-    }
-  }
-  if(fixPly !== null && !fix.isEditMode && !state.editMode){
-    showPositionAtPly(fixPly);
-  }
 
   renderArrows();
 
@@ -867,8 +972,18 @@ function applyFix(){
     }
   }
 
-  // Update confirmed ply - we've confirmed everything up to and including this fix
-  state.confirmedPly = Math.max(state.confirmedPly, fixPly + 1);
+  // Update confirmed ply - we've confirmed everything up to and including this
+  // fix, and NOTHING after it. Use fixPly+1 directly (not Math.max): when the
+  // user EDITS a move behind the confirmed frontier (e.g. correcting 20.W
+  // Bd2→Qd2 long after the frontier has moved past it), the board changes for
+  // every later move, so their prior confirmation no longer holds. Math.max
+  // would keep the stale-high frontier, and revalidate()'s fast-path then
+  // replays — and silently auto-corrects — the downstream moves without ever
+  // surfacing the one that just became illegal (21.W Bf4). Pulling the frontier
+  // back to the edit point forces a full re-validation of the tail. For the
+  // normal forward-fix flow fixPly+1 >= old confirmedPly anyway, so this only
+  // changes behaviour for behind-the-frontier edits.
+  state.confirmedPly = fixPly + 1;
 
   if (isKeepAsIs) {
     // LOCKED: user confirmed OCR is correct — sacred, never search this ply again
@@ -884,7 +999,21 @@ function applyFix(){
       state.fixedPlies.push(fixPly);
     }
   }
-  log('🔒 Confirmed ply updated to: ' + state.confirmedPly + ', fixed_plies=[' + state.fixedPlies.join(',') + '], locked_plies=[' + (state.lockedPlies||[]).join(',') + ']');
+  // approvedPlies = the union (fixed ∪ locked) that revalidate's validator
+  // consults to skip EAD on user-signed-off plies. Without this, a
+  // keep-as-is on a "bad trade" move (e.g. 4.W Nxf7) flips state.lockedPlies
+  // but leaves state.approvedPlies untouched — so revalidate re-runs
+  // play_until_absurd_or_stuck against approved_plies=[], the bad-trade
+  // detector fires AGAIN at the locked ply, val.stuck_at points right
+  // back at 4.W with reason "bad trade", and the user sees the warning
+  // banner on a move they explicitly locked. shift-ops.js's
+  // _rebuildFixedPliesFromMoves already encodes this union convention;
+  // mirror it here.
+  if (!state.approvedPlies) state.approvedPlies = [];
+  if (state.approvedPlies.indexOf(fixPly) === -1) {
+    state.approvedPlies.push(fixPly);
+  }
+  log('🔒 Confirmed ply updated to: ' + state.confirmedPly + ', fixed_plies=[' + state.fixedPlies.join(',') + '], locked_plies=[' + (state.lockedPlies||[]).join(',') + '], approved_plies=[' + state.approvedPlies.join(',') + ']');
 
   // Send live hint to background search workers (if running)
   if(window.searchManager && typeof fixPly === 'number'){
@@ -1028,6 +1157,17 @@ function enterEditMode(num, color){
 
   state.editMode = {num: num, color: color, currentMove: currentMove, ply: ply};
   log('✏️ Edit mode: ' + num + '.' + color.toUpperCase() + ' ' + currentMove);
+
+  // SUPERSEDE any in-flight live backtracking search. fetchFixes() guards
+  // every panel paint against state.searchGeneration, aborting at its next
+  // checkpoint when the value changes. Without this bump, a deep search that
+  // was still running when the user double-clicked an earlier move would sail
+  // past its checkpoints and mergeBacktrackFixes() would overwrite the
+  // edit-mode candidates the user is looking at with fix suggestions for the
+  // old stuck ply. Bumping here makes edit mode a panel-owning transition,
+  // exactly like applyFix and verification entry. exitEditMode() relaunches
+  // fetchFixes(), so the deep suggestions return fresh when the user cancels.
+  state.searchGeneration = (state.searchGeneration || 0) + 1;
 
   // CLEAR stale state from the prior stuck flow. Without this, the Apply
   // button and "All legal moves" panel can still show the previous stuck
@@ -1400,38 +1540,24 @@ function exitEditMode(){
     state.pendingNoiseReview = false;
   }
   if(state.pendingNoiseReview){
-    document.getElementById('stuck-info').innerHTML =
-      '<div class="text-yellow-400">⚠️ Potential OCR noise at end</div>' +
-      '<div class="text-xs text-gray-400 mt-1">Review highlighted moves and delete noise before continuing</div>';
-    document.getElementById('fix-list').innerHTML =
-      '<div class="p-3 bg-yellow-900/30 rounded border border-yellow-700 mb-3">' +
-        '<div class="text-yellow-300 text-sm font-medium mb-2">🗑️ Low-confidence moves detected</div>' +
-        '<div class="text-xs text-gray-300 mb-3">Click 🗑️ next to any move to delete it and all moves after.</div>' +
-        '<button id="btn-continue-validation" class="w-full py-2 bg-green-600 hover:bg-green-500 rounded text-sm font-medium">✓ Continue to Validation</button>' +
-      '</div>';
-    document.getElementById('btn-continue-validation').onclick = function(){
-      state.pendingNoiseReview = false;
-      document.getElementById('stuck-info').innerHTML = '<span class="text-blue-300">🔍 Validating...</span>';
-      document.getElementById('fix-list').innerHTML = '<div class="text-gray-400 text-sm p-4 text-center">Checking moves...</div>';
+    // Render the shared noise-review panel (ui.js). On Continue, revalidate
+    // against the current state.moves (already paired and truncated in place
+    // by deleteMovesFromPly) and notify batch mode (no-op outside batch).
+    // showOcrResults uses validateAndDisplay instead because it runs on
+    // freshly-loaded OCR before validation has touched state.moves.
+    renderNoiseReviewPanel(function(){
+      // Capture gameId SYNCHRONOUSLY so a mid-revalidate game-switch can't
+      // route the truncation completion to the wrong game (mirrors the
+      // fix in ocr.js's noise-review callback). revalidate() is fire-and-
+      // forget here (its Promise is unused), so notifyBatchTruncationComplete
+      // already runs synchronously in this path — passing the captured
+      // gameId is defense-in-depth against a future await refactor.
+      var capturedGameId = (window.BatchGameList && window.BatchGameList.batchState
+                            && window.BatchGameList.batchState.active)
+        ? window.BatchGameList.batchState.currentGameId : null;
       revalidate();
-      // Mirror ocr.js's original Continue-to-Validation handler: in batch
-      // mode, mark the game's noise as resolved so the auto-VERIFY guard
-      // in _saveGameWorkingState can pass. Without this, a game where the
-      // user navigated back from editing (which re-renders the noise UI
-      // through this fixes.js copy of the panel) and then committed the
-      // truncation here stayed IN_REVIEW / NEEDS_REVIEW forever —
-      // game.hasTrailingNoise never flipped to false. Reported: B9
-      // oscillating between 🔍 and 🟡 after walking the game through to
-      // "🎉 Game complete! 80 moves".
-      if (window.BatchGameList && window.BatchGameList.batchState &&
-          window.BatchGameList.batchState.active &&
-          typeof window.BatchGameList.onTruncationComplete === 'function') {
-        try {
-          window.BatchGameList.onTruncationComplete(
-            window.BatchGameList.batchState.currentGameId);
-        } catch (e) { /* non-fatal */ }
-      }
-    };
+      notifyBatchTruncationComplete(capturedGameId);
+    });
     renderArrows();
     return;
   }
@@ -1496,6 +1622,24 @@ async function computeQuickFixes() {
   // ply_str on each fix consistent with the row Quick Fixes is operating on.
   var lbl = (moveNum + 1) + '.' + (isWhite ? 'W' : 'B');
 
+  // Local helper: parse a SAN into {piece, dest, hasDisambig}.
+  // Returns null for pawn moves, castling, and anything we can't classify.
+  // Used by the disambig-variant section to detect ambiguous OCR readings.
+  function _parseMoveSig(san) {
+    if (!san) return null;
+    var s = san.replace(/[+#]/g, '');
+    if (s === 'O-O' || s === 'O-O-O') return null;
+    if (!/^[KQRBN]/.test(s)) return null;  // pawn moves don't disambiguate via prefix
+    var piece = s[0];
+    var m = s.match(/([a-h][1-8])(?:=[QRBN])?$/);
+    if (!m) return null;
+    var dest = m[1];
+    // Middle = everything between piece letter and matched suffix, minus 'x'.
+    var middle = s.substring(1, s.length - m[0].length).replace('x', '');
+    var hasDisambig = middle.length > 0 && /^[a-h1-8]+$/.test(middle);
+    return { piece: piece, dest: dest, hasDisambig: hasDisambig };
+  }
+
   // === Section 0: Try normalizing the illegal top move itself as lenient notation ===
   // If OCR decoded "e5xd4" or "Nf3-e5" etc., the top move IS the lenient candidate.
   var legalMovesForNorm = chess.moves();
@@ -1505,11 +1649,16 @@ async function computeQuickFixes() {
       try {
         var result = chess.move(topNormalized);
         if (result) {
+          // Use chess.js's canonical SAN (result.san) so check/mate markers
+          // are correct. chess.move() accepts lenient input ("Rg7") even when
+          // the canonical form is "Rg7+", but storing the lenient form means
+          // the UI displays a strict-illegal SAN as a suggested fix.
+          var canonSan = result.san;
           chess.undo();
-          seenMoves.add(topNormalized);
-          var sim = Math.round(charSimilarity(topMove, topNormalized));
+          seenMoves.add(canonSan);
+          var sim = Math.round(charSimilarity(topMove, canonSan));
           quickFixes.push({
-            ocr: topMove, san: topNormalized, similarity: sim,
+            ocr: topMove, san: canonSan, similarity: sim,
             ocr_conf: Math.round(topConf * 100), ply: ply, ply_str: lbl,
             source: 'lenient_grammar', source_raw: topMove,
             is_quick_fix: true,
@@ -1517,9 +1666,90 @@ async function computeQuickFixes() {
             ocr_from_square: state.errorArrow ? state.errorArrow.from : null,
             ocr_to_square: state.errorArrow ? state.errorArrow.to : null
           });
-          console.log('[QUICK-FIX] Top move "' + topMove + '" is lenient notation → "' + topNormalized + '" (legal, conf=' + Math.round(topConf * 100) + '%)');
+          console.log('[QUICK-FIX] Top move "' + topMove + '" is lenient notation → "' + canonSan + '" (legal, conf=' + Math.round(topConf * 100) + '%)');
         }
       } catch (e) {}
+    }
+  }
+
+  // === Section 0.5: Disambiguation variants of an ambiguous top OCR move ===
+  // When OCR reads "Rg2" but multiple rooks can reach g2, chess.js rejects it
+  // as illegal (ambiguous). The standard OCR alternatives ("Kg2", "Rg1", ...)
+  // don't include "Rdg2" / "Rgg2" because the OCR model didn't write a
+  // disambig char. Enumerate the legal disambig forms here so the user sees
+  // them in Quick Fixes alongside the piece-confusion variants.
+  //
+  // This intentionally adds MULTIPLE options when ambiguity is genuine. The
+  // "one or nothing" auto-apply rule is unaffected: auto-apply is decided
+  // server-side via pending_confirmation, and a tie between two equally
+  // plausible disambig variants won't single one out.
+  var topSig = topMove ? _parseMoveSig(topMove) : null;
+  if (topSig && !topSig.hasDisambig) {
+    var disambigVariants = legalMovesForNorm.filter(function(san) {
+      var sig = _parseMoveSig(san);
+      return sig && sig.piece === topSig.piece && sig.dest === topSig.dest;
+    });
+    if (disambigVariants.length > 1) {
+      // Display order: cross-file disambig before same-file disambig. For
+      // "Rg2" with two rook options, "Rdg2" (d-file rook moves to g-file
+      // target) surfaces ahead of "Rgg2" (g-file rook stays on g-file). The
+      // typical scoresheet pattern is that the cross-file move ends up with
+      // doubled rooks on the destination file, which is what most players
+      // are reaching for when they write an ambiguous-looking move. This is
+      // a tiebreak on display order only — not a scoring change.
+      var destFile = topSig.dest[0];
+      disambigVariants.sort(function(a, b) {
+        var aSig = _parseMoveSig(a);
+        var bSig = _parseMoveSig(b);
+        // Extract the disambig substring (between piece letter and the
+        // trailing dest square, with 'x' removed). For "Rdg2" it's "d".
+        function _disambigStr(san, sig) {
+          var s = san.replace(/[+#]/g, '');
+          var m = s.match(/([a-h][1-8])(?:=[QRBN])?$/);
+          if (!m) return '';
+          return s.substring(1, s.length - m[0].length).replace('x', '');
+        }
+        var aMid = _disambigStr(a, aSig);
+        var bMid = _disambigStr(b, bSig);
+        var aSameFile = (aMid === destFile) ? 1 : 0;
+        var bSameFile = (bMid === destFile) ? 1 : 0;
+        if (aSameFile !== bSameFile) return aSameFile - bSameFile;
+        // Stable secondary order: alphabetical on disambig char for
+        // determinism across browsers when both are cross-file (e.g. three
+        // rooks all on different files from the destination).
+        return aMid.localeCompare(bMid);
+      });
+      console.log('[QUICK-FIX] OCR "' + topMove + '" is ambiguous (' +
+                  disambigVariants.length + ' legal ' + topSig.piece + '->' + topSig.dest +
+                  '): ' + disambigVariants.join(', '));
+      disambigVariants.forEach(function(disambigSan) {
+        if (seenMoves.has(disambigSan)) return;
+        try {
+          var result = chess.move(disambigSan);
+          if (result) {
+            var canonSan = result.san;
+            chess.undo();
+            if (seenMoves.has(canonSan)) return;
+            seenMoves.add(canonSan);
+            // Similarity floor: 85%. Mirrors the Python similarity model's
+            // disambig anchor (0.98 - disambig_penalty=0.12 = 0.86). The JS
+            // charSimilarity is purely character-by-character and would
+            // return ~15% for "Rg2" vs "Rdg2", which understates the case —
+            // omitting a disambig is a single-character omission of a
+            // structurally optional element, not a misread.
+            var sim = 85;
+            quickFixes.push({
+              ocr: topMove, san: canonSan, similarity: sim,
+              ocr_conf: Math.round(topConf * 100), ply: ply, ply_str: lbl,
+              source: 'disambig_variant', is_quick_fix: true,
+              from_square: result.from, to_square: result.to,
+              ocr_from_square: state.errorArrow ? state.errorArrow.from : null,
+              ocr_to_square: state.errorArrow ? state.errorArrow.to : null
+            });
+            console.log('[QUICK-FIX] Disambig variant: "' + topMove + '" → "' + canonSan + '"');
+          }
+        } catch (e) {}
+      });
     }
   }
 
@@ -1534,11 +1764,15 @@ async function computeQuickFixes() {
       try {
         var result = chess.move(move);
         if (result) {
+          // Use canonical SAN (result.san) so check/mate markers are correct.
+          // See top-move lenient section above for rationale.
+          var canonSan = result.san;
           chess.undo();
-          seenMoves.add(move);
-          var sim = Math.round(charSimilarity(topMove, move));
+          if (canonSan === topMove || seenMoves.has(canonSan)) return;
+          seenMoves.add(canonSan);
+          var sim = Math.round(charSimilarity(topMove, canonSan));
           quickFixes.push({
-            ocr: topMove, san: move, similarity: sim,
+            ocr: topMove, san: canonSan, similarity: sim,
             ocr_conf: Math.round(conf * 100), ply: ply, ply_str: lbl,
             source: 'ocr_alternative', is_quick_fix: true,
             from_square: result.from, to_square: result.to,
@@ -1608,12 +1842,15 @@ async function computeQuickFixes() {
       try {
         var result = chess.move(normalized);
         if (result) {
+          // Use canonical SAN (result.san) — see top-move lenient section.
+          var canonSan = result.san;
           chess.undo();
-          seenMoves.add(normalized);
+          if (canonSan === topMove || seenMoves.has(canonSan)) return;
+          seenMoves.add(canonSan);
           lenientCount++;
-          var sim = Math.round(charSimilarity(topMove, normalized));
+          var sim = Math.round(charSimilarity(topMove, canonSan));
           quickFixes.push({
-            ocr: topMove, san: normalized, similarity: sim,
+            ocr: topMove, san: canonSan, similarity: sim,
             ocr_conf: Math.round(conf * 100), ply: ply, ply_str: lbl,
             source: 'lenient_grammar', source_raw: rawMove,
             is_quick_fix: true,
@@ -1621,7 +1858,7 @@ async function computeQuickFixes() {
             ocr_from_square: state.errorArrow ? state.errorArrow.from : null,
             ocr_to_square: state.errorArrow ? state.errorArrow.to : null
           });
-          console.log('[QUICK-FIX] Lenient: "' + rawMove + '" → "' + normalized + '" (legal)');
+          console.log('[QUICK-FIX] Lenient: "' + rawMove + '" → "' + canonSan + '" (legal)');
         }
       } catch (e) {}
     });
@@ -1674,17 +1911,21 @@ async function computeQuickFixes() {
           try {
             var result = chess.move(c.move);
             if (result) {
+              // Use canonical SAN (result.san) — see top-move lenient section.
+              var canonSan = result.san;
               chess.undo();
-              var sim = Math.round(charSimilarity(topMove, c.move));
+              if (canonSan !== c.move && seenMoves.has(canonSan)) return;
+              seenMoves.add(canonSan);
+              var sim = Math.round(charSimilarity(topMove, canonSan));
               quickFixes.push({
-                ocr: topMove, san: c.move, similarity: sim,
+                ocr: topMove, san: canonSan, similarity: sim,
                 ocr_conf: 0, ply: ply, ply_str: lbl,
                 source: 'constrained_reocr', is_quick_fix: true,
                 from_square: result.from, to_square: result.to,
                 ocr_from_square: state.errorArrow ? state.errorArrow.from : null,
                 ocr_to_square: state.errorArrow ? state.errorArrow.to : null
               });
-              console.log('[QUICK-FIX] Re-OCR: "' + c.move + '" conf=' + (c.confidence * 100).toFixed(0) + '%');
+              console.log('[QUICK-FIX] Re-OCR: "' + c.move + '" → "' + canonSan + '" conf=' + (c.confidence * 100).toFixed(0) + '%');
             }
           } catch (e) {}
         });
@@ -1898,9 +2139,10 @@ function renderQuickFixes(quickFixes) {
   var container = document.getElementById('fix-list');
   container.innerHTML = '';
 
-  // Show "Keep it" button for bad trades, persistent absurdities, or piece hanging
+  // Show "Keep it" button for bad trades, persistent absurdities, piece
+  // hanging, or forced-stop ambiguity (see renderFixes note).
   var reason = state.stuckInfo ? state.stuckInfo.reason : null;
-  if (reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging') {
+  if (reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging' || reason === 'ambiguous') {
     createKeepAsIsButton(container);
 
     var sep = document.createElement('div');
@@ -2082,7 +2324,21 @@ function mergeBacktrackFixes(backtrackFixes, missingMoveCandidates) {
     header.innerHTML = '<span>🔍</span><span>Deep Search</span><span class="text-gray-500">(backtracking)</span>';
     deepSection.appendChild(header);
 
+    // Top 8 by rank, plus any cross-ply Phase 2 candidates ranked below 8.
+    // A cross-ply fix (ply != stuck_ply) is qualitatively different from
+    // same-ply alternatives — it says "the real error is upstream, not at
+    // the stuck move." Dropping it because it ranks 9th hides Phase 2's
+    // entire purpose. Reported case: 20.W Re1 → Rac1 ranked #10 against
+    // nine 23.W Rd2 alternatives, invisible behind the slice cap while
+    // Greedy treated it as the top fix.
     var shownBacktrack = allBacktrack.slice(0, 8);
+    var stuckPly = state.stuckPly;
+    if (typeof stuckPly === 'number' && allBacktrack.length > 8) {
+      for (var _bi = 8; _bi < allBacktrack.length; _bi++) {
+        var _bf = allBacktrack[_bi];
+        if (_bf && _bf.ply !== stuckPly) shownBacktrack.push(_bf);
+      }
+    }
     var maxBacktrackReach = 0;
     shownBacktrack.forEach(function(f){ if (!f.completes && !f.keep_as_is) { var ar = getAbsReach(f); if (ar > maxBacktrackReach) maxBacktrackReach = ar; } });
     shownBacktrack.forEach(function(fix, i) {

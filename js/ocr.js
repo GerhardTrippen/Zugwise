@@ -144,6 +144,14 @@ function showOcrResults(paired, filename){
   } else {
     state.lockedPlies = [];
   }
+  // Preserve merge-flagged ambiguity plies (dual-sheet forced stops), same
+  // pattern as merge-locked plies — the reset above would otherwise drop them
+  // before validate runs.
+  if (state._pendingAmbiguousPlies && state._pendingAmbiguousPlies.length > 0) {
+    state.ambiguousPlies = state._pendingAmbiguousPlies.slice();
+  } else {
+    state.ambiguousPlies = [];
+  }
   // SearchManager.lockedPlies persists on the singleton across games, so
   // drop any plies locked during a prior game before launching fresh searches.
   if (window.searchManager) window.searchManager.lockedPlies.clear();
@@ -216,15 +224,19 @@ function showOcrResults(paired, filename){
   //      the BiLSTM happens to land on as a valid-looking pawn move.
   //   3. detectTrailingNoise — last-resort check on just the final 1-2
   //      plies, for when neither scan fired.
-  var _suspFromTail = detectSuspiciousTail();
-  var _suspFromRepeat = (_suspFromTail === null) ? detectRepeatingTail() : null;
-  var _suspFromTrailing = (_suspFromTail === null && _suspFromRepeat === null) ? detectTrailingNoise() : null;
-  log('🔎 Noise detectors: suspiciousTail=' + _suspFromTail +
-      ' repeatingTail=' + _suspFromRepeat +
-      ' trailingNoise=' + _suspFromTrailing);
-  var suspiciousTailStart = _suspFromTail;
-  if(suspiciousTailStart === null) suspiciousTailStart = _suspFromRepeat;
-  if(suspiciousTailStart === null) suspiciousTailStart = _suspFromTrailing;
+  // Run ALL four detectors and take the EARLIEST flagged ply (not first-non-
+  // null priority). A confidence-based detector firing on a downstream low-
+  // confidence patch must not hide an earlier per-color pawn-push run, and a
+  // game that ends in a repeated push (only that detector fires) must still be
+  // caught. Shared with renderMoveList via _earliestNoiseStart so the 🗑️
+  // markers land at exactly this point.
+  var _nd = _earliestNoiseStart();
+  log('🔎 Noise detectors: suspiciousTail=' + _nd.suspiciousTail +
+      ' repeatingTail=' + _nd.repeatingTail +
+      ' pawnPushRepeat=' + _nd.pawnPushRepeat +
+      ' trailingNoise=' + _nd.trailingNoise +
+      ' → start=' + _nd.start);
+  var suspiciousTailStart = _nd.start;
   // Defense in depth: in batch mode, if the user already worked past the
   // noise on a prior visit (saved workingState has pendingNoiseReview=false
   // and at least one applied fix), skip re-painting the yellow panel. The
@@ -233,14 +245,25 @@ function showOcrResults(paired, filename){
   // pristine state.moves we just rebuilt — clicking it later wipes the
   // user's fixes (the symptom the user reported). Skipping outright is
   // simpler and cheaper than relying on the post-hoc cleanup.
+  //
+  // Also short-circuit on game.noiseResolved — set by onTruncationComplete
+  // when the user clicked "Continue to Validation". Without this, a user
+  // who truncated but hasn't applied any algorithm fixes yet (algorithms
+  // still running, or stuck-point not yet reached) would re-enter the
+  // noise-review panel on every revisit, because the fix-status loop
+  // below finds no fixed/locked moves.
   var _alreadyResolved = false;
   try {
     if (suspiciousTailStart !== null && window.BatchGameList &&
         window.BatchGameList.batchState && window.BatchGameList.batchState.active) {
       var _bs = window.BatchGameList.batchState;
       var _g = _bs.currentGameId && _bs.games && _bs.games.get(_bs.currentGameId);
+      if (_g && _g.noiseResolved) {
+        _alreadyResolved = true;
+      }
       var _ws = _g && _g.workingState;
-      if (_ws && _ws.pendingNoiseReview === false && Array.isArray(_ws.moves)) {
+      if (!_alreadyResolved && _ws && _ws.pendingNoiseReview === false &&
+          Array.isArray(_ws.moves)) {
         for (var _wi = 0; _wi < _ws.moves.length; _wi++) {
           var _wm = _ws.moves[_wi];
           if (_wm.wStatus === 'fixed' || _wm.wStatus === 'locked' ||
@@ -261,6 +284,51 @@ function showOcrResults(paired, filename){
     // cell showing a trashcan, and it's what the user needs to eyeball to
     // decide where the real game ends.
     state.pendingNoiseReview = true;
+
+    // BATCH-MODE INVALIDATION — if the orchestrator's enqueue gate missed
+    // this game's noise (cached pre-fix detector result, or a pattern that
+    // slipped through the cells-to-paired mapping), Greedy/Beam/Dijkstra
+    // may have already run and cached results against the un-truncated
+    // tail. The user is now seeing the noise-review panel for the FIRST
+    // time on this game, so those cached results are stale: they include
+    // fixes for plies the user is about to delete. Abort any in-flight
+    // work, clear the aggregate, and flip game.status to NEEDS_TRUNCATION
+    // so the game list reflects the actual state. onTruncationComplete
+    // will re-enqueue with the cleaned OCR.
+    try {
+      if (window.BatchGameList && window.BatchGameList.batchState &&
+          window.BatchGameList.batchState.active) {
+        var _bs = window.BatchGameList.batchState;
+        var _gid = _bs.currentGameId;
+        if (_gid) {
+          var _game = _bs.games && _bs.games.get(_gid);
+          if (_game) {
+            _game.hasTrailingNoise = true;
+            _game.noiseResolved = false;
+            if (window.BatchGameList.GAME_STATUS) {
+              _game.status = window.BatchGameList.GAME_STATUS.NEEDS_TRUNCATION;
+            }
+            _game.methodStatus = null;
+            _game.tier = null;
+            _game.triageDetails = null;
+            _game.reconstructPicked = null;
+          }
+          if (_bs.reconstructResults) {
+            delete _bs.reconstructResults[_gid];
+          }
+          if (_bs.reconstructQueue &&
+              typeof _bs.reconstructQueue.abortGame === 'function') {
+            try { _bs.reconstructQueue.abortGame(_gid); } catch (e) {}
+          }
+          if (typeof window.BatchGameList.renderGameList === 'function') {
+            try { window.BatchGameList.renderGameList(); } catch (e) {}
+          }
+          log('🧹 Cleared stale reconstruction results for ' + _gid +
+              ' — game needs truncation before algorithms can run.');
+        }
+      }
+    } catch (e) { /* non-fatal */ }
+
     goToPly(suspiciousTailStart + 1);
     var susMoveNum = Math.floor(suspiciousTailStart / 2) + 1;
     var susRow = document.getElementById('move-row-' + susMoveNum);
@@ -280,23 +348,24 @@ function showOcrResults(paired, filename){
     }
     log('⚠️ Suspicious low-confidence moves detected at end - please review before validation');
 
-    // Show noise review UI
-    document.getElementById('stuck-info').innerHTML =
-      '<div class="text-yellow-400">⚠️ Potential OCR noise at end</div>' +
-      '<div class="text-xs text-gray-400 mt-1">Review highlighted moves and delete noise before continuing</div>';
-    document.getElementById('fix-list').innerHTML =
-      '<div class="p-3 bg-yellow-900/30 rounded border border-yellow-700 mb-3">' +
-        '<div class="text-yellow-300 text-sm font-medium mb-2">🗑️ Low-confidence moves detected</div>' +
-        '<div class="text-xs text-gray-300 mb-3">Click 🗑️ next to any move to delete it and all moves after.</div>' +
-        '<button id="btn-continue-validation" class="w-full py-2 bg-green-600 hover:bg-green-500 rounded text-sm font-medium">✓ Continue to Validation</button>' +
-      '</div>';
+    // Render the shared noise-review panel (ui.js). On Continue, validate
+    // against the freshly-paired post-truncation OCR, kick off background
+    // searches, and notify batch mode (no-op outside batch). The fixes.js
+    // copy of this panel uses revalidate() instead of validateAndDisplay()
+    // because it runs against an already-validated state.moves.
+    renderNoiseReviewPanel(function(){
+      // Capture the active gameId SYNCHRONOUSLY at click time. If the user
+      // switches games while validateAndDisplay is awaiting Pyodide below,
+      // notifyBatchTruncationComplete would otherwise read the new
+      // currentGameId post-await and apply noiseResolved=true + reconstruct
+      // enqueue to the wrong game. Fire the batch-truncation hook now (it
+      // only touches batchState + the orchestrator, not state.moves) so the
+      // correct game is committed regardless of how long validation takes.
+      var capturedGameId = (window.BatchGameList && window.BatchGameList.batchState
+                            && window.BatchGameList.batchState.active)
+        ? window.BatchGameList.batchState.currentGameId : null;
+      notifyBatchTruncationComplete(capturedGameId);
 
-    // Add click handler for continue button
-    document.getElementById('btn-continue-validation').onclick = function(){
-      state.pendingNoiseReview = false;
-      document.getElementById('stuck-info').innerHTML = '<span class="text-blue-300">🔍 Validating...</span>';
-      document.getElementById('fix-list').innerHTML = '<div class="text-gray-400 text-sm p-4 text-center">Checking moves...</div>';
-      // Trigger validation (rebuild paired from current state)
       var currentPaired = [];
       state.moves.forEach(function(m){
         currentPaired.push({
@@ -310,22 +379,20 @@ function showOcrResults(paired, filename){
         });
       });
       validateAndDisplay(currentPaired, filename).then(function(){
-        launchBackgroundSearches();
-        // Batch mode: state.ocrCells (and state.ocrCellsSheet1/2) have been
-        // truncated in place by deleteMovesFromPly. Let batch-game-list
-        // persist the cleaned OCR and enqueue the game for reconstruction —
-        // it was deliberately held out of the orchestrator until the user
-        // dealt with the noise.
-        if (window.BatchGameList && window.BatchGameList.batchState &&
-            window.BatchGameList.batchState.active &&
-            typeof window.BatchGameList.onTruncationComplete === 'function') {
-          try {
-            window.BatchGameList.onTruncationComplete(
-              window.BatchGameList.batchState.currentGameId);
-          } catch (e) {}
+        // Skip launchBackgroundSearches if the user switched games while
+        // validateAndDisplay was awaiting — it reads state.stuckPly /
+        // state.moves, which now belong to a different game. The
+        // orchestrator's enqueue (fired synchronously above) already
+        // handles reconstruction for the truncated game.
+        var stillSameGame = (window.BatchGameList && window.BatchGameList.batchState
+                             && window.BatchGameList.batchState.active)
+          ? (window.BatchGameList.batchState.currentGameId === capturedGameId)
+          : true;
+        if (stillSameGame) {
+          launchBackgroundSearches();
         }
       });
-    };
+    });
   } else {
     // No suspicious tail - proceed normally
     document.getElementById('stuck-info').innerHTML = '<span class="text-blue-300">🔍 Validating...</span>';
@@ -531,10 +598,17 @@ async function loadOCRWithImage() {
   loadOCRFromInput();
 }
 
-function loadPGNFromInput(){
+async function loadPGNFromInput(){
   // Check if dual input mode is active
   var dualInput=document.getElementById('pgn-dual-input');
   var isDual=dualInput&&!dualInput.classList.contains('hidden');
+
+  // Reset any previous PGN-batch state so a fresh paste starts clean.
+  // The multi-game branch below will re-activate it; the single-game
+  // branch leaves the sidebar hidden.
+  if(window.PgnBatch && window.PgnBatch.state && window.PgnBatch.state.active){
+    window.PgnBatch.reset();
+  }
 
   var sans=[];
 
@@ -559,21 +633,83 @@ function loadPGNFromInput(){
     // Single input mode - original behavior
     var text=document.getElementById('pgn-input').value.trim();
     if(!text)return;
+
+    // Multi-game branch: if the pasted text contains 2+ [Event ...] blocks,
+    // route through PgnBatch instead of the single-game flow. The batch
+    // module parses every game, validates each, and renders the sidebar.
+    if(window.PgnBatch && window.PgnBatch.isMultiGame(text)){
+      var games = window.PgnBatch.parseMultiGamePgn(text);
+      log('📚 Detected multi-game PGN: '+games.length+' games');
+      await window.PgnBatch.initBatch(games);
+      return;
+    }
+
     var cleaned=text.replace(/\[.*?\]/g,'').replace(/\{.*?\}/g,'').replace(/\d+\./g,' ').trim();
     sans=cleaned.split(/\s+/).filter(function(m){return m&&m!=='*'&&!/^[01]-[01]$/.test(m)&&!/^1\/2/.test(m);});
   }
 
-  state.moves=[];state.sans=[];state.ocrCells=[];state.ocrCellsSheet1=null;state.ocrCellsSheet2=null;state.mergeTierMap=null;state.hasGridImage=false;state.inputMode='pgn';
-  if(chess){chess.reset();for(var i=0;i<sans.length;i++){try{chess.move(sans[i]);var num=Math.floor(i/2)+1;if(i%2===0)state.moves.push({num:num,white:sans[i],black:'',wStatus:'ok',bStatus:'ok',wConf:1,bConf:1});else state.moves[state.moves.length-1].black=sans[i];state.sans.push(sans[i]);}catch(e){log('⚠ Invalid: '+sans[i]);break;}}}
-  state.stuckPly=null;state.stuckInfo=null;
-  document.getElementById('stuck-info').innerHTML='<span class="text-green-400">✓ All moves valid!</span>';
-  document.getElementById('fix-list').innerHTML='<div class="text-green-400 text-sm p-4 text-center">🎉 Loaded!</div>';
+  if(sans.length===0){
+    log('⚠ No moves found in PGN input');
+    return;
+  }
+
+  // PGN-validate flow: route the typed game through the same validate +
+  // find-fixes pipeline OCR uses, so absurdity / persistent-hang / bad-trade
+  // detection runs over typed input. This catches typos like Qd2-for-Qe3
+  // where every move is legal but a piece quietly hangs ~10 moves later.
+  // The fix-finder doesn't need OCR alternatives — it iterates legal moves
+  // at each ply and ranks by character similarity + reach + absurdity
+  // resolution, which is enough for one-character SAN typos.
+  state.ocrCells=[];
+  state.ocrCellsSheet1=null;
+  state.ocrCellsSheet2=null;
+  state.mergeTierMap=null;
+  state.hasGridImage=false;
+  state.inputMode='pgn';
+  state._pendingMergeLockedPlies=null;
   document.getElementById('source-preview').classList.add('hidden');
   document.getElementById('ocr-context-panel').classList.add('hidden');
-  resetApplyButton();renderMoveList();toggleInputArea(true);
+
+  // Build a "paired" array in the shape OCR uses. Synthetic OCR data per ply:
+  // confidence 1.0, no alternatives. Mismatched dual-input lengths fall back
+  // to chess.js / backend stuck-point reporting at the offending ply.
+  var paired=[];
+  for(var pi=0;pi<sans.length;pi+=2){
+    paired.push({
+      num: Math.floor(pi/2)+1,
+      white: sans[pi] || '',
+      black: sans[pi+1] || '',
+      wConf: 1.0,
+      bConf: 1.0,
+      wAlts: [],
+      bAlts: [],
+      wLenientAlts: [],
+      bLenientAlts: []
+    });
+  }
+
+  document.getElementById('stuck-info').innerHTML='<span class="text-blue-300">🔍 Validating typed PGN…</span>';
+  document.getElementById('fix-list').innerHTML='<div class="text-gray-400 text-sm p-4 text-center">Checking moves and looking for absurdities…</div>';
+  log('🔍 Validating '+sans.length+' typed PGN moves…');
+
+  await validateAndDisplay(paired, 'PGN: '+sans.length+' moves');
+
   document.getElementById('loaded-info').textContent='📄 PGN input';
-  log('✓ Loaded '+state.sans.length+' moves from PGN');
-  goToPly(state.sans.length);
+
+  if(state.stuckPly===null && state.stuckInfo===null){
+    // validateAndDisplay's success branch doesn't paint a green headline
+    // (only revalidate does). Do it here for the all-clear path so the
+    // user gets explicit confirmation that legality + absurdity both passed.
+    document.getElementById('stuck-info').innerHTML='<span class="text-green-400">✓ All '+state.sans.length+' moves valid — no absurdities detected.</span>';
+    document.getElementById('fix-list').innerHTML='<div class="text-green-400 text-sm p-4 text-center">🎉 Game looks clean!</div>';
+    log('✓ PGN: '+state.sans.length+' moves, no issues found');
+  } else if (typeof launchBackgroundSearches === 'function') {
+    // Stuck — kick off Greedy/Beam/Dijkstra in addition to the deep-search
+    // panel that fetchFixes already triggered. PGN mode runs outside the
+    // sheet-merge path that normally fires this for OCR games. The
+    // fingerprint guard in beam.js prevents duplicate launches.
+    launchBackgroundSearches();
+  }
 }
 
 // Parse PGN move list (handles "1. e4" or "1... e5" or just "e4")
@@ -624,7 +760,7 @@ async function loadPGNWithImage() {
   }
 
   // Now load PGN
-  loadPGNFromInput();
+  await loadPGNFromInput();
 }
 
 function downloadOCRText() {

@@ -72,13 +72,23 @@ function createSyntheticOcrCell(move, num, color) {
 function syncCorrectionsToOcrCells() {
   if (!state.moves) return;
 
-  // Build correction map keyed by (moveNum, color) → {move, status, original, ocrAlt}
+  // Build correction map keyed by (moveNum, color) → {move, status, original, ocrAlt}.
+  // CRITICAL: skip cells that hold an algorithm proposal (wAlgoProposed /
+  // bAlgoProposed) which haven't been user-confirmed. Otherwise the
+  // suggestion-only Greedy/Beam/Dijkstra moves on state.moves leak into
+  // per-sheet _correctedMove here, and survive Exit Review's revert because
+  // _revertUnconfirmedAlgoProposed only touches state.moves — not per-sheet.
+  // The next re-merge then re-injects them via _copySheetMetadataToMerged →
+  // rebuildFromOcrCells, silently auto-applying algorithm proposals the
+  // user never confirmed (violates the "Algorithms never auto-apply" rule).
+  // Backend Layer-1 auto-fixes (wStatus='ok' with wOcrAlt or similarity
+  // correction) DO want to survive — wAlgoProposed is false for those.
   var corrections = {};
   state.moves.forEach(function(m) {
-    if (m.white) {
+    if (m.white && !m.wAlgoProposed) {
       corrections[m.num + '_w'] = { move: m.white, status: m.wStatus, original: m.wOriginal, ocrAlt: m.wOcrAlt };
     }
-    if (m.black) {
+    if (m.black && !m.bAlgoProposed) {
       corrections[m.num + '_b'] = { move: m.black, status: m.bStatus, original: m.bOriginal, ocrAlt: m.bOcrAlt };
     }
   });
@@ -214,6 +224,14 @@ function adjustAllTrackingArrays(atPly, op) {
   state.fixedPlies = adjustPlyArray(state.fixedPlies, atPly, op);
   state.lockedPlies = adjustPlyArray(state.lockedPlies, atPly, op);
   state.approvedPlies = adjustPlyArray(state.approvedPlies, atPly, op);
+  // Forced-stop ambiguity plies are positional too — shift them so a 🔍 stays
+  // on the right move after a single-move insert/delete (the dual-sheet path
+  // recomputes from scratch in reMergeAndRevalidate instead). Low-confidence
+  // forced stops need no maintenance: they're derived from each cell's
+  // confidence at validate time, so they travel with the move automatically.
+  if (state.ambiguousPlies) {
+    state.ambiguousPlies = adjustPlyArray(state.ambiguousPlies, atPly, op);
+  }
   // Trust all moves before atPly — they haven't changed.
   // Revalidation (EAD) will start from atPly, which is where the shift happens.
   state.confirmedPly = atPly;
@@ -518,6 +536,20 @@ function reMergeAndRevalidate(changePly) {
   if (!state.ocrCellsSheet1 || !state.ocrCellsSheet2) return;
   if (!window.MergeSheets) return;
 
+  // If a structural edit lands while the user is in Review, the Review panel
+  // is showing fixes computed against the pre-edit ply structure — they're
+  // now stale (e.g. user accepted a NW gap-insert mid-Greedy review). Exit
+  // Review first so the patched applyFix gets unpatched, the panel-fixes
+  // DOM is restored, and the post-merge revalidate at the bottom of this
+  // function can paint the normal interactive Layer 1/2 fix UI for the new
+  // stuck ply. Same rationale as nulling window.greedyResult etc. below:
+  // the algorithm's state is invalidated by the structural shift.
+  if (window.VerificationUI && typeof window.VerificationUI.isActive === 'function' &&
+      window.VerificationUI.isActive()) {
+    try { window.VerificationUI.exitVerificationMode(); }
+    catch (e) { console.warn('[shift-ops] exitVerificationMode before re-merge failed:', e); }
+  }
+
   // Snapshot the user's approved fixes BEFORE the re-merge wipes metadata
   // at/after the change point. We restore them by content matching after
   // revalidate so a structural shift doesn't lose downstream work.
@@ -541,6 +573,19 @@ function reMergeAndRevalidate(changePly) {
   var lockMode = (state.mergeSettings && state.mergeSettings.lockMode) || 'tier1';
   var lockedPlies = window.MergeSheets.computeLockedPlies(tierMap, lockMode);
   state.mergeLockedPlies = lockedPlies;
+
+  // Recompute forced-stop ambiguity plies from the FRESH merged cells. The
+  // structural edit re-aligned the sheets, so the prior positional
+  // state.ambiguousPlies is stale — regenerate it from _ambiguous rather than
+  // trying to shift the old indices (mergePly may flag a different set after
+  // re-alignment). Mirrors the merge-apply block in sheets.js.
+  var ambiguousPlies = [];
+  merged.forEach(function(mc) {
+    if (mc && mc._ambiguous) {
+      ambiguousPlies.push((mc.num - 1) * 2 + (mc.color === 'w' ? 0 : 1));
+    }
+  });
+  state.ambiguousPlies = ambiguousPlies;
 
   // Rebuild from merged cells (restores wStatus/bStatus from _status on cells)
   rebuildFromOcrCells();

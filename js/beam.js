@@ -19,6 +19,38 @@ var dijkstraResult = null;
 var searchInProgress = false;
 var searchCancelFlag = { cancelled: false };
 
+// Fingerprint of the last input we kicked off background searches for.
+// Captures the algorithms' actual inputs (OCR moves + alts + confidences,
+// stuck point, locked plies). When launchBackgroundSearches is invoked
+// repeatedly with the same fingerprint — e.g. by goToPly →
+// runStructuralChecks → _retryReconstructionLaunch on every move-list click
+// — we skip the relaunch instead of terminating + respawning workers for
+// no reason. Manual buttons (runGreedySearch/runBeamSearch/runDijkstraSearch)
+// bypass launchBackgroundSearches entirely, so they always rerun.
+var _lastLaunchFingerprint = null;
+
+function _altKey(a) {
+  var mv = Array.isArray(a) ? a[0] : (a && (a.move || a));
+  var c = Array.isArray(a) ? (a[1] || 0) : (a && (a.confidence || 0));
+  return mv + '@' + c;
+}
+
+function _computeLaunchFingerprint() {
+  if (!state.moves || !state.moves.length) return null;
+  var parts = [];
+  state.moves.forEach(function(m) {
+    var w = (m.white || '') + ':' + (m.wConf || 0);
+    if (m.wAlts && m.wAlts.length) w += '[' + m.wAlts.map(_altKey).join(',') + ']';
+    var b = (m.black || '') + ':' + (m.bConf || 0);
+    if (m.bAlts && m.bAlts.length) b += '[' + m.bAlts.map(_altKey).join(',') + ']';
+    parts.push(m.num + 'w=' + w + 'b=' + b);
+  });
+  parts.push('stuck=' + state.stuckPly);
+  var locked = (state.lockedPlies || []).slice().sort(function(a, b) { return a - b; }).join(',');
+  parts.push('locked=' + locked);
+  return parts.join('|');
+}
+
 // =============================================================================
 // PANEL UI HELPERS
 // =============================================================================
@@ -151,6 +183,11 @@ function setSearchButtonsEnabled(enabled) {
 function buildSearchOcrMoves(paired) {
   var source = paired || state.moves;
   var ocrMoves = [];
+  // Carry the same forced_stop signal the interactive validator uses, so the
+  // search worker can stop/defer at dual-sheet ambiguities and very-low-
+  // confidence reads (see search-worker.js / play_until_absurd_or_stuck).
+  var _ambig = state.ambiguousPlies || [];
+  var _LOW = (typeof window !== 'undefined' && window.FORCED_STOP_MIN_CONFIDENCE) || 0.50;
   source.forEach(function(m) {
     if (m.white) {
       var alts = [];
@@ -162,7 +199,9 @@ function buildSearchOcrMoves(paired) {
           });
         });
       }
-      ocrMoves.push({ num: m.num, color: 'w', move: m.white, confidence: m.wConf || 0.9, alternatives: alts });
+      var wPly = (m.num - 1) * 2;
+      ocrMoves.push({ num: m.num, color: 'w', move: m.white, confidence: m.wConf || 0.9, alternatives: alts,
+                      forced_stop: (_ambig.indexOf(wPly) >= 0) || ((m.wConf || 0.9) < _LOW) });
     }
     if (m.black) {
       var alts = [];
@@ -174,7 +213,9 @@ function buildSearchOcrMoves(paired) {
           });
         });
       }
-      ocrMoves.push({ num: m.num, color: 'b', move: m.black, confidence: m.bConf || 0.9, alternatives: alts });
+      var bPly = (m.num - 1) * 2 + 1;
+      ocrMoves.push({ num: m.num, color: 'b', move: m.black, confidence: m.bConf || 0.9, alternatives: alts,
+                      forced_stop: (_ambig.indexOf(bPly) >= 0) || ((m.bConf || 0.9) < _LOW) });
     }
   });
   return ocrMoves;
@@ -284,12 +325,17 @@ function handleSearchComplete(method, result) {
   var isPartial = (result.status === 'PARTIAL');
 
   // Stale-result check: the search ran on whatever state.moves looked like
-  // when it was launched. If the user has manually fixed / locked plies
-  // since then AND the algorithm's answer at any of those plies differs
-  // from what the user settled on, the result would overwrite user work
-  // on Review — we treat it as STALE, don't store it, and don't enable
-  // the Review button. The algorithm's fixes are still surfaced for
-  // inspection (same as partials) so the user can see what it found.
+  // when it was launched. Only a deliberately LOCKED ply (🔒 — the user's hard
+  // commitment) blocks the result: if the algorithm's answer there differs, it
+  // would overwrite that lock on Review, so we treat it as STALE, don't store
+  // it, and don't enable the Review button (the fixes are still surfaced for
+  // inspection). A merely 'fixed' (confirmed-in-a-prior-run) ply is NOT a
+  // blocker: re-running the search means "reconsider", and the algorithm
+  // changing its mind there — when the live deep-search agrees — is exactly
+  // what the user wants to review, not a stale conflict (reported: a prior run
+  // confirmed 16.W Rfc1, this run + the panel both propose Rfe1). Review is
+  // non-destructive (per-fix), so a 'fixed' difference is reviewable, not
+  // clobbering.
   var isStale = false;
   var staleAtPlyLabel = null;
   if ((isSolved || isPartial) && result.moves && typeof state !== 'undefined' &&
@@ -299,13 +345,13 @@ function handleSearchComplete(method, result) {
       if (!m2) continue;
       var wPly = idx2 * 2;
       var bPly = wPly + 1;
-      if (m2.white && (m2.wStatus === 'fixed' || m2.wStatus === 'locked')) {
+      if (m2.white && m2.wStatus === 'locked') {
         if (result.moves[wPly] !== m2.white) {
           isStale = true;
           staleAtPlyLabel = (idx2 + 1) + '.W';
         }
       }
-      if (!isStale && m2.black && (m2.bStatus === 'fixed' || m2.bStatus === 'locked')) {
+      if (!isStale && m2.black && m2.bStatus === 'locked') {
         if (result.moves[bPly] !== m2.black) {
           isStale = true;
           staleAtPlyLabel = (idx2 + 1) + '.B';
@@ -375,6 +421,23 @@ function handleSearchComplete(method, result) {
     var showPartialFixes = fixes.length > 0 && (!isGreedy || isPartial);
     var discardFixes = isGreedy && !isPartial && fixes.length > 0;
 
+    // Diagnostic: a PARTIAL+stale result hides the Review button below
+    // (acceptResult requires !isStale) but — unlike SOLVED+stale — gave no
+    // reason, so "the review button just isn't there" was a mystery. Surface
+    // WHICH fixed/locked ply the algorithm's result disagrees with, so a
+    // false-positive staleness (result.moves vs your move) is debuggable.
+    if (isStale && isPartial) {
+      appendPanelLogHtml(panel,
+        '<span class="text-amber-300/80 italic text-xs">  Review disabled — ' +
+        'result disagrees with your ' + staleAtPlyLabel +
+        ' (re-apply a fix to re-launch on your current input)</span>'
+      );
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[' + method + '] PARTIAL stale at ' + staleAtPlyLabel +
+          ': algorithm result.moves differs from your fixed/locked move there.');
+      }
+    }
+
     // Filter out fixes for plies the user has already confirmed (or locked
     // via merge-agreement) in state.moves. The partial-fix list is the OLD
     // Greedy result frozen at search-completion time; even after the user
@@ -442,18 +505,34 @@ function handleSearchComplete(method, result) {
   }
 
   // Store result when it's reviewable AND not stale:
-  //   - SOLVED: full solution, obviously reviewable
+  //   - SOLVED with fixes: full solution, obviously reviewable
   //   - PARTIAL with fixes: orderly forward-progress fixes worth reviewing
   //     (Greedy stops at backward regression; Beam/Dijkstra stop at timeout
   //     but report coherent frontier fixes)
-  // STALE or empty-PARTIAL is not reviewable; blank the slot so stale/partial
-  // fixes can't leak into a future review session via the click handler.
-  var hasReviewableFixes = isSolved || (isPartial && fixes.length > 0);
+  // VALID (0 fixes) is not reviewable — the game needed no corrections and
+  // enterVerificationMode returns false for an empty fix list anyway, making
+  // the Review button a dead end. STALE or empty-PARTIAL also not reviewable.
+  var hasReviewableFixes = fixes.length > 0 && (isSolved || isPartial);
   var acceptResult = hasReviewableFixes && !isStale;
   var storedResult = acceptResult ? result : null;
   if (method === 'greedy') greedyResult = storedResult;
   else if (method === 'beam') beamResult = storedResult;
   else if (method === 'dijkstra') dijkstraResult = storedResult;
+
+  // PGN-batch mode: persist the result into the current game's slot so a
+  // game-switch round-trip reloads this run instead of the stale cached
+  // background-Greedy result. Without this, clicking the ↻ rerun button
+  // produces a fresh result that's only stored in beam.js's module-level
+  // greedyResult — _loadGame repaints from g.algoResult on return.
+  if (method === 'greedy'
+      && window.PgnBatch && window.PgnBatch.state && window.PgnBatch.state.active
+      && typeof window.PgnBatch.updateCurrentGameAlgoResult === 'function') {
+    try {
+      window.PgnBatch.updateCurrentGameAlgoResult(result);
+    } catch (_e) {
+      if (typeof console !== 'undefined') console.warn('PgnBatch.updateCurrentGameAlgoResult failed:', _e);
+    }
+  }
 
   // Show Review button for SOLVED or PARTIAL-with-fixes (when not stale).
   // A STALE result would overwrite the user's own manual fixes with the
@@ -506,6 +585,28 @@ function launchBackgroundSearches(paired) {
   if (!state.stuckPly && state.stuckPly !== 0) {
     return;  // Game is valid, no search needed
   }
+  // Noise truncation must be resolved before reconstruction runs at all —
+  // running Greedy/Beam/Dijkstra on noise-laden input wastes worker time
+  // on suggestions the user is about to truncate away, and any algorithm
+  // result computed against the pre-truncation tail is stale the moment
+  // truncation happens. _retryReconstructionLaunch has the same gate; this
+  // one defends every other call site (batch panel bridge, verification
+  // re-entry, sheets.js, ocr.js).
+  if (state.pendingNoiseReview) {
+    if (typeof log === 'function') {
+      log('⏸️ Reconstruction launch deferred: noise-review panel pending — confirm or dismiss truncation first.');
+    }
+    return;
+  }
+  if (window.NoiseDetection &&
+      typeof window.NoiseDetection.isTailNoisy === 'function' &&
+      state.moves && !state.noiseBannerDismissed &&
+      window.NoiseDetection.isTailNoisy(state.moves)) {
+    if (typeof log === 'function') {
+      log('⏸️ Reconstruction launch deferred: trailing noise detected — resolve via noise-review first.');
+    }
+    return;
+  }
   // Don't burn worker time on a game whose structure is still being negotiated
   // — every accepted noise/alignment fix triggers a re-merge that would abort
   // and re-launch this anyway.
@@ -523,6 +624,32 @@ function launchBackgroundSearches(paired) {
       window.BatchGameList.batchState.active) {
     return;
   }
+  // PGN batch mode: same logic. The PGN-batch scheduler runs Greedy on
+  // every stuck game in the background and paints results into the
+  // Greedy panel via handleSearchComplete. Foreground launches here
+  // would duplicate that work and clash on game switch (logs from two
+  // games interleaving, "Loading game…" appearing to hang behind a
+  // foreground search the user can't see).
+  if (window.PgnBatch && window.PgnBatch.state && window.PgnBatch.state.active) {
+    return;
+  }
+
+  // Idempotency: if the algorithm inputs are unchanged since the last
+  // launch and at least one worker exists for this game, skip the relaunch.
+  // navigation.js calls SheetAlignment.runStructuralChecks on every
+  // goToPly, and that path cascades into _retryReconstructionLaunch →
+  // launchBackgroundSearches even when the user is just scrolling through
+  // the move list. Without this guard, every click terminates and respawns
+  // the greedy/beam/dijkstra workers — pure waste.
+  var fingerprint = _computeLaunchFingerprint();
+  var hasExistingWorker = !!(window.searchManager && window.searchManager.workers &&
+                             Object.keys(window.searchManager.workers).length > 0);
+  if (fingerprint && fingerprint === _lastLaunchFingerprint && hasExistingWorker) {
+    if (typeof log === 'function') {
+      log('⏭️ Background searches already running for this input — skipping relaunch.');
+    }
+    return;
+  }
 
   var ocrMoves = buildSearchOcrMoves(paired);
 
@@ -536,20 +663,42 @@ function launchBackgroundSearches(paired) {
   beamResult = null;
   dijkstraResult = null;
 
-  // Check which searches are enabled for auto-run
+  // Check which searches are enabled for auto-run. Pass the user's
+  // confirmed-prefix frontier so the algorithms respect it the same way
+  // the live deep-search panel does. Without this, Greedy/Beam/Dijkstra
+  // launched with confirmed_ply=0 and ran with min_ply = stuck - 5
+  // regardless of which plies the user had already accepted — producing
+  // rankings that disagreed with the live panel for the same game.
+  // Matches the per-method injection in batch-reconstruct-queue.js.
+  //
+  // PGN review override: when state.inputMode === 'pgn', typed games can
+  // carry rare-but-deep typos (e.g. Qd2 for Qe2 surfacing as an
+  // absurdity 10+ plies later). Mirror getAutoFixSettings()' depth=999
+  // bump so algorithms get the same full-game lookback as the live
+  // deep-search panel. Without this, Greedy/Beam/Dijkstra stay capped
+  // at max_backtrack=5 in PGN mode and can't reach upstream errors past
+  // 5 plies before the stuck point.
+  var _confirmedPly = (state && state.confirmedPly) | 0;
+  var _isPgnReview = (state && state.inputMode === 'pgn');
+  var _maxBacktrackOverride = _isPgnReview ? 999 : null;
+  function _algoOpts(base) {
+    base.confirmed_ply = _confirmedPly;
+    if (_maxBacktrackOverride != null) base.max_backtrack = _maxBacktrackOverride;
+    return base;
+  }
   var methods = [];
   var methodOptions = {};
   if (!currentSettings || currentSettings.autorun_greedy) {
     methods.push('greedy');
-    methodOptions.greedy = { max_fixes: 15 };
+    methodOptions.greedy = _algoOpts({ max_fixes: 15 });
   }
   if (!currentSettings || currentSettings.autorun_beam) {
     methods.push('beam');
-    methodOptions.beam = { beam_width: 5, max_iterations: 20, max_fixes_per_path: 10 };
+    methodOptions.beam = _algoOpts({ beam_width: 5, max_iterations: 20, max_fixes_per_path: 10 });
   }
   if (!currentSettings || currentSettings.autorun_dijkstra) {
     methods.push('dijkstra');
-    methodOptions.dijkstra = { max_queue_size: 50, max_steps: 1000, max_fixes_per_path: 15 };
+    methodOptions.dijkstra = _algoOpts({ max_queue_size: 50, max_steps: 1000, max_fixes_per_path: 15 });
   }
 
   if (methods.length === 0) {
@@ -559,7 +708,29 @@ function launchBackgroundSearches(paired) {
 
   log('Launching background searches (' + methods.join(' + ') + ')...');
   window.searchManager.launchSearches(ocrMoves, methods, methodOptions,
-    state.lockedPlies || []);
+    state.lockedPlies || [], _collectTier1AgreedPlies());
+  _lastLaunchFingerprint = fingerprint;
+}
+
+/**
+ * Collect plies where both OCR sheets strongly back the move (dual-sheet,
+ * _sheetCount===2, and either raw top-agreement _agree OR a summed-consensus
+ * pick _consensusTop set by mergePly). Static — does NOT depend on legality.
+ * Greedy/Beam/Dijkstra use this to recompute their locked set after each applied
+ * fix, mirroring what the frontend's classifyTiers + computeLockedPlies('tier1')
+ * would compute on a manual revalidate (classifyTiers elevates the same
+ * _agree||_consensusTop cells to Tier 1). For single-sheet OCR the set is empty
+ * and auto-lock behavior is unchanged.
+ */
+function _collectTier1AgreedPlies() {
+  if (!state.ocrCells || !Array.isArray(state.ocrCells)) return [];
+  var out = [];
+  state.ocrCells.forEach(function(cell, ply) {
+    if (cell && cell._sheetCount === 2 && (cell._agree || cell._consensusTop)) {
+      out.push(ply | 0);
+    }
+  });
+  return out;
 }
 
 /**
@@ -576,9 +747,11 @@ function runGreedySearch() {
   greedyResult = null;
 
   var ocrMoves = buildSearchOcrMoves();
+  var _gOpts = { max_fixes: 15, confirmed_ply: (state && state.confirmedPly) | 0 };
+  if (state && state.inputMode === 'pgn') _gOpts.max_backtrack = 999;
   window.searchManager.launchSearches(ocrMoves, ['greedy'], {
-    greedy: { max_fixes: 15 }
-  }, state.lockedPlies || []);
+    greedy: _gOpts
+  }, state.lockedPlies || [], _collectTier1AgreedPlies());
 }
 
 /**
@@ -595,9 +768,11 @@ function runBeamSearch() {
   beamResult = null;
 
   var ocrMoves = buildSearchOcrMoves();
+  var _bOpts = { beam_width: 5, max_iterations: 20, max_fixes_per_path: 10, confirmed_ply: (state && state.confirmedPly) | 0 };
+  if (state && state.inputMode === 'pgn') _bOpts.max_backtrack = 999;
   window.searchManager.launchSearches(ocrMoves, ['beam'], {
-    beam: { beam_width: 5, max_iterations: 20, max_fixes_per_path: 10 }
-  }, state.lockedPlies || []);
+    beam: _bOpts
+  }, state.lockedPlies || [], _collectTier1AgreedPlies());
 }
 
 /**
@@ -614,9 +789,11 @@ function runDijkstraSearch() {
   dijkstraResult = null;
 
   var ocrMoves = buildSearchOcrMoves();
+  var _dOpts = { max_queue_size: 50, max_steps: 1000, max_fixes_per_path: 15, confirmed_ply: (state && state.confirmedPly) | 0 };
+  if (state && state.inputMode === 'pgn') _dOpts.max_backtrack = 999;
   window.searchManager.launchSearches(ocrMoves, ['dijkstra'], {
-    dijkstra: { max_queue_size: 50, max_steps: 1000, max_fixes_per_path: 15 }
-  }, state.lockedPlies || []);
+    dijkstra: _dOpts
+  }, state.lockedPlies || [], _collectTier1AgreedPlies());
 }
 
 function runAllSearches() {

@@ -298,11 +298,19 @@ var BatchTriage = (function() {
         return { method: m, result: r };
       }
     }
-    // Nothing solved — fall back to whatever has fixes.
+    // Nothing solved — fall back to whatever has fixes, but ONLY when its
+    // status is at least PARTIAL. A FAILED (X glyph) result can still carry
+    // fixes the worker had committed before bailing; picking it here would
+    // route the user into that method's review pane for a run the sidebar
+    // is showing as failed. The SOLVED/VALID disjuncts are redundant given
+    // the first loop above already returns on those — included for
+    // readability so this condition states the rule directly ("at least
+    // partial") rather than depending on loop ordering.
     for (var j = 0; j < order.length; j++) {
       var mm = order[j];
       var rr = results[mm];
-      if (rr && rr.fixes && rr.fixes.length > 0) {
+      if (rr && (rr.status === 'SOLVED' || rr.status === 'VALID' || rr.status === 'PARTIAL')
+             && rr.fixes && rr.fixes.length > 0) {
         return { method: mm, result: rr };
       }
     }

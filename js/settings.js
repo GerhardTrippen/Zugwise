@@ -123,13 +123,24 @@ function getEnabledPieceFileConfusions() {
 }
 
 function getAutoFixSettings() {
+  // PGN-validate mode: typed games carry rare-but-deep typos (e.g. Qd2 for
+  // Qe3 surfacing as an absurdity 10+ plies later). The default
+  // deep_search_depth=5 governs Phase 2's lookback past the user's
+  // confirmed frontier — fine for OCR where errors cluster near the
+  // working ply, too shallow once any plies get confirmed in PGN mode.
+  // Force full-game lookback so a typo at move 10 stays in scope after
+  // the user confirms moves 0-15. OCR mode keeps the user-configured value.
+  var depth = currentSettings.deep_search_depth;
+  if (typeof state !== 'undefined' && state && state.inputMode === 'pgn') {
+    depth = 999;
+  }
   return {
     piece_confusions: getEnabledPieceConfusions(),
     piece_file_confusions: getEnabledPieceFileConfusions(),
     // Quick fix pipeline settings
     enable_quick_fixes: currentSettings.enable_quick_fixes,
     enable_deep_search: currentSettings.enable_deep_search,
-    deep_search_depth: currentSettings.deep_search_depth,
+    deep_search_depth: depth,
     // Auto-fix toggles
     ocr_autofix: currentSettings.ocr_autofix,
     similarity_autofix: currentSettings.similarity_autofix,

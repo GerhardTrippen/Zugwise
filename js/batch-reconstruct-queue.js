@@ -377,6 +377,27 @@ var BatchReconstructQueue = (function() {
       });
     }
 
+    // Tier 1 auto-relock set: plies with strong dual-sheet backing —
+    // cell._sheetCount === 2 AND either raw top-agreement (cell._agree) OR a
+    // summed-consensus pick both sheets saw (cell._consensusTop, set by
+    // mergePly). Static — independent of legality. Greedy uses this to
+    // re-evaluate its locked set after each applied fix, mirroring the frontend's
+    // classifyTiers behavior on revalidate (which elevates the same
+    // _agree||_consensusTop cells to Tier 1). Without this, an iter-2 Greedy in
+    // batch mode happily proposes a fix at a Tier 1 ply (symptom: 4.B e6 — Tier 1
+    // agreed — being "fixed" to e5 even though both scoresheets clearly read e6
+    // and the bug is upstream; or 6.B Bb7 with summed 1.04). mergeSheets carries
+    // _sheetCount/_agree/_consensusTop on every cell, and the requeue splice
+    // paths (_buildOcrMovesFromState / _buildOcrMovesWithOverrides) preserve them
+    // via Object.assign, so deriving here works for both the initial-merge and
+    // post-override requeue cases.
+    var tier1AgreedPlies = [];
+    (prepared.ocrMoves || []).forEach(function(cell, ply) {
+      if (cell && cell._sheetCount === 2 && (cell._agree || cell._consensusTop)) {
+        tier1AgreedPlies.push(ply | 0);
+      }
+    });
+
     return mgr.launchSearchesPromise(
       prepared.ocrMoves,
       this.methods,
@@ -396,7 +417,8 @@ var BatchReconstructQueue = (function() {
           }
         }
       },
-      prepared.lockedPlies || []
+      prepared.lockedPlies || [],
+      tier1AgreedPlies
     );
   };
 

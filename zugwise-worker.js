@@ -9,6 +9,26 @@
 // Import grammar, decoder, and shared Python loader modules
 importScripts('chess-grammar.js', 'lenient-grammar.js', 'beam-decoder.js', 'python-loader.js');
 
+// Per-cell OCR verbosity. The DEBUG / ONNX-dims / CANDIDATES / LENIENT-RAW
+// lines fire once per cell — ~80 per scoresheet half, ~320 per game in
+// dual-sheet mode — and flood the console past the point of usefulness once
+// the OCR pipeline is stable. Flip to true to re-enable when actively
+// debugging the ML side. Independent variable so flipping it doesn't
+// also re-enable noisier non-ML debug paths.
+const OCR_VERBOSE_LOG = false;
+
+// Per-cell OCR timing. When true, runOCR returns a `timing` object with
+// onnx/softmax/decodeStrict/decodeLenient/total in ms. Aggregated by
+// worker-api.js into a per-sheet summary. Cheap; safe to leave on.
+const OCR_TIMING = true;
+
+// EXPERIMENT: drop `logits` from the worker→main response. The raw CTC
+// logits buffer (~seqLen × vocabSize × 4 bytes per cell) is structured-cloned
+// on every cell, but nothing on the main thread reads it — constrained re-OCR
+// looks up `storedLogits` worker-side via the sheet-specific key. Flip to
+// false to confirm or restore.
+const OCR_OMIT_LOGITS_IN_RESPONSE = true;
+
 let pyodide = null;
 let onnxSession = null;
 let isReady = false;
@@ -17,7 +37,7 @@ let isReady = false;
 // INITIALIZATION
 // -----------------------------------------------------------------------------
 
-async function initWorker() {
+async function initWorker(loadOnnx = true) {
     try {
         postMessage({ type: 'status', message: 'Loading Pyodide runtime...' });
 
@@ -36,15 +56,21 @@ import micropip
 await micropip.install('chess')
         `);
 
-        postMessage({ type: 'status', message: 'Loading ONNX model...' });
+        // Load ONNX only when this worker will actually serve OCR. With the OCR
+        // pool enabled (the default), the pool workers own all ONNX work, so we
+        // skip the redundant model download + session here. runOCR /
+        // constrained-reocr stay defined but are never called in that mode.
+        if (loadOnnx) {
+            postMessage({ type: 'status', message: 'Loading ONNX model...' });
 
-        // Load ONNX Runtime Web and model
-        importScripts('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js');
+            // Load ONNX Runtime Web and model
+            importScripts('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js');
 
-        ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';
+            ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';
 
-        const modelUrl = 'https://huggingface.co/GerhardTrippen/chess-ocr-bilstm/resolve/main/chess_ocr.onnx';
-        onnxSession = await ort.InferenceSession.create(modelUrl);
+            const modelUrl = 'https://huggingface.co/GerhardTrippen/chess-ocr-bilstm/resolve/main/chess_ocr.onnx';
+            onnxSession = await ort.InferenceSession.create(modelUrl);
+        }
 
         postMessage({ type: 'status', message: 'Loading Python modules...' });
 
@@ -69,6 +95,10 @@ await micropip.install('chess')
 onmessage = async function(e) {
     const { id, type, data } = e.data;
 
+    // Stamp arrival time for OCR messages so we can measure full worker-wall
+    // (recv → just-before-postMessage) and isolate pure postMessage cost.
+    const _tMsgRecv = (OCR_TIMING && type === 'ocr') ? performance.now() : 0;
+
     if (!isReady && type !== 'init') {
         postMessage({ id, type: 'error', error: 'Worker not ready' });
         return;
@@ -79,10 +109,15 @@ onmessage = async function(e) {
 
         switch (type) {
             case 'init':
-                await initWorker();
+                // Default to loading ONNX unless explicitly told not to, so any
+                // caller that omits the flag still gets a fully capable worker.
+                await initWorker(!data || data.loadOnnx !== false);
                 return;
 
             case 'ocr':
+                if (!onnxSession) {
+                    throw new Error('OCR requested on the Pyodide worker but ONNX was not loaded (OCR pool is active — this path should not be used). Set USE_OCR_POOL=false to serve OCR here.');
+                }
                 result = await runOCR(data.imageData, data.width, data.height, data.cellBelow || null, data.moveInfo || null);
                 break;
 
@@ -167,6 +202,13 @@ onmessage = async function(e) {
                 throw new Error(`Unknown message type: ${type}`);
         }
 
+        if (OCR_TIMING && type === 'ocr' && result && result.timing) {
+            // workerWall = from message recv to just-before-postMessage.
+            // Subtracting result.timing.total gives un-instrumented worker-side
+            // work (input prep + storedLogits + response construction).
+            result.timing.workerWall = performance.now() - _tMsgRecv;
+        }
+
         postMessage({ id, type: 'result', result });
 
     } catch (error) {
@@ -213,7 +255,9 @@ async function runOCR(imageData, width, height, cellBelow = null, moveInfo = nul
     const centerMean = centerSum / centerCount;
     const rightMean = rightSum / rightCount;
 
-    console.log(`  DEBUG ${moveLabel}: shape=${height}x${width}, left=${leftMean.toFixed(0)}, center=${centerMean.toFixed(0)}, right=${rightMean.toFixed(0)}, min=${min}, max=${max}`);
+    if (OCR_VERBOSE_LOG) {
+        console.log(`  DEBUG ${moveLabel}: shape=${height}x${width}, left=${leftMean.toFixed(0)}, center=${centerMean.toFixed(0)}, right=${rightMean.toFixed(0)}, min=${min}, max=${max}`);
+    }
 
     // Normalize to [-1, 1]
     const floatData = new Float32Array(imageData.length);
@@ -224,16 +268,22 @@ async function runOCR(imageData, width, height, cellBelow = null, moveInfo = nul
     // Create tensor [1, 1, 64, 256]
     const tensor = new ort.Tensor('float32', floatData, [1, 1, height, width]);
 
+    const _tStart = OCR_TIMING ? performance.now() : 0;
+
     // Run inference
     const results = await onnxSession.run({ input: tensor });
     const output = results.output;
-    
-    console.log("ONNX output dims:", output.dims);
-    
+
+    const _tAfterOnnx = OCR_TIMING ? performance.now() : 0;
+
+    if (OCR_VERBOSE_LOG) {
+        console.log("ONNX output dims:", output.dims);
+    }
+
     const dims = output.dims;
     const seqLen = dims[0];
     const vocabSize = dims[2];
-    
+
     // Apply log_softmax to get log probabilities
     const logProbs = new Float32Array(seqLen * vocabSize);
     for (let t = 0; t < seqLen; t++) {
@@ -265,19 +315,24 @@ async function runOCR(imageData, width, height, cellBelow = null, moveInfo = nul
         storedLogits.set(sheetKey, { data: logProbs, seqLen, vocabSize });
     }
 
+    const _tAfterSoftmax = OCR_TIMING ? performance.now() : 0;
+
     // Beam decode with grammar constraints (strict)
     const candidates = beamDecoder.decode(logProbs, seqLen, vocabSize, color);
 
-    const candidatesStr = candidates.map(c => `('${c.move}', ${c.confidence.toFixed(4)})`).join(', ');
-    console.log(`  CANDIDATES ${moveLabel}: [${candidatesStr}]`);
+    const _tAfterStrict = OCR_TIMING ? performance.now() : 0;
+
+    if (OCR_VERBOSE_LOG) {
+        const candidatesStr = candidates.map(c => `('${c.move}', ${c.confidence.toFixed(4)})`).join(', ');
+        console.log(`  CANDIDATES ${moveLabel}: [${candidatesStr}]`);
+    }
 
     // Lenient decode (secondary pass - accepts non-standard notations)
     const strictMoves = new Set(candidates.map(c => c.move));
     let lenientAlternatives = [];
     try {
         const lenientRaw = beamDecoder.decodeLenient(logProbs, seqLen, vocabSize, color);
-        // Always log raw lenient output for debugging
-        if (lenientRaw.length > 0) {
+        if (OCR_VERBOSE_LOG && lenientRaw.length > 0) {
             const rawStr = lenientRaw.map(c => `${c.move}(${c.confidence.toFixed(3)})`).join(', ');
             const dupes = lenientRaw.filter(c => strictMoves.has(c.move)).map(c => c.move);
             console.log(`  LENIENT-RAW ${moveLabel}: [${rawStr}]${dupes.length ? ' (dupes of strict: ' + dupes.join(',') + ')' : ''}`);
@@ -286,7 +341,7 @@ async function runOCR(imageData, width, height, cellBelow = null, moveInfo = nul
         lenientAlternatives = lenientRaw
             .filter(c => c.move && !strictMoves.has(c.move))
             .map(c => ({ move: c.move, confidence: c.confidence * 0.5, source: 'lenient' }));
-        if (lenientAlternatives.length > 0) {
+        if (OCR_VERBOSE_LOG && lenientAlternatives.length > 0) {
             const lenientStr = lenientAlternatives.map(c => `('${c.move}', ${c.confidence.toFixed(4)})`).join(', ');
             console.log(`  LENIENT-UNIQUE ${moveLabel}: [${lenientStr}]`);
         }
@@ -294,18 +349,34 @@ async function runOCR(imageData, width, height, cellBelow = null, moveInfo = nul
         console.warn(`  Lenient decode failed for ${moveLabel}: ${e.message}`);
     }
 
+    const _tAfterLenient = OCR_TIMING ? performance.now() : 0;
+
     // Return in format expected by rest of system
     const topMove = candidates[0]?.move || '';
     const topConf = candidates[0]?.confidence || 0;
     const alternatives = candidates.slice(1).map(c => ({move: c.move, confidence: c.confidence}));
 
-    return {
+    const out = {
         move: topMove,
         confidence: topConf,
         alternatives: alternatives,
-        lenientAlternatives: lenientAlternatives,
-        logits: { data: logProbs, seqLen, vocabSize }
+        lenientAlternatives: lenientAlternatives
     };
+    if (!OCR_OMIT_LOGITS_IN_RESPONSE) {
+        out.logits = { data: logProbs, seqLen, vocabSize };
+    }
+
+    if (OCR_TIMING) {
+        out.timing = {
+            onnx: _tAfterOnnx - _tStart,
+            softmax: _tAfterSoftmax - _tAfterOnnx,
+            decodeStrict: _tAfterStrict - _tAfterSoftmax,
+            decodeLenient: _tAfterLenient - _tAfterStrict,
+            total: _tAfterLenient - _tStart
+        };
+    }
+
+    return out;
 }
 
 // -----------------------------------------------------------------------------

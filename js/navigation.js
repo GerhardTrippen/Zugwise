@@ -444,7 +444,13 @@ function _buildOcrContextGrid(cells, highlightMoveNum, highlightColor, label, ov
       html+='</div>';
     }
 
-    // Image grid - NO gaps, uniform row heights for readability
+    // Image grid - seamless reconstruction of the scoresheet column.
+    // Adjacent crops SHARE their boundaries (row i's yBot == row i+1's yTop,
+    // and the white/black halves share xMid), so tiling them edge-to-edge with
+    // object-fit:fill (below) rebuilds the original sheet with no gaps. This
+    // also reconnects 'g' descenders: a tail clipped at one row's bottom
+    // reappears at the top of the next cell's crop. All slide cells share the
+    // same warp aspect ratio, so fill scales them uniformly (no visible skew).
     var cellH = 32;  // Fixed cell height in px
     html+='<div style="display:grid;grid-template-columns:1fr 1fr;grid-template-rows:repeat('+rowCount+','+cellH+'px);gap:0;line-height:0;overflow:hidden;border-radius:4px">';
     for(var row=startRow;row<=endRow;row++){
@@ -460,7 +466,7 @@ function _buildOcrContextGrid(cells, highlightMoveNum, highlightColor, label, ov
                      (isStuckW  ? 'outline:2px solid #f87171;outline-offset:-1px;position:relative;z-index:1;' : '');
       html+='<div style="line-height:0;'+wOutline+'">';
       if(wCell && wCell.imageDataUrl){
-        html+='<img src="'+wCell.imageDataUrl+'" style="width:100%;height:100%;display:block;object-fit:contain;object-position:left center" alt="'+(wCell.move||'')+'">';
+        html+='<img src="'+wCell.imageDataUrl+'" style="width:100%;height:100%;display:block;object-fit:fill" alt="'+(wCell.move||'')+'">';
       }else if(wCell){
         html+='<div style="height:32px;background:#d4c8a8;line-height:32px" class="px-1 text-xs text-gray-600">'+wCell.move+'</div>';
       }else{
@@ -473,7 +479,7 @@ function _buildOcrContextGrid(cells, highlightMoveNum, highlightColor, label, ov
                      (isStuckB  ? 'outline:2px solid #f87171;outline-offset:-1px;position:relative;z-index:1;' : '');
       html+='<div style="line-height:0;'+bOutline+'">';
       if(bCell && bCell.imageDataUrl){
-        html+='<img src="'+bCell.imageDataUrl+'" style="width:100%;height:100%;display:block;object-fit:contain;object-position:left center" alt="'+(bCell.move||'')+'">';
+        html+='<img src="'+bCell.imageDataUrl+'" style="width:100%;height:100%;display:block;object-fit:fill" alt="'+(bCell.move||'')+'">';
       }else if(bCell){
         html+='<div style="height:32px;background:#d4c8a8;line-height:32px" class="px-1 text-xs text-gray-600">'+bCell.move+'</div>';
       }else{
