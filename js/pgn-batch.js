@@ -964,7 +964,7 @@ window.PgnBatch = (function() {
     });
     // Source tag per CLAUDE.md
     if (!('Source' in g.tags)) {
-      lines.push('[Source "Zugwise (gerhardtrippen.github.io/zugwise)"]');
+      lines.push('[Source "Zugwise (gerhardtrippen.github.io/Zugwise)"]');
     }
     lines.push('');
     // Move text: "1. e4 c5 2. Nf3 Nc6 ..." plus result

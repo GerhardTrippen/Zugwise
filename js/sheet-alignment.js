@@ -2306,6 +2306,17 @@
       clearNoiseBanner();
       clearAlignmentBanner();
       state.alignmentAnalysis = null;
+      // SINGLE-SHEET reconstruction relaunch. The dual-sheet path reaches
+      // _retryReconstructionLaunch() via _runNWAlignmentCheck below, but a
+      // single-sheet game has no sheet2 and bails here — so without this call
+      // an edit that changes the move list (e.g. the user deviating from
+      // Greedy's suggestion) never restarts the background searches, leaving
+      // the now-stale partial results on the Greedy/Beam/Dijkstra panels.
+      // The launcher is idempotent (input-fingerprint guard in beam.js), so a
+      // plain navigation click that didn't change inputs is a no-op skip; a
+      // real edit changes the fingerprint and triggers a fresh launch (which
+      // also clears the old greedyResult/beamResult/dijkstraResult panels).
+      _retryReconstructionLaunch();
       return;
     }
 

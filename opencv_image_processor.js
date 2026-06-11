@@ -2111,10 +2111,38 @@ async function processScoresheet(file, gridConfig, corners, method, options) {
         // the background, concurrently with the pool's OCR. The public shape of
         // each move (imageDataUrl/cellBelowImageUrl strings) is unchanged — the
         // strings are just produced off the critical path.
+        // Remove the printed left vertical grid rule from the OCR INPUT only —
+        // the BiLSTM otherwise reads it as a leading K/N/B/R ("|a5"->Ng6). We do
+        // it here (transiently), not in extractCellsDirect, so the cell's stored
+        // .image stays RAW and the user-facing preview shows the original (no
+        // white gap). Default on; an explicit options flag or the
+        // clean_vertical_lines setting can disable it. Only slide cells carry an
+        // edgeMode tag — anchor cells are left untouched (prior behavior).
+        let cleanVLines = true;
+        if (options && typeof options.cleanVerticalLines === 'boolean') {
+            cleanVLines = options.cleanVerticalLines;
+        } else if (typeof window !== 'undefined' && window.currentSettings
+                   && window.currentSettings.clean_vertical_lines === false) {
+            cleanVLines = false;
+        }
+        const hasCleaner = cleanVLines && typeof window !== 'undefined'
+            && window.SlideGrid && typeof window.SlideGrid.cleanCell === 'function';
+        // Returns the Mat to feed OCR plus a temp Mat to free (null if unchanged).
+        const ocrMatFor = (cell) => {
+            if (hasCleaner && cell.edgeMode) {
+                const cc = window.SlideGrid.cleanCell(cell.image, undefined, undefined, undefined, cell.edgeMode);
+                if (cc !== cell.image) return { mat: cc, tmp: cc };
+            }
+            return { mat: cell.image, tmp: null };
+        };
+
         const processedCells = cells.map((cell, idx) => {
-            const preprocessed = preprocessCellForCTC(cell.image);
-            // Cheap: blit the Mat into a canvas (~0.3 ms). Encode to a data URL
-            // now (eager) or hand the canvas back for deferred encoding.
+            const wIn = ocrMatFor(cell);
+            const preprocessed = preprocessCellForCTC(wIn.mat);
+            if (wIn.tmp) wIn.tmp.delete();   // free the cleaned copy; .image stays raw
+            // Cheap: blit the RAW Mat into a canvas (~0.3 ms) so the preview the
+            // user sees is the original. Encode to a data URL now (eager) or hand
+            // the canvas back for deferred encoding.
             const previewCanvas = matToCanvas(cell.image);
             const imageDataUrl = deferPreviews ? null : previewCanvas.toDataURL('image/jpeg', 0.85);
 
@@ -2134,8 +2162,10 @@ async function processScoresheet(file, gridConfig, corners, method, options) {
                     sameColumn = xDiff < (cell.bbox.width || 100);
                 }
                 if (sameColumn) {
-                    cellBelow = preprocessCellForCTC(cells[cellBelowIdx].image);
-                    cellBelowCanvas = matToCanvas(cells[cellBelowIdx].image);
+                    const bIn = ocrMatFor(cells[cellBelowIdx]);
+                    cellBelow = preprocessCellForCTC(bIn.mat);
+                    if (bIn.tmp) bIn.tmp.delete();
+                    cellBelowCanvas = matToCanvas(cells[cellBelowIdx].image);  // RAW preview
                     if (!deferPreviews) {
                         cellBelowImageUrl = cellBelowCanvas.toDataURL('image/jpeg', 0.85);
                     }

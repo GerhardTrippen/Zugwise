@@ -556,6 +556,24 @@
         </div>
       </div>
 
+      <!-- Image Preprocessing -->
+      <div class="mb-6">
+        <h3 class="text-lg font-semibold text-cyan-400 mb-2">Image Preprocessing</h3>
+        <div class="bg-gray-700/50 rounded p-2">
+          <label class="flex items-start text-gray-300 text-sm font-medium">
+            <input type="checkbox" id="set-clean_vertical_lines" class="mr-2 mt-0.5">
+            <div>
+              <span>Remove printed vertical lines</span>
+              <p class="text-xs text-gray-500 mt-0.5 font-normal">
+                Erases the printed grid rule at the left edge of each cell before OCR, so it
+                isn&#x27;t read as a leading piece letter (e.g. &quot;|a5&quot; &rarr; Ng6).
+                Only the dead-straight, full-height left rule is removed; handwriting is left intact.
+              </p>
+            </div>
+          </label>
+        </div>
+      </div>
+
       <!-- Fix-Finding Pipeline -->
       <div class="mb-6">
         <h3 class="text-lg font-semibold text-orange-400 mb-2">Fix-Finding Pipeline</h3>
@@ -616,16 +634,39 @@
               </p>
             </div>
           </div>
+          <!-- Uncertain-move review threshold -->
+          <div class="bg-gray-700/50 rounded p-2">
+            <label class="flex items-center text-gray-300 text-sm font-medium">
+              Uncertain-move review threshold:
+              <select id="set-low_confidence_threshold" class="ml-2 bg-gray-700 text-white rounded px-2 py-1 text-sm">
+                <option value="30">30% (review fewer)</option>
+                <option value="40">40%</option>
+                <option value="50">50% (recommended)</option>
+                <option value="60">60%</option>
+                <option value="70">70% (review more)</option>
+              </select>
+            </label>
+            <p class="text-xs text-gray-500 mt-1 ml-1">
+              A move whose top OCR confidence falls below this is flagged for a mandatory
+              review stop (&#x1F50D;), even when it's a legal move.
+              <span class="text-gray-400">Tradeoff:</span> lower it and more uncertain moves
+              play straight through &mdash; faster now, but a wrong-but-legal read can
+              bite you many moves later. Raise it to catch more errors up front, at the
+              cost of reviewing many more moves.
+            </p>
+          </div>
         </div>
       </div>
 
       <!-- Auto-Run Searches -->
       <div class="mb-6">
         <h3 class="text-lg font-semibold text-teal-400 mb-2">Auto-Run Searches</h3>
-        <p class="text-xs text-gray-400 mb-2">Launch these searches automatically when entering interactive mode</p>
+        <p class="text-xs text-gray-400 mb-2">Launch these searches automatically when entering interactive mode.
+          In batch mode they also gate auto-escalation: a disabled method is never queued (Greedy always runs as the base).</p>
         <div class="space-y-2">
           <label class="flex items-center text-gray-300 text-sm">
             <input type="checkbox" id="set-autorun_greedy" class="mr-2"> Greedy search
+            <span class="text-xs text-gray-500 ml-2">(batch always runs Greedy as the base)</span>
           </label>
           <label class="flex items-center text-gray-300 text-sm">
             <input type="checkbox" id="set-autorun_beam" class="mr-2"> Beam search

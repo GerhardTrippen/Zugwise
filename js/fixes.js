@@ -163,6 +163,21 @@ function createRevertToOcrButton(originalOcr, container) {
       var moveObj = null;
       try { moveObj = tempChess.move(originalOcr, { sloppy: true }); } catch (e) {}
       if (!moveObj) return null;  // OCR move is illegal here — don't offer revert
+      // Phantom check/mate: chess.js sloppy mode silently strips a bogus "+"/"#"
+      // (it accepts "Qc2+" even when Qc2 isn't check), so moveObj is non-null
+      // for a move that is illegal AS WRITTEN. The OCR text claims a check the
+      // position can't deliver — reverting to it would restore the phantom-check
+      // move the algorithm is stripping (user-reported: "❌ 15.W Qc2+ is illegal"
+      // / "❌ 4.B Nbd7+ is illegal" still offered "↩ Revert to OCR: Qc2+/Nbd7+").
+      // Mirror the hybrid replay's marker test in verification-ui.js: tempChess
+      // has already played the move, so in_check()/in_checkmate() report whether
+      // it gave check/mate. Mate implies check, so an under-marked "+" on a real
+      // mate still passes.
+      var _claimsMate = /#/.test(originalOcr);
+      var _claimsCheck = !_claimsMate && /\+/.test(originalOcr);
+      var _actualCheck = (typeof tempChess.in_check === 'function') && tempChess.in_check();
+      var _actualMate = (typeof tempChess.in_checkmate === 'function') && tempChess.in_checkmate();
+      if ((_claimsMate && !_actualMate) || (_claimsCheck && !_actualCheck)) return null;
       fromSq = moveObj.from;
       toSq = moveObj.to;
     }
@@ -224,8 +239,15 @@ function createKeepAsIsButton(container) {
   if (ply !== null) {
     try {
       var tempChess = new Chess();
-      for (var j = 0; j < ply; j++) { tempChess.move(state.sans[j]); }
-      var moveObj = tempChess.move(move);
+      for (var j = 0; j < ply; j++) { tempChess.move(state.sans[j], { sloppy: true }); }
+      // Parse the kept move in SLOPPY mode. chess.js v0.12.0 strict parsing
+      // REJECTS a capture written without "x" (it rejects "Rf4" when the move
+      // is really "Rxf4" — the documented SAN-leniency gap). With strict
+      // parsing moveObj came back null, the canonical-SAN recovery below never
+      // ran, and the button kept showing the stripped OCR text "Rf4". Sloppy
+      // parsing accepts it and hands back the canonical SAN ("Rxf4"), which is
+      // the strict/correct form we want to display and lock.
+      var moveObj = tempChess.move(move, { sloppy: true });
       if (moveObj) {
         fromSq = moveObj.from; toSq = moveObj.to;
         // Only adopt the canonical SAN when the move BODY is unchanged
@@ -314,8 +336,12 @@ function renderFixes(fixes){
   // hanging, or forced-stop ambiguity. For 'ambiguous', the displayed move
   // is the higher-confidence REAL reading (e.g. Qb8) — a valid choice the
   // user can lock as-is rather than picking an algorithm proposal.
+  // Suppressed on a detected position mismatch (positionMismatch): the
+  // 'persistent_absurdity' reason there is a downgraded-from-illegal verdict
+  // on a divergent replay, so the kept move may be illegal in the true game.
   var reason = state.stuckInfo ? state.stuckInfo.reason : null;
-  if(reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging' || reason === 'ambiguous'){
+  var posMismatch = !!(state.stuckInfo && state.stuckInfo.positionMismatch);
+  if(!posMismatch && (reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging' || reason === 'ambiguous')){
     createKeepAsIsButton(container);
 
     var sep = document.createElement('div');
@@ -369,8 +395,10 @@ function renderFixes(fixes){
     selectFix(pcFix, btn);
   }
 
-  // Show "Revert to OCR" button if stuck ply was manually edited away from OCR
-  var originalOcr = getOriginalOcrForStuckPly();
+  // Show "Revert to OCR" button if stuck ply was manually edited away from OCR.
+  // Suppressed on a position mismatch — reverting would restore a move that is
+  // likely illegal in the true game (see Keep-button note above).
+  var originalOcr = posMismatch ? null : getOriginalOcrForStuckPly();
   if (originalOcr) {
     createRevertToOcrButton(originalOcr, container);
   }
@@ -439,9 +467,12 @@ function renderSimpleFixes(){
   var lbl = state.stuckInfo.num + '.' + state.stuckInfo.color.toUpperCase();
 
   // Show "Keep it" button for bad trades, persistent absurdities, piece
-  // hanging, or forced-stop ambiguity (see renderFixes note).
+  // hanging, or forced-stop ambiguity (see renderFixes note). Suppressed on a
+  // detected position mismatch — the kept/reverted move may be illegal in the
+  // true game.
   var reason = state.stuckInfo.reason || 'illegal';
-  if(reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging' || reason === 'ambiguous'){
+  var posMismatch = !!(state.stuckInfo && state.stuckInfo.positionMismatch);
+  if(!posMismatch && (reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging' || reason === 'ambiguous')){
     createKeepAsIsButton(container);
 
     var sep = document.createElement('div');
@@ -451,7 +482,7 @@ function renderSimpleFixes(){
   }
 
   // Show "Revert to OCR" button if stuck ply was manually edited away from OCR
-  var originalOcr = getOriginalOcrForStuckPly();
+  var originalOcr = posMismatch ? null : getOriginalOcrForStuckPly();
   if (originalOcr) {
     createRevertToOcrButton(originalOcr, container);
   }
@@ -2140,9 +2171,14 @@ function renderQuickFixes(quickFixes) {
   container.innerHTML = '';
 
   // Show "Keep it" button for bad trades, persistent absurdities, piece
-  // hanging, or forced-stop ambiguity (see renderFixes note).
+  // hanging, or forced-stop ambiguity (see renderFixes note). Suppressed on a
+  // detected position mismatch: the 'persistent_absurdity' reason there is a
+  // downgraded-from-illegal verdict on a divergent replay, so keeping or
+  // reverting to the move could lock in an illegal move (user-reported "Keep
+  // Rd1"/"Revert to OCR: Rd1" with the king in check).
   var reason = state.stuckInfo ? state.stuckInfo.reason : null;
-  if (reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging' || reason === 'ambiguous') {
+  var posMismatch = !!(state.stuckInfo && state.stuckInfo.positionMismatch);
+  if (!posMismatch && (reason === 'bad_trade' || reason === 'persistent_absurdity' || reason === 'piece_hanging' || reason === 'ambiguous')) {
     createKeepAsIsButton(container);
 
     var sep = document.createElement('div');
@@ -2152,7 +2188,7 @@ function renderQuickFixes(quickFixes) {
   }
 
   // Show "Revert to OCR" button if stuck ply was manually edited away from OCR
-  var originalOcr = getOriginalOcrForStuckPly();
+  var originalOcr = posMismatch ? null : getOriginalOcrForStuckPly();
   if (originalOcr) {
     createRevertToOcrButton(originalOcr, container);
   }
@@ -2311,8 +2347,11 @@ function mergeBacktrackFixes(backtrackFixes, missingMoveCandidates) {
 
   // "Revert to OCR" button is already shown in the quick fixes section (renderFixes) — don't duplicate here
 
-  // Check if we need to auto-select first backtrack fix (no quick fixes, no pending confirmation)
-  var originalOcr = getOriginalOcrForStuckPly();
+  // Check if we need to auto-select first backtrack fix (no quick fixes, no pending confirmation).
+  // On a position mismatch the Revert button is suppressed, so treat originalOcr
+  // as absent here too — otherwise auto-select would defer to a revert option
+  // that isn't on screen, leaving nothing selected.
+  var originalOcr = (state.stuckInfo && state.stuckInfo.positionMismatch) ? null : getOriginalOcrForStuckPly();
   var needsAutoSelect = (!state.quickFixes || state.quickFixes.length === 0) && !state.pendingConfirmation && !originalOcr;
   var firstBacktrackBtn = null;
   var firstBacktrackFix = null;

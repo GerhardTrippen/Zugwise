@@ -360,6 +360,25 @@ function detectMidpoint(srcMat, profilePage1, profilePage2, opts) {
     log('Detected ' + colXs.length + ' columns at X = ['
         + colXs.map(function(x) { return Math.round(x); }).join(', ') + ']');
 
+    // Per-column CC detail for diagnostics: a REAL number column has ~rowCount
+    // components spanning the full sheet height; a noise/partial artifact has
+    // few CCs or a short span. Surfaced on failure so we can tell whether the
+    // robust detector found clean columns (→ seam math is the bug) or junk
+    // (→ the detection is the bug).
+    var colDetail = anchorCols.map(function(a) {
+        var cys = a.cys || [];
+        var y0 = Infinity, y1 = -Infinity;
+        for (var ci = 0; ci < cys.length; ci++) {
+            if (cys[ci] < y0) y0 = cys[ci];
+            if (cys[ci] > y1) y1 = cys[ci];
+        }
+        return { cx: Math.round(a.cx), n: cys.length,
+                 span: cys.length ? Math.round(y1 - y0) : 0 };
+    });
+    var colDetailStr = colDetail.map(function(d) {
+        return 'x' + d.cx + '(' + d.n + 'cc,' + d.span + 'px)';
+    }).join(' ');
+
     var detected = colXs.length;
     var inferredLeftColumn = false;
 
@@ -476,7 +495,12 @@ function detectMidpoint(srcMat, profilePage1, profilePage2, opts) {
             pageSlopeDeg: slopeCheck.pageSlopeDeg,
             maxSlopeDeviationDeg: slopeCheck.maxDevDeg,
             seamSpacing: spacingCheck.seamSpacing,
-            maxWithinSpacing: spacingCheck.maxWithin
+            maxWithinSpacing: spacingCheck.maxWithin,
+            // 2D-row-validated column X-positions — surfaced for the seam
+            // fallback's diagnostics (these filter noise via row structure,
+            // unlike the 1D density peaks).
+            colXs: colXs.map(function(x) { return Math.round(x); }),
+            colDetail: colDetailStr
         };
     }
 
@@ -536,9 +560,310 @@ function detectMidpoint(srcMat, profilePage1, profilePage2, opts) {
     };
 }
 
+// =============================================================================
+// 6-COLUMN-PEAK SEAM FALLBACK
+// =============================================================================
+//
+// When detectMidpoint's anchor path fails (mis-grouped columns on a skewed or
+// noisy photo) the caller drops to the legacy ink-valley split. On a badly-
+// centered photo the globally-deepest valley is a WITHIN-sheet gap, not the
+// seam — so the cut lops a column (the "rightmost column ~155px vs ~516px,
+// hugs the image edge" templateWarning).
+//
+// This fallback places the seam by COLUMN COUNT instead of valley depth. Two
+// copies of the same sheet contribute (leftCols + rightCols) evenly-spaced ink
+// columns; the seam is the gap between column[leftCols-1] and column[leftCols]
+// (a 3|3 split for 3-col sheets). Detecting the columns as smoothed-density
+// humps and splitting by count is robust to overall left/right ink imbalance
+// and to non-column-shaped noise blobs, which never become one of the top-
+// (leftCols+rightCols) regularly-spaced humps.
+//
+// Returns { seamX, confident, reason }. confident:false means "the hump
+// structure didn't match a clean N+N column layout" — the caller keeps the
+// ink-valley fallback, so this can only improve on it, never regress.
+
+// Centered box-filter via a single running sum. lo/hi are non-decreasing as c
+// advances, so L and R move monotonically — O(n) total.
+function boxSmooth(arr, win) {
+    var n = arr.length;
+    var out = new Float64Array(n);
+    if (win < 2 || n === 0) { for (var i = 0; i < n; i++) out[i] = arr[i]; return out; }
+    var half = Math.floor(win / 2);
+    var run = 0, L = 0, R = -1;
+    for (var c = 0; c < n; c++) {
+        var lo = c - half; if (lo < 0) lo = 0;
+        var hi = c + half; if (hi > n - 1) hi = n - 1;
+        while (R < hi) { R++; run += arr[R]; }
+        while (L < lo) { run -= arr[L]; L++; }
+        out[c] = run / (R - L + 1);
+    }
+    return out;
+}
+
+// =============================================================================
+// PRINTED-GRID SEAM DETECTION (primary fallback)
+// =============================================================================
+//
+// When detectMidpoint's anchor path fails, this is the first fallback — it is
+// the most robust because it keys on the PRINTED TABLE GRID, not ink density.
+//
+// Why density fails on real phone photos (verified on PXL_20260606_222707000):
+//   - a strong left-bright/right-dark lighting gradient makes any global
+//     brightness/darkness threshold meaningless (one side saturates);
+//   - one sheet's pencil can be much fainter than the other's, so its ink
+//     density is no higher than the whitespace between its own columns;
+//   - the inter-sheet gap is thin and (under skew) diagonal.
+// Density-based valley finding then picks a within-sheet gap and the split
+// lops a column.
+//
+// The printed grid is invariant to all three: every scoresheet is covered in
+// printed rule lines (a border + a line per row), so an ADAPTIVE (local-
+// contrast) threshold lights up each sheet as a dense foreground plateau
+// regardless of global lighting or how faint the handwriting is. The table
+// surface BETWEEN the two sheets has no printed structure → an empty band.
+// The seam is the widest empty band between the two plateaus; its center is
+// the cut.
+//
+// Returns { seamX, confident, reason }. confident:false → caller tries the
+// next fallback (column-count, then ink-valley), so this only ever improves.
+function detectSeamByGrid(srcMat, log) {
+    log = log || function() {};
+    function done(confident, seamX, reason) {
+        log('[grid-seam] ' + (confident ? 'OK — ' : 'reject — ') + reason);
+        return { seamX: seamX, confident: confident, reason: reason };
+    }
+    if (!srcMat) return done(false, null, 'no image');
+    if (typeof cv === 'undefined' || !cv.Mat) return done(false, null, 'OpenCV unavailable');
+
+    var W = srcMat.cols;
+    var gray = new cv.Mat(), bw = new cv.Mat(), colSum = new cv.Mat();
+    var fg = new Float64Array(W);
+    try {
+        if (srcMat.channels() === 4) cv.cvtColor(srcMat, gray, cv.COLOR_RGBA2GRAY);
+        else if (srcMat.channels() === 3) cv.cvtColor(srcMat, gray, cv.COLOR_RGB2GRAY);
+        else srcMat.copyTo(gray);
+        // Foreground = darker than the local mean (printed lines + ink). Block
+        // size 41 captures the rule-line scale; C=8 rejects flat page/table.
+        // adaptiveThreshold needs an odd block; 41 is odd.
+        cv.adaptiveThreshold(gray, bw, 255, cv.ADAPTIVE_THRESH_MEAN_C,
+            cv.THRESH_BINARY_INV, 41, 8);
+        cv.reduce(bw, colSum, 0, cv.REDUCE_SUM, cv.CV_32S);  // 1×W foreground sums
+        var sd = colSum.data32S;
+        for (var x = 0; x < W; x++) fg[x] = sd[x] / 255;     // → pixel count
+    } catch (e) {
+        return done(false, null, 'adaptive threshold failed: ' + (e && e.message || e));
+    } finally {
+        gray.delete(); bw.delete(); colSum.delete();
+    }
+
+    var win = Math.max(5, Math.round(W / 60));
+    var fgs = boxSmooth(fg, win);
+    var peak = 0;
+    for (var i = 0; i < W; i++) if (fgs[i] > peak) peak = fgs[i];
+    if (peak < 1) return done(false, null, 'no printed structure detected');
+
+    // Compact spatial profile (40 bins, 0–9 of peak) for diagnostics.
+    var BINS = 40, prof = '', binW = W / BINS;
+    for (var b = 0; b < BINS; b++) {
+        var bm = 0, bEnd = Math.floor((b + 1) * binW);
+        for (var bx = Math.floor(b * binW); bx < bEnd && bx < W; bx++) {
+            if (fgs[bx] > bm) bm = fgs[bx];
+        }
+        prof += String.fromCharCode(48 + Math.min(9, Math.round(bm / peak * 9)));
+    }
+    log('[grid-seam] printed-grid profile (' + BINS + ' bins ~' + Math.round(binW)
+        + 'px, 0–9 of peak ' + Math.round(peak) + '): ' + prof);
+
+    // Seed one column inside each sheet = the strongest-grid column in each
+    // outer half (the seam lies between them). Then find the widest LOW-
+    // foreground run between the seeds: within a sheet the printed grid keeps
+    // foreground high even over blank/unfilled cells, so only the genuine
+    // inter-sheet gap (no printed grid) drops out.
+    var gapThr = peak * 0.35;
+    var plateauThr = peak * 0.5;
+    var gL = 0, gR = (W >> 1);
+    for (var l = 0; l < (W >> 1); l++) if (fgs[l] > fgs[gL]) gL = l;
+    for (var r = (W >> 1); r < W; r++) if (fgs[r] > fgs[gR]) gR = r;
+    if (fgs[gL] < plateauThr || fgs[gR] < plateauThr) {
+        return done(false, null, 'one half lacks a printed-grid plateau (left peak '
+            + Math.round(fgs[gL]) + ', right peak ' + Math.round(fgs[gR]) + ', need '
+            + Math.round(plateauThr) + ') — may be a single sheet');
+    }
+    var bestLen = 0, bestLo = -1, cur = 0, start = gL;
+    for (var x2 = gL; x2 < gR; x2++) {
+        if (fgs[x2] < gapThr) {
+            if (cur === 0) start = x2;
+            cur++;
+            if (cur > bestLen) { bestLen = cur; bestLo = start; }
+        } else {
+            cur = 0;
+        }
+    }
+    if (bestLo < 0) {
+        return done(false, null, 'no empty band (<' + Math.round(gapThr) + ') between the two '
+            + 'grid plateaus at x=' + gL + ' and x=' + gR + ' — sheets abut or single sheet');
+    }
+    var seamX = bestLo + (bestLen >> 1);
+    if (seamX < W * 0.20 || seamX > W * 0.80) {
+        return done(false, null, 'seam x=' + seamX + ' (' + Math.round(seamX / W * 100)
+            + '%) outside central 20–80% band');
+    }
+    return done(true, seamX, 'inter-sheet gap [' + bestLo + '..' + (bestLo + bestLen)
+        + '] (' + bestLen + 'px wide, fg ' + Math.round(fgs[seamX]) + ' vs peak '
+        + Math.round(peak) + ') → cut at x=' + seamX + ' (' + Math.round(seamX / W * 100) + '%)');
+}
+
+function detectSeamByColumns(srcMat, leftCols, rightCols, log) {
+    log = log || function() {};
+    var totalCols = leftCols + rightCols;
+    // Every exit funnels through done() so the decision trace always reaches
+    // the caller's log (and is returned in .reason) — even on the reject paths.
+    function done(confident, seamX, reason) {
+        log('[6col-peak] ' + (confident ? 'OK — ' : 'reject — ') + reason);
+        return { seamX: seamX, confident: confident, reason: reason };
+    }
+    if (!srcMat || totalCols < 2) {
+        return done(false, null, 'bad args (totalCols=' + totalCols + ')');
+    }
+    if (typeof cv === 'undefined' || !cv.Mat) {
+        return done(false, null, 'OpenCV unavailable');
+    }
+
+    var W = srcMat.cols;
+    log('[6col-peak] start: W=' + W + ' expecting ' + leftCols + '+' + rightCols
+        + '=' + totalCols + ' column humps');
+
+    // --- column ink-density projection: count of dark pixels per column ---
+    var gray = new cv.Mat(), bw = new cv.Mat(), colSum = new cv.Mat();
+    var density = new Float64Array(W);
+    try {
+        if (srcMat.channels() === 4) cv.cvtColor(srcMat, gray, cv.COLOR_RGBA2GRAY);
+        else if (srcMat.channels() === 3) cv.cvtColor(srcMat, gray, cv.COLOR_RGB2GRAY);
+        else srcMat.copyTo(gray);
+        cv.threshold(gray, bw, 160, 1, cv.THRESH_BINARY_INV);  // dark ink → 1
+        cv.reduce(bw, colSum, 0, cv.REDUCE_SUM, cv.CV_32S);    // 1×W column sums
+        var sd = colSum.data32S;
+        for (var x = 0; x < W; x++) density[x] = sd[x];
+    } catch (e) {
+        return done(false, null, 'projection failed: ' + (e && e.message || e));
+    } finally {
+        gray.delete(); bw.delete(); colSum.delete();
+    }
+
+    // --- smooth at ~0.4× the expected column width: enough to merge a column's
+    //     number + White/Black move sub-columns into ONE hump and to drop stray
+    //     handwriting strokes, while preserving the wider inter-column dips. ---
+    var expColW = 0.9 * W / totalCols;
+    var win = Math.max(5, Math.round(expColW * 0.4));
+    var smooth = boxSmooth(density, win);
+
+    var peakMax = 0;
+    for (var i2 = 0; i2 < W; i2++) if (smooth[i2] > peakMax) peakMax = smooth[i2];
+    if (peakMax < 1) return done(false, null, 'blank projection');
+
+    // Compact spatial ink profile (40 bins, each digit = max smoothed density
+    // in that bin as 0–9 of peak). Reveals the [left sheet][right sheet][noise]
+    // layout at a glance — a trailing run of 9s is a dense edge noise blob.
+    var BINS = 40, prof = '', binW = W / BINS;
+    for (var b = 0; b < BINS; b++) {
+        var bm = 0, bEnd = Math.floor((b + 1) * binW);
+        for (var bx = Math.floor(b * binW); bx < bEnd && bx < W; bx++) {
+            if (smooth[bx] > bm) bm = smooth[bx];
+        }
+        prof += String.fromCharCode(48 + Math.min(9, Math.round(bm / peakMax * 9)));
+    }
+    log('[6col-peak] ink profile (' + BINS + ' bins ~' + Math.round(binW) + 'px each, 0–9 of peak '
+        + Math.round(peakMax) + '): ' + prof);
+
+    // --- column humps: local maxima, then greedy non-max suppression so two
+    //     adjacent columns can't both collapse onto one pick and a noise blob
+    //     near a real column gets absorbed. Keep the top (totalCols) by height. ---
+    var minProm = peakMax * 0.12;
+    var maxima = [];
+    for (var p = 1; p < W - 1; p++) {
+        if (smooth[p] >= smooth[p - 1] && smooth[p] > smooth[p + 1] && smooth[p] >= minProm) {
+            maxima.push({ x: p, h: smooth[p] });
+        }
+    }
+    maxima.sort(function(a, b) { return b.h - a.h; });
+    log('[6col-peak] smooth win=' + win + 'px peakMax=' + Math.round(peakMax)
+        + ' → ' + maxima.length + ' local maxima (>=' + Math.round(minProm) + '); top'
+        + ' by height: ' + maxima.slice(0, Math.min(maxima.length, totalCols + 3))
+            .map(function(o) { return Math.round(o.x) + '(' + Math.round(o.h) + ')'; }).join(' '));
+    var minDist = expColW * 0.6;
+    var picked = [];
+    for (var m = 0; m < maxima.length && picked.length < totalCols; m++) {
+        var ok = true;
+        for (var q = 0; q < picked.length; q++) {
+            if (Math.abs(maxima[m].x - picked[q].x) < minDist) { ok = false; break; }
+        }
+        if (ok) picked.push(maxima[m]);
+    }
+    if (picked.length < totalCols) {
+        return done(false, null, 'found only ' + picked.length + ' of ' + totalCols
+            + ' column humps (minDist=' + Math.round(minDist) + 'px) at X=['
+            + picked.map(function(o) { return Math.round(o.x); }).join(', ') + ']');
+    }
+    picked.sort(function(a, b) { return a.x - b.x; });
+
+    // --- the seam is the gap between the two innermost columns (index
+    //     leftCols-1 → leftCols). It must be the WIDEST gap, and the within-
+    //     sheet gaps must be roughly uniform; otherwise the hump structure
+    //     does not match a clean N+N layout and we should not trust it. ---
+    var gaps = [];
+    for (var g = 1; g < picked.length; g++) gaps.push(picked[g].x - picked[g - 1].x);
+    var seamGapIdx = leftCols - 1;
+    var seamGap = gaps[seamGapIdx];
+    var widestIdx = 0;
+    for (var gi = 1; gi < gaps.length; gi++) if (gaps[gi] > gaps[widestIdx]) widestIdx = gi;
+    log('[6col-peak] humps X=[' + picked.map(function(o) { return Math.round(o.x); }).join(', ')
+        + '] gaps=[' + gaps.map(function(v) { return Math.round(v); }).join(', ')
+        + '] expected seam at gap#' + (seamGapIdx + 1) + ' (=' + Math.round(seamGap)
+        + 'px); widest gap is #' + (widestIdx + 1) + ' (=' + Math.round(gaps[widestIdx]) + 'px)');
+    if (widestIdx !== seamGapIdx) {
+        return done(false, null, 'widest hump gap at boundary ' + (widestIdx + 1) + ', not the expected '
+            + leftCols + '|' + rightCols + ' seam (boundary ' + (seamGapIdx + 1) + ')');
+    }
+    var within = gaps.filter(function(_, idx) { return idx !== seamGapIdx; });
+    var medWithin = median(within);
+    if (medWithin > 0 && seamGap < medWithin * 1.25) {
+        return done(false, null, 'seam gap ' + Math.round(seamGap) + 'px not clearly wider than within-sheet '
+            + Math.round(medWithin) + 'px (columns too uniform — may be a single sheet)');
+    }
+    var maxWithin = Math.max.apply(null, within);
+    var minWithin = Math.min.apply(null, within);
+    if (minWithin > 0 && maxWithin > minWithin * 2.5) {
+        return done(false, null, 'within-sheet hump spacing too irregular (' + Math.round(minWithin)
+            + '..' + Math.round(maxWithin) + 'px, ratio ' + (maxWithin / minWithin).toFixed(1)
+            + ') — detection unreliable');
+    }
+
+    // --- place the cut at the density minimum inside the seam gap; that lands
+    //     in the real whitespace even when the two sheets are unequal widths
+    //     or skewed, which the gap midpoint would miss. ---
+    var lo2 = picked[seamGapIdx].x, hi2 = picked[seamGapIdx + 1].x;
+    var seamX = Math.round((lo2 + hi2) / 2), seamMin = Infinity;
+    for (var sx = lo2; sx <= hi2; sx++) {
+        if (smooth[sx] < seamMin) { seamMin = smooth[sx]; seamX = sx; }
+    }
+
+    // Two copies of the same sheet put the seam near center; reject an extreme
+    // (that would be the within-sheet valley the ink-valley path already finds).
+    if (seamX < W * 0.20 || seamX > W * 0.80) {
+        return done(false, null, 'seam X=' + seamX + ' (' + Math.round(seamX / W * 100)
+            + '% of W) outside central 20–80% band');
+    }
+
+    return done(true, seamX, totalCols + ' column humps, ' + leftCols + '|' + rightCols
+        + ' split at x=' + seamX + ' (seamGap=' + Math.round(seamGap) + 'px, within~'
+        + Math.round(medWithin) + 'px)');
+}
+
 if (typeof window !== 'undefined') {
     window.GridUnsplit = {
-        detectMidpoint: detectMidpoint
+        detectMidpoint: detectMidpoint,
+        detectSeamByGrid: detectSeamByGrid,
+        detectSeamByColumns: detectSeamByColumns
     };
 }
 

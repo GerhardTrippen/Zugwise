@@ -359,10 +359,29 @@ def validate_moves(
             # handled as a normal illegal fix below (which surfaces c5) — NOT as a
             # keepable ambiguity (a "Keep Kc5" button is nonsense). So an illegal
             # forced-stop reading falls through to Step 0.5 / the fix search.
-            if (ocr_data and i < len(ocr_data)
+            _fs_legal_move = (
+                try_move(board, san, auto_correct=False)
+                if (ocr_data and i < len(ocr_data)
                     and ocr_data[i].get('forced_stop')
-                    and i not in approved_plies
-                    and try_move(board, san, auto_correct=False) is not None):
+                    and i not in approved_plies)
+                else None)
+            # TERMINAL-MATE CARVE-OUT: a forced stop (low confidence / near-tie)
+            # on the FINAL recorded move is pointless when that move plays as a
+            # legal checkmate. The +/# suffix is board-determined, and a mate is
+            # the terminal move — the game ends here, so there is nothing
+            # downstream to commit wrong and no review can change the outcome.
+            # Fall through to the normal play path, which stores the canonical
+            # SAN (board.san() = "...#") instead of forcing the user to arbitrate
+            # a deterministic mate (e.g. 39.B "Re1+" -> "Re1#"). A MID-game
+            # forced-stop mate is NOT auto-committed here: it still stops as
+            # ambiguous, and a spurious mid-game mate is caught by the
+            # premature_mate guard further down.
+            _fs_terminal_mate = False
+            if _fs_legal_move is not None and i + 1 >= len(moves):
+                board.push(_fs_legal_move)
+                _fs_terminal_mate = board.is_checkmate()
+                board.pop()
+            if _fs_legal_move is not None and not _fs_terminal_mate:
                 stuck_at = i
                 stuck_move = san
                 stuck_reason = 'ambiguous'

@@ -8,12 +8,28 @@
 // same mechanism as a dual-sheet near-tie disagreement. This catches the
 // "very low probability" single readings that today only get a red % badge and
 // otherwise play straight through if legal. Exposed on window so the move-list
-// renderer (ui.js forcedStopInd) shows the 🔍 badge at the same threshold.
-// TUNABLE: raise to review more aggressively, lower to reduce stops. Kept
-// below the 0.7 red-confidence band so only weak reads force a stop. Set to
-// 0.50 (Jun 2026) so coin-flip reads like 7.B f5 @43% force a review.
-var FORCED_STOP_MIN_CONFIDENCE = 0.50;
+// renderer (ui.js forcedStopInd) and beam.js read the SAME threshold.
+//
+// USER-CONFIGURABLE via Settings → "Uncertain-move review threshold"
+// (currentSettings.low_confidence_threshold, a percent). Kept below the 0.7
+// red-confidence band so only weak reads force a stop. Default 50% (Jun 2026)
+// so coin-flip reads like 7.B f5 @43% force a review. getForcedStopMinConfidence()
+// reads the live setting on every validate call and mirrors it onto window;
+// the 0.50 fallback applies only before settings have loaded.
+var FORCED_STOP_MIN_CONFIDENCE = 0.50;  // window mirror / pre-settings default
 if (typeof window !== 'undefined') window.FORCED_STOP_MIN_CONFIDENCE = FORCED_STOP_MIN_CONFIDENCE;
+
+function getForcedStopMinConfidence() {
+  var pct = 50;
+  if (typeof currentSettings !== 'undefined' && currentSettings &&
+      typeof currentSettings.low_confidence_threshold === 'number') {
+    pct = currentSettings.low_confidence_threshold;
+  }
+  var val = pct / 100;
+  FORCED_STOP_MIN_CONFIDENCE = val;
+  if (typeof window !== 'undefined') window.FORCED_STOP_MIN_CONFIDENCE = val;
+  return val;
+}
 
 // Ply indices flagged as dual-sheet ambiguous (near-tie disagreement). Single
 // source for the forced-stop readers (validate builders + the 🔍 badge).
@@ -154,7 +170,7 @@ async function validateAndDisplay(paired,filename,opts){
       if(m.wAlts&&m.wAlts.length>0){m.wAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.wLenientAlts&&m.wLenientAlts.length>0){m.wLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
+      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<getForcedStopMinConfidence())});
     }
     if(m.black){
       flat.push(m.black);
@@ -162,7 +178,7 @@ async function validateAndDisplay(paired,filename,opts){
       if(m.bAlts&&m.bAlts.length>0){m.bAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.bLenientAlts&&m.bLenientAlts.length>0){m.bLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
+      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<getForcedStopMinConfidence())});
     }
   });
   // Debug: count lenient alternatives in OCR data
@@ -597,7 +613,7 @@ async function fetchFixes(){
         }
         var lenientAlts=[];
         if(m.wLenientAlts&&m.wLenientAlts.length>0){m.wLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-        ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
+        ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<getForcedStopMinConfidence())});
       }
       if(m.black){
         flat.push(m.black);
@@ -607,7 +623,7 @@ async function fetchFixes(){
         }
         var lenientAlts=[];
         if(m.bLenientAlts&&m.bLenientAlts.length>0){m.bLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-        ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
+        ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<getForcedStopMinConfidence())});
       }
     });
 
@@ -862,7 +878,7 @@ async function revalidate(opts){
       if(m.wAlts&&m.wAlts.length>0){m.wAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.wLenientAlts&&m.wLenientAlts.length>0){m.wLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
+      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<getForcedStopMinConfidence())});
     }
     if(m.black){
       flat.push(m.black);
@@ -870,7 +886,7 @@ async function revalidate(opts){
       if(m.bAlts&&m.bAlts.length>0){m.bAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.bLenientAlts&&m.bLenientAlts.length>0){m.bLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<FORCED_STOP_MIN_CONFIDENCE)});
+      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<getForcedStopMinConfidence())});
     }
   });
   // Pass confirmedPly as startPly to skip re-checking already-confirmed moves

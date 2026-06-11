@@ -41,6 +41,19 @@ var BatchPanelBridge = (function() {
   var _completedGameIds = {};
   var METHODS = ['greedy', 'beam', 'dijkstra'];
 
+  // Show/hide a method panel's Cancel (✕) button. In single mode beam.js's
+  // handleSearchStatusChange toggles this on the 'running' status; the batch
+  // bridge renders progress via updateSearchPanel (which doesn't touch the
+  // button), so we toggle it here whenever we paint a running/non-running
+  // state. Without this the ✕ stays at its index.html `hidden` default for the
+  // whole batch run and the user can never cancel an in-flight Greedy.
+  function _setCancelVisible(method, visible) {
+    var btn = document.getElementById('btn-cancel-' + method);
+    if (!btn) return;
+    if (visible) btn.classList.remove('hidden');
+    else btn.classList.add('hidden');
+  }
+
   // Attach is called once from batch-game-list.js when the orchestrator is
   // created. The bridge does not construct the orchestrator — it just needs
   // a reference to call getResult(gameId) during bindGame.
@@ -120,6 +133,7 @@ var BatchPanelBridge = (function() {
         if (typeof updateSearchPanel === 'function') {
           updateSearchPanel(m, 'Running\u2026', 0);
         }
+        _setCancelVisible(m, true);
       } else if (status === 'queued') {
         if (typeof updateSearchPanel === 'function') {
           updateSearchPanel(m, 'Queued', 0);
@@ -153,6 +167,12 @@ var BatchPanelBridge = (function() {
     // handleSearchStep would render that as "Step N Q:M" and overwrite the
     // completion banner the user just saw turn green.
     if (_completedGameIds[gameId]) return;
+    // A live (non-done) step means this method is actively running on the
+    // open game — make sure its Cancel (✕) is visible even if the user opened
+    // the game while the method was still 'queued' (bindGame only shows it for
+    // an already-'running' method). handleSearchComplete hides it again on
+    // completion.
+    if (step && !step.done) _setCancelVisible(method, true);
     if (typeof handleSearchStep === 'function') {
       handleSearchStep(method, step);
     }
@@ -203,6 +223,7 @@ var BatchPanelBridge = (function() {
           updateSearchPanel(m, 'Queued (escalating\u2026)', 0);
         } else if (s === 'running') {
           updateSearchPanel(m, 'Running\u2026', 0);
+          _setCancelVisible(m, true);
         }
       });
     }

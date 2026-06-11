@@ -191,6 +191,11 @@ var BatchGameList = (function() {
         section: game.section,
         round: game.round,
         board: game.board,
+        // Carry board provenance so attachPairings knows a directory-derived
+        // board ("…/Board 6/") is authoritative and must not be overwritten
+        // by the tournament file's (possibly section-local or synthetic)
+        // board number. Dropping it here was silently re-enabling the clobber.
+        boardFromDirectory: game.boardFromDirectory,
         files: game.files,
         status: GAME_STATUS.QUEUED,
         ocrCellCount: 0,
@@ -1175,7 +1180,12 @@ var BatchGameList = (function() {
   async function _selectGameInner(gameId) {
     var result = batchState.ocrResults[gameId];
     var hasData = result && (
-      (result.isDualSheet && result.sheet1 && result.sheet1.length > 0) ||
+      // Either half of a dual-sheet result is enough — a game whose LEFT
+      // sheet OCR'd to zero cells (e.g. transient model-load failure) must
+      // stay clickable; processAllSheets collapses one-half-empty games
+      // into the single-sheet flow.
+      (result.isDualSheet && ((result.sheet1 && result.sheet1.length > 0) ||
+                              (result.sheet2 && result.sheet2.length > 0))) ||
       (result.ocrCells && result.ocrCells.length > 0)
     );
     if (!hasData) {
@@ -1423,6 +1433,52 @@ var BatchGameList = (function() {
     // ply) on top of what processAllSheets just produced. First-time visits
     // skip this and use the fresh validation result as-is.
     _restoreGameWorkingState(gameId);
+
+    // FALSE-POSITIVE TRUNCATION RECONCILE — break the NEEDS_TRUNCATION deadlock.
+    // The orchestrator's enqueue gate (_hasTrailingNoise) and the user-facing
+    // detector (showOcrResults → _earliestNoiseStart, which set
+    // state.pendingNoiseReview during the processAllSheets call above) run the
+    // SAME four NoiseDetection detectors but on DIFFERENT inputs: the gate uses
+    // _cellsToPaired(mergeSheets(s1,s2)); the user-facing path uses the merged
+    // moves actually shown. On dual-sheet games these can disagree — the gate
+    // flags a low-confidence tail (e.g. "Rh4 (38%)") while the user-facing
+    // detector sees the real last move ("Ra3") as clean.
+    //
+    // When they disagree this way the game is wedged. The orchestrator/nav
+    // gates read the stale `hasTrailingNoise && !noiseResolved` pair as "still
+    // needs truncation" (e.g. _isGameReadyForReview at ~:2484) REGARDLESS of
+    // the game's status — so the game can sit at NEEDS_TRUNCATION *or* drift to
+    // in_review via live fix-finding and still be blocked from reconstruction.
+    // Meanwhile no yellow "Continue to Validation" panel ever appears
+    // (pendingNoiseReview is false), so the user has nothing to truncate and no
+    // button to dismiss it — they just see fix-finding spin on the first
+    // forced-stop. The user-facing detector is authoritative (it's the one the
+    // user can act on); if it found the tail clean, the gate's flag was a false
+    // positive. Clear it the same way an explicit "Continue to Validation" click
+    // would: onTruncationComplete marks the game noiseResolved, clears
+    // hasTrailingNoise, and enqueues reconstruction against the (un-truncated)
+    // OCR. Keyed on hasTrailingNoise (not status) so the in_review case below is
+    // covered too.
+    console.log('[TRUNC-DIAG] ' + gameId +
+                ' active=' + (batchState && batchState.active) +
+                ' status=' + (game && game.status) +
+                ' noiseResolved=' + (game && game.noiseResolved) +
+                ' hasTrailingNoise=' + (game && game.hasTrailingNoise) +
+                ' pendingNoiseReview=' + (typeof state !== 'undefined' && state.pendingNoiseReview) +
+                ' reconstructPicked=' + !!(game && game.reconstructPicked));
+    if (batchState.active && game &&
+        game.hasTrailingNoise && !game.noiseResolved &&
+        typeof state !== 'undefined' && !state.pendingNoiseReview) {
+      if (typeof log === 'function') {
+        log('  ↪ ' + gameId + ' flagged NEEDS_TRUNCATION but user-facing noise ' +
+            'detector found no tail to cut — clearing false-positive flag and ' +
+            'enqueuing reconstruction');
+      }
+      console.log('[TRUNC-RECONCILE] ' + gameId + ' — orchestrator gate vs ' +
+                  'user-facing detector disagree; treating as no-noise and ' +
+                  'enqueuing reconstruction.');
+      onTruncationComplete(gameId);
+    }
 
     // Populate the tournament/pairing header above the move list. If no
     // pairing data is available (e.g. no tournament file loaded), renderGameHeader
@@ -2617,7 +2673,7 @@ var BatchGameList = (function() {
     headers2.push('[Black "' + ((pairing && pairing.blackName) || '?') + '"]');
     headers2.push('[Result "' + result + '"]');
     if (moves && moves.length > 0) headers2.push('[PlyCount "' + moves.length + '"]');
-    headers2.push('[Source "Zugwise (gerhardtrippen.github.io/zugwise)"]');
+    headers2.push('[Source "Zugwise (gerhardtrippen.github.io/Zugwise)"]');
 
     var moveText = '';
     for (var i = 0; i < moves.length; i += 2) {
@@ -2703,7 +2759,7 @@ var BatchGameList = (function() {
       '[Black "' + ((pairing && pairing.blackName) || '?') + '"]',
       '[Result "' + pairingResult + '"]',
       '[Termination "Reconstruction incomplete (Zugwise)"]',
-      '[Source "Zugwise (gerhardtrippen.github.io/zugwise)"]',
+      '[Source "Zugwise (gerhardtrippen.github.io/Zugwise)"]',
       ''
     ];
     var moveText = '';

@@ -81,6 +81,22 @@ var AMBIGUITY_TIE_MARGIN = 0.15;
 // it. TUNABLE alongside the margin.
 var AMBIGUITY_MIN_CONFIDENCE = 0.45;
 
+// Global sheet-reliability gate on the forced-stop. The per-cell
+// AMBIGUITY_MIN_CONFIDENCE floor assumes a bad reading is a WEAK reading, but a
+// mis-gridded second sheet emits confidently-WRONG moves (0.97+), so the floor
+// never engages and every disagreement looks like a "two strong opinions" tie.
+// When the two sheets agree on the top-1 move across fewer than this fraction of
+// their shared plies, the second sheet is not a trustworthy corroborator — its
+// disagreements are noise, not resolvable ambiguities. In that regime we keep
+// MERGING (higher summed-confidence pick still wins, sheet 2 stays in the merged
+// alternatives for the fix-finder) but SUPPRESS the forced user-arbitration
+// stop; normal legality validation remains the backstop for illegal picks. On a
+// real broken pairing this cut 19 forced stops to 0 (12% agreement, the good
+// sheet dominated every legal pick). Computed over plies where BOTH sheets have
+// data; needs a minimum sample so a 2-move stub can't trip it. TUNABLE.
+var AMBIGUITY_MIN_SHEET_AGREEMENT = 0.40;
+var AMBIGUITY_MIN_SHEET_SAMPLE = 8;
+
 // Tier-1 consensus elevation. A legal disagree-cell move (the sheets' raw TOP
 // moves differ) is still elevated to Tier 1 (auto-lockable, never touched by the
 // algorithms) when BOTH sheets saw the chosen move AND its SUMMED cross-sheet
@@ -116,6 +132,36 @@ function confForMoveInCell(cell, move) {
 }
 
 // =============================================================================
+// BLAST-RADIUS HELPERS (queen-square carve-out)
+// =============================================================================
+
+// Does this SAN move the queen? (leading 'Q'; castling/promotion never start Q.)
+function isQueenMove(san) {
+  return /^Q/.test(san || '');
+}
+
+// Destination square of a SAN ('a1'..'h8'), or '' if none parseable. Strips
+// check/mate and a promotion suffix so "Qxb7+" -> "b7", "e8=Q" -> "e8".
+function sanDestSquare(san) {
+  if (!san) return '';
+  var m = san.replace(/[+#]/g, '').match(/([a-h][1-8])(?:=[QRBNqrbn])?$/);
+  return m ? m[1] : '';
+}
+
+// High-blast-radius ambiguity: BOTH competing readings move the queen, but to
+// DIFFERENT squares (e.g. 16.W Qe1 vs Qa1, 25.B Qxb7 vs Qxb1). A wrong queen
+// SQUARE seeds a long, individually-legal trajectory that only detonates ~20
+// plies later, behind a wall of already-confirmed moves — irrecoverable by any
+// bounded backtrack. So this near-tie earns a forced stop EVEN on a globally-
+// unreliable pairing (where the gate otherwise suppresses). This is a structural
+// reconstruction signal (which piece, which square), NOT a move-quality judgment.
+function isQueenSquareAmbiguity(move1, move2) {
+  return isQueenMove(move1) && isQueenMove(move2) &&
+         sanDestSquare(move1) !== sanDestSquare(move2) &&
+         sanDestSquare(move1) !== '' && sanDestSquare(move2) !== '';
+}
+
+// =============================================================================
 // SINGLE PLY MERGE
 // =============================================================================
 
@@ -128,9 +174,14 @@ function confForMoveInCell(cell, move) {
  * @param {Object|null} cell2 - OCR cell from sheet 2
  * @param {number} num - Move number
  * @param {string} color - 'w' or 'b'
+ * @param {boolean} [sheetsReliable=true] - False when the two sheets' global
+ *   top-1 agreement is below AMBIGUITY_MIN_SHEET_AGREEMENT (one sheet is
+ *   unreliable). Suppresses the forced-stop ambiguity branch; the merge still
+ *   commits the higher summed-confidence pick and keeps both readings in alts.
  * @returns {Object} Merged cell in standard OCR format
  */
-function mergePly(cell1, cell2, num, color) {
+function mergePly(cell1, cell2, num, color, sheetsReliable) {
+  if (sheetsReliable === undefined) sheetsReliable = true;
   // Only one sheet has data
   if (!cell1 && !cell2) return null;
   if (!cell1) return Object.assign({}, cell2, { _sheet2Move: cell2.move, _sheetCount: 1 });
@@ -281,7 +332,24 @@ function mergePly(cell1, cell2, num, color) {
   // Floor: don't force a stop on a disagreement between two weak readings —
   // that's a bad cell, not a genuine "two strong opinions" tie.
   var _bothNotNoise = Math.max(cell1.confidence || 0, cell2.confidence || 0) >= AMBIGUITY_MIN_CONFIDENCE;
-  if (!agree && _nearTie && _topIsSheetPick && _bothNotNoise) {
+  // sheetsReliable gate: on a globally-unreliable pairing the second sheet's
+  // confident-but-wrong readings manufacture fake near-ties everywhere. Skip the
+  // forced stop and fall through to the ordinary higher-confidence pick below;
+  // legality validation still catches illegal picks. See AMBIGUITY_MIN_SHEET_*.
+  var _queenSquareAmbiguity = isQueenSquareAmbiguity(cell1.move, cell2.move);
+  // Ordinary near-tie ambiguity: a coin-flip disagreement. Worth a stop on a
+  // reliable pairing, OR for a queen-square disagreement even on an unreliable one.
+  var _nearTieStop = _nearTie && _bothNotNoise && (sheetsReliable || _queenSquareAmbiguity);
+  // Queen-square disagreement at ANY margin. The cost of silently committing the
+  // WRONG queen square is the same whether the gap is 0.04 or 0.30 — it seeds an
+  // unrecoverable 20-ply cascade either way — so the near-tie gate is wrong here.
+  // Require only that the LOSING queen square is itself credible (above the floor),
+  // not that it's a coin flip. This makes the safety net robust to OCR-preprocessing
+  // confidence drift (e.g. removing the leading grid line shifts every BiLSTM/CTC
+  // score globally) that would otherwise widen the gap and silently un-flag it.
+  var _queenSquareStop = _queenSquareAmbiguity &&
+      Math.min(_top1Summed, _top2Summed) >= AMBIGUITY_MIN_CONFIDENCE;
+  if (!agree && _topIsSheetPick && (_nearTieStop || _queenSquareStop)) {
     // Default to the higher SUMMED reading (consensus), consistent with the
     // disagree pick + near-tie above. _top1Summed/_top2Summed (computed for the
     // near-tie) are cell1.move and cell2.move summed across both sheets.
@@ -389,6 +457,28 @@ function mergeSheets(sheet1Moves, sheet2Moves) {
   var idx1 = indexByPly(sheet1Moves);
   var idx2 = indexByPly(sheet2Moves);
 
+  // Global sheet-reliability: over plies where BOTH sheets have data, how often
+  // do their top-1 moves agree? A low rate means one sheet is unreliable (e.g.
+  // mis-gridded), so its disagreements shouldn't be promoted to forced user
+  // arbitration. Gates the per-ply forced-stop branch in mergePly.
+  var _bothPresent = 0, _topAgree = 0;
+  Object.keys(idx1).forEach(function(k) {
+    if (!idx2[k]) return;
+    _bothPresent++;
+    if (normalizeSanForComparison(idx1[k].move) === normalizeSanForComparison(idx2[k].move)) {
+      _topAgree++;
+    }
+  });
+  var _agreementRate = _bothPresent > 0 ? _topAgree / _bothPresent : 1;
+  var sheetsReliable = !(_bothPresent >= AMBIGUITY_MIN_SHEET_SAMPLE &&
+                         _agreementRate < AMBIGUITY_MIN_SHEET_AGREEMENT);
+  if (!sheetsReliable && typeof console !== 'undefined') {
+    console.log('[MERGE] low sheet agreement ' +
+      (_topAgree) + '/' + _bothPresent + ' (' + Math.round(_agreementRate * 100) +
+      '% < ' + Math.round(AMBIGUITY_MIN_SHEET_AGREEMENT * 100) +
+      '%) — second sheet unreliable, suppressing forced ambiguity stops');
+  }
+
   // Collect all unique (num, color) keys
   var allKeys = {};
   Object.keys(idx1).forEach(function(k) { allKeys[k] = true; });
@@ -408,7 +498,7 @@ function mergeSheets(sheet1Moves, sheet2Moves) {
     var parts = key.split('_');
     var num = parseInt(parts[0]);
     var color = parts[1];
-    var cell = mergePly(idx1[key] || null, idx2[key] || null, num, color);
+    var cell = mergePly(idx1[key] || null, idx2[key] || null, num, color, sheetsReliable);
     if (cell) merged.push(cell);
   });
 

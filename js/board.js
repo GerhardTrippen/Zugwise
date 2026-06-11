@@ -559,6 +559,40 @@ function finalizeBoardMove(san,from,to){
     };
     selectFix(fix,null);
     applyFix();
+  }else if(window.VerificationUI&&typeof window.VerificationUI.isActive==='function'&&window.VerificationUI.isActive()){
+    // In Greedy/Beam/Dijkstra review: route a board move through the patched
+    // selectFix/applyFix (→ VerificationUI._requeueAndExit) so it overrides
+    // the algorithm's suggestion, requeues from this ply, and exits review
+    // cleanly. Do NOT depend on state.stuckPly here: _focusFix sets it
+    // asynchronously and revalidate()/fetchFixes can transiently clear it
+    // during the await window, in which case the old stuckPly!==null branch
+    // below silently dropped the move (no override recorded, review never
+    // exited, change lost). Derive the override ply from state.currentPly,
+    // which goToPly always sets to the displayed ply (= the move just made).
+    var rPly=state.currentPly;
+    var rNum=Math.floor(rPly/2)+1;
+    var rColor=rPly%2===0?'w':'b';
+    var rOcr='';
+    for(var ri=0;ri<state.moves.length;ri++){
+      if(state.moves[ri].num===rNum){
+        var rm=state.moves[ri];
+        rOcr=rColor==='w'?(rm.wOriginal||rm.white||''):(rm.bOriginal||rm.black||'');
+        break;
+      }
+    }
+    var fix={
+      san:san,
+      ocr:rOcr,
+      similarity:0,
+      ply_str:rNum+'.'+rColor.toUpperCase(),
+      ply:rPly,
+      from_square:from,
+      to_square:to,
+      ocr_from_square:state.errorArrow?state.errorArrow.from:null,
+      ocr_to_square:state.errorArrow?state.errorArrow.to:null
+    };
+    selectFix(fix,null);
+    applyFix();
   }else if(state.stuckPly!==null){
     // Check if a fix suggestion is selected that targets a DIFFERENT ply than stuckPly
     // (e.g., user selected "25.W Rxe1 -> Kxe1" while stuck at 26.B)

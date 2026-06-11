@@ -186,7 +186,15 @@ function buildSearchOcrMoves(paired) {
   // Carry the same forced_stop signal the interactive validator uses, so the
   // search worker can stop/defer at dual-sheet ambiguities and very-low-
   // confidence reads (see search-worker.js / play_until_absurd_or_stuck).
-  var _ambig = state.ambiguousPlies || [];
+  // Derive from getAmbiguousPlies() (live state.ocrCells._ambiguous flags) —
+  // the SAME source validation.js + ui.js read — NOT the vestigial
+  // state.ambiguousPlies cache. That cache is set from _pendingAmbiguousPlies
+  // only on the dual-sheet merge path and is never cleared on a single-sheet
+  // load, so reading it here force-stopped the search at stale near-tie plies
+  // from a PRIOR dual-sheet game — surfacing no-op "f6 -> f6" fixes and bogus
+  // "sheets disagree" review steps on 0.999-confidence single-sheet cells.
+  var _ambig = (typeof getAmbiguousPlies === 'function')
+    ? getAmbiguousPlies() : (state.ambiguousPlies || []);
   var _LOW = (typeof window !== 'undefined' && window.FORCED_STOP_MIN_CONFIDENCE) || 0.50;
   source.forEach(function(m) {
     if (m.white) {
@@ -819,19 +827,46 @@ function runAllSearches() {
 // CANCEL
 // =============================================================================
 
+// In batch mode the panels are driven by the orchestrator's per-game
+// SearchManager instances (via BatchPanelBridge), NOT the UI singleton. So a
+// panel Cancel click must reach the orchestrator's run for the OPEN game, not
+// window.searchManager (which is idle in batch). Returns true if it routed the
+// cancel to the orchestrator; false to fall through to the singleton path used
+// in single/dual mode. The orchestrator keeps the cancelled method's partial
+// and surfaces it for Review — same outcome as cancelling Greedy in single mode.
+function _cancelBatchBoundMethod(method) {
+  try {
+    var bs = window.BatchGameList && window.BatchGameList.batchState;
+    if (!bs || !bs.active) return false;  // not in batch — use the singleton
+    var bridge = window.BatchPanelBridge;
+    var gid = bridge && typeof bridge.getBoundGameId === 'function'
+      ? bridge.getBoundGameId() : null;
+    if (!gid) return false;
+    var orch = bs.reconstructQueue;
+    if (!orch || typeof orch.cancelGameKeepPartial !== 'function') return false;
+    orch.cancelGameKeepPartial(gid, method);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 function cancelSearch() {
   if (window.searchManager) window.searchManager.cancel();
 }
 
 function cancelGreedySearch() {
+  if (_cancelBatchBoundMethod('greedy')) return;
   if (window.searchManager) window.searchManager.cancelMethod('greedy');
 }
 
 function cancelBeamSearch() {
+  if (_cancelBatchBoundMethod('beam')) return;
   if (window.searchManager) window.searchManager.cancelMethod('beam');
 }
 
 function cancelDijkstraSearch() {
+  if (_cancelBatchBoundMethod('dijkstra')) return;
   if (window.searchManager) window.searchManager.cancelMethod('dijkstra');
 }
 

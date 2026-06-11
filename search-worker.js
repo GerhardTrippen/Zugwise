@@ -150,6 +150,14 @@ async function createSearchState(ocrMoves, method, options, lockedPlies, tier1Ag
     const maxBacktrack = (options && options.max_backtrack != null)
         ? (options.max_backtrack | 0)
         : 5;
+    // Forced-stop confidence floor — mirrors the interactive "Uncertain-move
+    // review threshold" setting (validation.js FORCED_STOP_MIN_CONFIDENCE).
+    // Caller (search-manager) resolves it from UI settings and passes it here;
+    // fallback 0.50 matches the UI default. Used for the BATCH path where raw
+    // merged cells arrive without a pre-stamped forced_stop flag.
+    const lowConfFloor = (options && options.low_conf_floor != null)
+        ? Number(options.low_conf_floor)
+        : 0.50;
     // Normalize lockedPlies to a JSON-safe integer array; used to seed
     // fixed_plies so streaming greedy never touches user-confirmed moves.
     const lockedArr = Array.isArray(lockedPlies)
@@ -202,12 +210,13 @@ for _entry in _search_ocr_data_${stateId}:
     # The trigger arrives one of three ways: an explicit 'forced_stop' flag
     # (interactive payload, stamped by beam.js buildSearchOcrMoves), the merge's
     # '_ambiguous' flag (BATCH passes raw merged cells straight through), or a
-    # very-low-confidence top read. The 0.50 floor mirrors
-    # FORCED_STOP_MIN_CONFIDENCE (validation.js). This is the BATCH fallback:
-    # interactive launches pre-stamp 'forced_stop' via beam.js using the same
-    # window threshold, so batch raw cells (no flag) still get caught here.
+    # very-low-confidence top read. The floor mirrors
+    # FORCED_STOP_MIN_CONFIDENCE (validation.js) and is resolved from the user's
+    # "Uncertain-move review threshold" setting by search-manager. This is the
+    # BATCH fallback: interactive launches pre-stamp 'forced_stop' via beam.js
+    # using the same threshold, so batch raw cells (no flag) still get caught.
     _is_forced = (_entry.get('forced_stop') or _entry.get('_ambiguous')
-                  or (_conf < 0.50))
+                  or (_conf < ${lowConfFloor}))
     if _is_forced and len(set(_c[0] for _c in _candidates if _c[0])) >= 2:
         _forced_stop_plies_${stateId}.add(_ply)
     _lenient_cands = []

@@ -1230,8 +1230,10 @@ var VerificationUI = (function() {
       try {
         if (typeof Chess === 'function' && state.sans && state.sans.length >= saved.stuckPly) {
           var _sc = new Chess();
-          for (var _si = 0; _si < saved.stuckPly; _si++) { _sc.move(state.sans[_si]); }
-          var _smo = _sc.move(skipMove);
+          for (var _si = 0; _si < saved.stuckPly; _si++) { _sc.move(state.sans[_si], { sloppy: true }); }
+          // Sloppy: chess.js strict rejects "Rf4" for capture "Rxf4", leaving
+          // the chip showing the stripped OCR text. Sloppy recovers "Rxf4".
+          var _smo = _sc.move(skipMove, { sloppy: true });
           if (_smo && _smo.san && _smo.san.replace(/[+#x]/g, '') === skipMove.replace(/[+#x]/g, '')) {
             skipMove = _smo.san;
           }
@@ -1325,8 +1327,11 @@ var VerificationUI = (function() {
     try {
       if (typeof Chess === 'function' && state.sans && state.sans.length >= ply) {
         var tempChess = new Chess();
-        for (var j = 0; j < ply; j++) { tempChess.move(state.sans[j]); }
-        var moveObj = tempChess.move(move);
+        for (var j = 0; j < ply; j++) { tempChess.move(state.sans[j], { sloppy: true }); }
+        // Sloppy parse: chess.js strict mode rejects a capture written without
+        // "x" (rejects "Rf4" for "Rxf4"), which left moveObj null and showed
+        // the stripped OCR text. Sloppy yields the canonical SAN ("Rxf4").
+        var moveObj = tempChess.move(move, { sloppy: true });
         if (moveObj) {
           fromSq = moveObj.from; toSq = moveObj.to;
           if (moveObj.san && moveObj.san.replace(/[+#x]/g, '') === move.replace(/[+#x]/g, '')) {
@@ -1608,7 +1613,19 @@ var VerificationUI = (function() {
       keepScore: _keepScore,
       keepComponents: _keepComponents,
       keepCharSim: _keepCharSim,
-      keepOcrConf: _keepOcrConf
+      keepOcrConf: _keepOcrConf,
+      // Position-mismatch flag: the worker's per-fix verdict was 'illegal' but
+      // the JS replay (running on greedy's own, possibly-divergent fix chain)
+      // found the move legal and downgraded to 'persistent_absurdity' (see the
+      // "position mismatch?" headline). In this state we CANNOT trust the
+      // replayed position, so the move may well be illegal in the true game
+      // (user-reported: "15.W Rd1" with the king in check still offered "Keep
+      // Rd1" and "Revert to OCR: Rd1"). Suppress both escape hatches so the
+      // user can only pick a real fix / override — keeping or reverting to an
+      // illegal move is never sound. Only the downgraded case sets this; a
+      // worker-reported persistent_absurdity (real absurdity, legal move)
+      // leaves it false and keeps its Keep button.
+      positionMismatch: _isDowngraded
     };
     // Clear prior arrows, then re-derive the red OCR-error arrow by
     // attempting to parse the original OCR text at this position.

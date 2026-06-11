@@ -371,6 +371,14 @@ var BatchNaming = (function() {
         filename: f.name
       };
 
+      // Track where the board number came from. A board read from the
+      // directory path ("Premier/Round 2/Board 6/") is the reliable
+      // playing-hall number (it matches what's written on the scoresheet);
+      // a board read from a filename token ("b1.jpg") may be a local stub.
+      // attachPairings() uses this to decide whether the tournament file's
+      // board number is allowed to override it.
+      meta.boardFromDirectory = (fnMeta.board == null && dirMeta.board != null);
+
       if (meta.round === null || meta.board === null) {
         unmatched.push(f);
         return;
@@ -391,6 +399,7 @@ var BatchNaming = (function() {
           section: meta.section,
           round: meta.round,
           board: meta.board,
+          boardFromDirectory: meta.boardFromDirectory,
           files: []
         });
       }

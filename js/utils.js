@@ -239,10 +239,66 @@ async function findUnsplitMidpoint(file, pageIndex) {
 
     if (!result || result.failureReason) {
       var reason = (result && result.failureReason) || 'no result';
-      if (window.GRID_VERBOSE_LOG) {
-        console.log('[GridUnsplit] ' + reason + ' — falling back to ink-valley split');
+
+      // The anchor path mis-grouped the columns (skewed/noisy photo). Try the
+      // fallbacks in order of robustness before the ink-valley split (which on
+      // a badly-centered photo picks a within-sheet valley and lops a column).
+      // Decision traces are captured (returned as seamTrace) so the testbed and
+      // Grid Debug panel can show WHY each accepted/rejected — this runs only on
+      // the anchor-failure path, so the logging is low-volume.
+      var seamTrace = [];
+      if (result && Array.isArray(result.colXs)) {
+        seamTrace.push('detectMidpoint 2D-validated columns X=[' + result.colXs.join(', ')
+          + '] (these passed row-structure checks; noise rarely does)');
       }
-      return { midpoint: null, failureReason: reason };
+      if (result && result.colDetail) {
+        seamTrace.push('  per-column CC detail (x(#cc,heightspan)): ' + result.colDetail
+          + ' — a real number column ≈ rowCount CCs spanning most of the sheet height');
+      }
+      var seamCollect = function(msg) { seamTrace.push(msg); console.log('[GridUnsplit] ' + msg); };
+
+      function recovered(seam, method, label) {
+        console.log('[GridUnsplit] anchor path failed (' + reason + ') — recovered via '
+                    + label + ' at x=' + seam.seamX);
+        // No per-half anchors: with a correct seam, all columns are cleanly
+        // visible in each half, so normal per-half detection succeeds.
+        return {
+          midpoint: seam.seamX,
+          leftHalfAnchorXs: null,
+          rightHalfAnchorXs: null,
+          inferredLeftColumn: false,
+          seamMethod: method,
+          seamTrace: seamTrace,
+          failureReason: null
+        };
+      }
+
+      // 1) Printed-grid seam — most robust (invariant to lighting gradient and
+      //    faint pencil; keys on the printed table grid, not ink density).
+      if (window.GridUnsplit.detectSeamByGrid) {
+        var gridSeam = window.GridUnsplit.detectSeamByGrid(srcMat, seamCollect);
+        if (gridSeam && gridSeam.confident && gridSeam.seamX !== null) {
+          return recovered(gridSeam, 'grid-seam', 'printed-grid seam');
+        }
+      } else {
+        seamTrace.push('detectSeamByGrid NOT loaded — grid-unsplit.js is stale '
+          + '(service-worker cache?). Hard-reload / clear cache.');
+        console.warn('[GridUnsplit] ' + seamTrace[seamTrace.length - 1]);
+      }
+
+      // 2) Column-count seam — two copies of the same sheet have N+N evenly-
+      //    spaced columns; the seam is the gap that splits them N|N.
+      if (window.GridUnsplit.detectSeamByColumns) {
+        var perSideCols = (pageProfile.format === '3col') ? 3 : 2;
+        var seam = window.GridUnsplit.detectSeamByColumns(srcMat, perSideCols, perSideCols, seamCollect);
+        if (seam && seam.confident && seam.seamX !== null) {
+          return recovered(seam, '6col-peak', '6-column-peak seam');
+        }
+      }
+
+      console.log('[GridUnsplit] ' + reason + ' — grid/column seam did not recover; '
+                  + 'falling back to ink-valley split');
+      return { midpoint: null, failureReason: reason, seamTrace: seamTrace };
     }
 
     if (window.GRID_VERBOSE_LOG) {

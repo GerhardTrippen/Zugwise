@@ -93,7 +93,7 @@ var BatchExport = (function() {
 
     // Always include Source if not already added above.
     if (!hdrs.Source) {
-      lines.push('[Source "Zugwise (gerhardtrippen.github.io/zugwise)"]');
+      lines.push('[Source "Zugwise (gerhardtrippen.github.io/Zugwise)"]');
     }
 
     lines.push('');
@@ -753,7 +753,7 @@ var BatchExport = (function() {
       White: (p && p.whiteName) || '?',
       Black: (p && p.blackName) || '?',
       Result: (p && p.result) || '*',
-      Source: 'Zugwise (gerhardtrippen.github.io/zugwise)'
+      Source: 'Zugwise (gerhardtrippen.github.io/Zugwise)'
     };
     if (game.section) h.Section = game.section;
     if (p && p.whiteRtg) h.WhiteElo = String(p.whiteRtg);

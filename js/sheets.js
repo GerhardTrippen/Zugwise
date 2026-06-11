@@ -1792,6 +1792,15 @@ async function processAllSheets() {
     state.ocrCells = moves;
     state.ocrCellsSheet1 = null;
     state.ocrCellsSheet2 = null;
+    // Drop the dual-sheet ambiguity cache — single-sheet has no merge, so no
+    // cell can be _ambiguous. These are only set on the dual-sheet merge path
+    // (mergePlayerMoves) and were never reset here, so a prior dual-sheet game
+    // left near-tie plies in state.ambiguousPlies / _pendingAmbiguousPlies.
+    // getAmbiguousPlies() already ignores the cache (derives live from
+    // ocrCells), so this is defense-in-depth against any direct reader and
+    // stops showOcrResults re-seeding state.ambiguousPlies from the pending.
+    state.ambiguousPlies = [];
+    state._pendingAmbiguousPlies = [];
     // Drop the dual-sheet tier-summary banner if it survived from a prior
     // dual-sheet pass — single-sheet has no merge tiers to display.
     var leftoverTierBanner = document.getElementById('tier-summary-banner');

@@ -1679,8 +1679,13 @@ function extractCellsDirect(srcMat, colR, rowCount, format, log) {
         var isLastGroup = (g === numGroups - 1);
         var moveOffset = g * rowCount;
         var lastPairIdx = Math.max(0, numGroups - 2);
+        // Index of this column's bottom row — its cell's printed rule may be
+        // clipped at the bottom (cell extends past the ruled area). Top row (i=0)
+        // is symmetric. Used to relax the edge-to-edge test in cleanCell.
+        var lastRowIdx = Math.min(rowCount, yBoundsG.length - 1) - 1;
 
         for (var i = 0; i < rowCount && i < yBoundsG.length - 1; i++) {
+            var edgeMode = (i === 0) ? 'topcell' : (i === lastRowIdx ? 'bottomcell' : 'interior');
             // X-boundaries — from the robust per-column boundary LINES, so the
             // white cell starts at the same X whether the move number is one or
             // two digits and whatever its alignment, and a stray mis-merged CC
@@ -1767,7 +1772,7 @@ function extractCellsDirect(srcMat, colR, rowCount, format, log) {
                     bbox: {x: Math.round(xLeft), y: Math.round(yTopLeft),
                            width: Math.round(xMid - xLeft), height: Math.round(yBotLeft - yTopLeft)},
                     corners: {TL: wTL, TR: wTR, BR: wBR, BL: wBL},
-                    image: wCell
+                    image: wCell, edgeMode: edgeMode
                 });
             }
 
@@ -1784,7 +1789,7 @@ function extractCellsDirect(srcMat, colR, rowCount, format, log) {
                     bbox: {x: Math.round(xMid), y: Math.round(yTopMid),
                            width: Math.round(xRight - xMid), height: Math.round(yBotRight - yTopMid)},
                     corners: {TL: bTL, TR: bTR, BR: bBR, BL: bBL},
-                    image: bCell
+                    image: bCell, edgeMode: edgeMode
                 });
             }
         }
@@ -1817,23 +1822,48 @@ function miniWarp(srcMat, TL, TR, BR, BL, dstW, dstH) {
 }
 
 /**
- * Clean a cell image: remove full-height vertical grid lines.
- * 
- * Vertical grid lines span the full cell height — no handwritten stroke does.
- * Morphological open with a tall narrow kernel isolates only those structures,
- * then we paint them as white (background), leaving handwriting untouched.
+ * Clean a cell image: remove the LEFT printed vertical grid rule.
+ *
+ * The recurring OCR corruption ("|a5"→Ng6) comes from the printed rule at the
+ * cell's left boundary being read as a leading stroke. A vertical grid rule is
+ * dead straight and spans (nearly) the full cell height — a handwritten stroke
+ * wobbles and breaks under a 1px-wide vertical open. We isolate such structures
+ * with a tall narrow morphological open, then act ONLY on the leftmost line
+ * inside a left-edge band and paint just its pixels white.
+ *
+ * The left-band restriction is the safety lever: a tall, fairly straight letter
+ * stroke (left bar of N/R/K/B/h/b/d) mid-cell would otherwise survive the same
+ * open and get erased. Confining removal to the leftmost band leaves real
+ * letters alone, and painting (not cropping) preserves writing on BOTH sides of
+ * the rule — players sometimes cross it, and there is often no gap to its right.
  *
  * @param {cv.Mat} cellImg - Cell image (RGBA or grayscale)
- * @param {number} [minLineFrac=0.75] - Min fraction of cell height for line detection
+ * @param {number} [minLineFrac=0.5] - Min straight-run length (fraction of cell
+ *        height) for a column to be a CANDIDATE. Just a straightness floor now —
+ *        the decisive gate is edge-to-edge continuity below. A height threshold
+ *        alone can't separate a rule from a tall straight letter stem (B/h/R/K).
+ * @param {number} [leftBandFrac=0.15] - Only consider lines whose x < this fraction
+ *        of width. A tall straight letter stroke (e.g. h) sitting off the left edge
+ *        falls outside the band and is spared.
+ * @param {number} [edgeTolFrac=0.03] - A printed rule is CONTINUOUS top to bottom,
+ *        so the chosen column must have ink within edgeTolFrac*height of BOTH the
+ *        top and bottom cell edge. A floating letter stem (margins top/bottom) fails
+ *        this and is spared. This is the primary discriminator (tighter = stricter;
+ *        must stay >= the mini-warp's vertical clipping, ~1-2px).
+ * @param {string} [edgeMode='interior'] - 'interior' requires BOTH edges (strict).
+ *        For the TOPMOST cell ('topcell') the rule may be clipped at the top (cell
+ *        extends above the ruled area), so the top edge is relaxed; for the BOTTOMMOST
+ *        cell ('bottomcell') the bottom edge is relaxed. The relaxed edge still
+ *        requires a long line (reaches ~70% toward that edge), just not the border.
  * @returns {cv.Mat} - Cleaned cell image (caller must delete original if not needed)
  */
 
-function cleanCell(cellImg, minLineFrac) {
+function cleanCell(cellImg, minLineFrac, leftBandFrac, edgeTolFrac, edgeMode) {
     if (!cellImg || cellImg.empty()) return cellImg;
     var ch = cellImg.rows, cw = cellImg.cols;
     if (ch < 10 || cw < 10) return cellImg;
 
-    var frac = minLineFrac || 0.75;
+    var frac = minLineFrac || 0.5;
     var kernelH = Math.max(7, Math.round(ch * frac));
 
     // Convert to grayscale for line detection
@@ -1864,24 +1894,72 @@ function cleanCell(cellImg, minLineFrac) {
     dilateK.delete();
     lineMask.delete();
 
-    // Check if any lines were found
-    var hasLines = false;
-    for (var y = 0; y < ch && !hasLines; y++) {
-        for (var x = 0; x < cw && !hasLines; x++) {
-            if (dilated.ucharAt(y, x) > 128) hasLines = true;
+    // --- Restrict to the LEFT band; require edge-to-edge continuity ---
+    // Per-column count of line-mask pixels. A column threshold avoids reacting to
+    // stray dilation noise.
+    var band = leftBandFrac || 0.15;
+    var bandW = Math.max(1, Math.round(cw * band));
+    var lineColThresh = kernelH * 0.6;
+    var edgeTol = Math.max(2, Math.round(ch * (edgeTolFrac || 0.03)));
+    var relaxTol = Math.max(edgeTol, Math.round(ch * 0.30));  // loose edge for top/bottom cells
+    var mode = edgeMode || 'interior';
+    var maxLineW = Math.max(3, Math.round(cw * 0.08));
+
+    var colCount = new Int32Array(cw);
+    for (var lx = 0; lx < cw; lx++) {
+        var cnt = 0;
+        for (var ly = 0; ly < ch; ly++) {
+            if (dilated.ucharAt(ly, lx) > 128) cnt++;
         }
+        colCount[lx] = cnt;
     }
 
-    if (!hasLines) {
+    // Walk the left band left->right. A printed rule runs CONTINUOUS top to bottom,
+    // so the chosen column group must have ink within edgeTol of BOTH the top and
+    // the bottom cell edge. A floating letter stem (margins top/bottom) fails this
+    // and is SKIPPED — a stray tick at the far left can't mask a real rule just to
+    // its right. We remove the leftmost group that passes.
+    var startX = -1, endX = -1;
+    for (var gx = 0; gx < bandW && gx < cw; gx++) {
+        if (colCount[gx] < lineColThresh) continue;
+        // Candidate group [gx..ex] — contiguous strong columns (the rule's width).
+        var ex = gx;
+        while (ex + 1 < cw && (ex - gx + 1) < maxLineW
+               && colCount[ex + 1] >= lineColThresh * 0.5) {
+            ex++;
+        }
+        // Edge-to-edge test: topmost / bottommost set row across the group.
+        var minRow = ch, maxRow = -1;
+        for (var ry = 0; ry < ch; ry++) {
+            var hit = false;
+            for (var rx = gx; rx <= ex && !hit; rx++) {
+                if (dilated.ucharAt(ry, rx) > 128) hit = true;
+            }
+            if (hit) { if (ry < minRow) minRow = ry; maxRow = ry; }
+        }
+        var topOK = (minRow <= edgeTol);
+        var botOK = (maxRow >= ch - 1 - edgeTol);
+        // Top/bottom cells: relax the OUTER edge (the rule is clipped there) but
+        // still require the line to run most of the way toward it.
+        if (mode === 'topcell')         topOK = (minRow <= relaxTol);
+        else if (mode === 'bottomcell') botOK = (maxRow >= ch - 1 - relaxTol);
+        if (topOK && botOK) {
+            startX = gx; endX = ex; break;   // leftmost continuous top-to-bottom rule
+        }
+        gx = ex;  // not edge-to-edge: skip this group, keep looking rightward in band
+    }
+
+    if (startX < 0) {
         dilated.delete();
-        return cellImg;
+        return cellImg;  // no continuous top-to-bottom rule in the left band
     }
 
-    // Paint detected line pixels as white in the original image
+    // Paint ONLY the chosen rule's pixels white. Writing to the left (a player
+    // crossing the rule) and to the right (no-gap writing) survives.
     var cleaned = cellImg.clone();
     var numChannels = cleaned.channels();
     for (var cy = 0; cy < ch; cy++) {
-        for (var cx = 0; cx < cw; cx++) {
+        for (var cx = startX; cx <= endX; cx++) {
             if (dilated.ucharAt(cy, cx) > 128) {
                 if (numChannels === 1) {
                     cleaned.ucharPtr(cy, cx)[0] = 255;
@@ -1911,13 +1989,12 @@ function cleanCell(cellImg, minLineFrac) {
 //    -> Consider: with per-cell mini-warps, the tail from row N is captured in
 //      row N's cell (good), but may also appear in row N+1's cell (needs cleanup).
 //
-// 2. VERTICAL LINE REMOVAL (cleanCell above):
-//    Call cleanCell() on each extracted cell to remove printed vertical grid lines.
-//    The BiLSTM may interpret vertical lines as K, N, B, or R.
-//    -> Wire into extractCellsDirect: replace `image: wCell` with 
-//      `image: cleanCell(wCell)` and delete the pre-cleaned version.
-//    -> In production: make this optional via a setting (some sheets have no 
-//      vertical lines, and the morphological op has a small cost).
+// 2. VERTICAL LINE REMOVAL (cleanCell above):  [DONE — wired in at OCR boundary]
+//    cleanCell() runs transiently on each cell's image just before CTC OCR in
+//    opencv_image_processor.js (gated by clean_vertical_lines setting, default
+//    on), using the cell's edgeMode tag set here. The cell's stored .image stays
+//    RAW so the user-facing preview shows the original (no white gap). The BiLSTM
+//    otherwise reads the rule as a leading K/N/B/R ("|a5"→Ng6).
 //
 // 3. ANCHOR CC CLEANUP:
 //    Some anchor bounding boxes include parts of handwriting that overlap
@@ -3447,6 +3524,9 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
     }
 
     // === Direct cell extraction (no global warp) ===
+    // Cells carry RAW images (+ an edgeMode tag); the printed left vertical rule
+    // is removed transiently at the OCR boundary (opencv_image_processor.js) so
+    // the user-facing preview still shows the original. See cleanCell().
     log('\n[Direct] Extracting cells from original image (no global warp)...');
     var cells = extractCellsDirect(srcMat, colR, rowCount, format, log);
     log('  ' + cells.length + ' cells');

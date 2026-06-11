@@ -575,7 +575,7 @@ function trimMovesAtCheckmate(moves){
   return out;
 }
 
-function downloadPGN(){var moves=trimMovesAtCheckmate(state.moves);var pgn='[Event "Zugwise"]\n[Result "*"]\n[Source "Zugwise (gerhardtrippen.github.io/zugwise)"]\n\n';moves.forEach(function(m,i){pgn+=m.num+'. '+m.white+' '+(m.black||'')+' ';if((i+1)%5===0)pgn+='\n';});pgn+='*';var blob=new Blob([pgn],{type:'text/plain'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='game.pgn';a.click();log('📥 Downloaded PGN');}
+function downloadPGN(){var moves=trimMovesAtCheckmate(state.moves);var pgn='[Event "Zugwise"]\n[Result "*"]\n[Source "Zugwise (gerhardtrippen.github.io/Zugwise)"]\n\n';moves.forEach(function(m,i){pgn+=m.num+'. '+m.white+' '+(m.black||'')+' ';if((i+1)%5===0)pgn+='\n';});pgn+='*';var blob=new Blob([pgn],{type:'text/plain'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='game.pgn';a.click();log('📥 Downloaded PGN');}
 
 function openLichess(){var moves=trimMovesAtCheckmate(state.moves);var pgn=moves.map(function(m){return m.num+'. '+m.white+' '+(m.black||'');}).join(' ');window.open('https://lichess.org/paste?pgn='+encodeURIComponent(pgn),'_blank');log('🔗 Opened in Lichess');}
 

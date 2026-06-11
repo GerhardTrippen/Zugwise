@@ -14,7 +14,7 @@ Your images never leave your device. Everything runs locally in your browser.
 
 ## Getting Started
 
-1. **Open Zugwise** at [gerhardtrippen.github.io/zugwise](https://gerhardtrippen.github.io/zugwise)
+1. **Open Zugwise** at [gerhardtrippen.github.io/Zugwise](https://gerhardtrippen.github.io/Zugwise)
 2. Wait for the one-time setup to finish (this loads the handwriting model and chess engine — about 30 seconds on first visit)
 3. You're ready to go
 

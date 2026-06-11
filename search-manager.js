@@ -262,6 +262,23 @@ var SearchManager = (function() {
             }
             opts.max_backtrack = _maxBacktrack;
 
+            // Forced-stop confidence floor. Mirrors the user's "Uncertain-move
+            // review threshold" so the BATCH path (raw merged cells that arrive
+            // without a pre-stamped forced_stop flag) defers on the same weak
+            // reads the interactive validator does. Explicit option wins, then
+            // currentSettings.low_confidence_threshold (a percent), else 0.50.
+            var _lowConfFloor;
+            if (options && options.low_conf_floor != null) {
+                _lowConfFloor = Number(options.low_conf_floor);
+            } else if (typeof window !== 'undefined' &&
+                       window.currentSettings &&
+                       typeof window.currentSettings.low_confidence_threshold === 'number') {
+                _lowConfFloor = window.currentSettings.low_confidence_threshold / 100;
+            } else {
+                _lowConfFloor = 0.50;
+            }
+            opts.low_conf_floor = _lowConfFloor;
+
             // Create search state
             var stateInfo = await worker._send('search-create', {
                 ocrMoves: ocrMoves,

@@ -8,6 +8,11 @@
 //   Beam fails on game K    -->  dijkstra queue enqueues K
 //   Greedy solves K         -->  nothing further runs on K by default
 //
+// Escalation honors the interactive "Auto-Run Searches" toggles
+// (autorun_beam / autorun_dijkstra): a disabled method is skipped, so the
+// chain might be greedy->dijkstra (beam off) or greedy-only (both off).
+// Greedy is the mandatory base and is always enabled. See _enabledMethods().
+//
 // All three per-method queues process sequentially within themselves but in
 // parallel across methods — i.e., greedy can be on game 20 while beam is on
 // game 3 and dijkstra is on game 1, each from their own SearchManager
@@ -70,6 +75,18 @@ var BatchReconstructOrchestrator = (function() {
     // { speculative: false } to restore strict escalation-only behavior.
     this.speculative = options.speculative !== false;
 
+    // Auto-escalation method gating. Mirrors the interactive "Auto-Run
+    // Searches" toggles so batch and interactive agree on which algorithms
+    // run: autorun_beam / autorun_dijkstra off stops the queue from ever
+    // escalating to that method (notably Dijkstra, whose runtime is unbounded
+    // — see CLAUDE.md). Greedy is the mandatory base (batch can't reconstruct
+    // without it) and is always enabled. Resolved live from currentSettings
+    // at each escalation (_enabledMethods) so a mid-session toggle takes
+    // effect; an explicit options.enabledMethods array overrides for tests.
+    this._enabledOverride = Array.isArray(options.enabledMethods)
+        ? options.enabledMethods.slice()
+        : null;
+
     // Original ocrResult per gameId, retained so escalation queues run from
     // the same raw input rather than from Greedy's partially-fixed moves.
     this._ocrByGame = {};
@@ -77,6 +94,13 @@ var BatchReconstructOrchestrator = (function() {
     // edits a fix during review. Escalation after a requeue must use the
     // overridden moves, not the stale raw OCR.
     this._overrideByGame = {};
+    // Games where the user pressed the panel Cancel button (cancelGameKeepPartial).
+    // The cancelled method's PARTIAL is kept and surfaced for review, but
+    // auto-escalation to the next method is suppressed — matching single-mode
+    // behavior where cancelling Greedy stops there and waits for the user
+    // rather than silently spinning up Beam/Dijkstra. Cleared on enqueue/requeue
+    // so a later fresh run for the same game behaves normally again.
+    this._escalationSuppressed = {};
     // Aggregated per-game results: gameId -> {results: {greedy,beam,dijkstra},
     //                                         triage, picked, methodStatus}
     this.results = {};
@@ -152,6 +176,9 @@ var BatchReconstructOrchestrator = (function() {
     this._ocrByGame[gameId] = ocrResult;
     // A fresh enqueue supersedes any earlier override.
     delete this._overrideByGame[gameId];
+    // A fresh enqueue restarts the full pipeline — any prior user cancel no
+    // longer applies, so re-enable auto-escalation for this game.
+    delete this._escalationSuppressed[gameId];
 
     // DEFENSIVE NOISE GATE — refuse to enqueue games with trailing noise.
     // BatchGameList.onGameComplete is supposed to gate this via _hasTrailingNoise
@@ -509,6 +536,9 @@ var BatchReconstructOrchestrator = (function() {
       fromPly: fromPly || 0
     };
     this.results[gameId] = _freshAggregate('queued');
+    // A user edit re-runs the pipeline from scratch — any earlier panel-Cancel
+    // suppression no longer applies, so auto-escalation is back on.
+    delete this._escalationSuppressed[gameId];
 
     // Kill every in-flight run for this game across all three queues. Greedy
     // will be restarted right below via requeue; beam/dijkstra just get
@@ -571,6 +601,36 @@ var BatchReconstructOrchestrator = (function() {
     METHOD_ORDER.forEach(function(m) {
       try { this._queues[m].abortGame(gameId); } catch (e) {}
     }, this);
+  };
+
+  /**
+   * User pressed the per-panel Cancel (✕) button while the game was open in
+   * review. Cancel the given method's in-flight run for this game but KEEP
+   * whatever partial it has produced — the cancelled method's worker rebuilds
+   * a PARTIAL result (Greedy streams its applied fixes, so the partial carries
+   * full review detail) and that flows through onGameComplete → the panel
+   * bridge → handleSearchComplete, surfacing the Review button exactly like a
+   * cancelled Greedy run in single mode.
+   *
+   * Differs from abortGame in two ways:
+   *   1. It targets ONE method (the one whose ✕ was clicked), not all three —
+   *      a sibling Beam/Dijkstra running speculatively is left alone.
+   *   2. It SUPPRESSES auto-escalation for the game, so the kept partial does
+   *      not silently chain to the next method. The user asked to stop here;
+   *      they can still hit a method's ↻ rerun button to escalate manually.
+   *
+   * The cancel itself is delegated to the per-method queue's abortGame, which
+   * fires the underlying SearchManager's cancel → partial-rebuild path. We set
+   * the suppress flag BEFORE that call so the resulting _handleMethodComplete
+   * (microtask later) sees it.
+   */
+  Orchestrator.prototype.cancelGameKeepPartial = function(gameId, method) {
+    if (!gameId) return;
+    method = method || 'greedy';
+    this._escalationSuppressed[gameId] = true;
+    if (this._queues[method]) {
+      try { this._queues[method].abortGame(gameId); } catch (e) {}
+    }
   };
 
   Orchestrator.prototype.resume = function() {
@@ -670,8 +730,9 @@ var BatchReconstructOrchestrator = (function() {
     // (keep-as-is, overrides) as absurd, spinning indefinitely. There is
     // no reconstruction ambiguity to corroborate when the game is valid.
     var willEscalate = this.escalate &&
+        !this._escalationSuppressed[gameId] &&
         !(methodResult && methodResult.status === 'VALID');
-    var next = willEscalate ? _nextMethod(method) : null;
+    var next = willEscalate ? _nextMethod(method, this._enabledMethods()) : null;
     // Per-game escalation guard: only hand the game to `next` if `next` has
     // not already been attempted for THIS game. Without speculation `next` is
     // always 'idle' here (each method runs once, in order), so this is a no-op
@@ -722,11 +783,29 @@ var BatchReconstructOrchestrator = (function() {
     }
   };
 
-  function _nextMethod(method) {
+  function _nextMethod(method, enabled) {
     var idx = METHOD_ORDER.indexOf(method);
-    if (idx < 0 || idx >= METHOD_ORDER.length - 1) return null;
-    return METHOD_ORDER[idx + 1];
+    if (idx < 0) return null;
+    // Walk forward to the next ENABLED method, skipping any the user disabled
+    // via Auto-Run Searches (e.g. greedy -> dijkstra when beam is off).
+    for (var i = idx + 1; i < METHOD_ORDER.length; i++) {
+      if (!enabled || enabled.indexOf(METHOD_ORDER[i]) >= 0) return METHOD_ORDER[i];
+    }
+    return null;
   }
+
+  // Live-resolved set of methods auto-escalation may use. Greedy is always
+  // included (mandatory base); beam/dijkstra mirror the interactive
+  // autorun_beam / autorun_dijkstra toggles, read from currentSettings so a
+  // mid-session change is honored. A constructor override wins (tests).
+  Orchestrator.prototype._enabledMethods = function() {
+    if (Array.isArray(this._enabledOverride)) return this._enabledOverride;
+    var cs = (typeof window !== 'undefined' && window.currentSettings) || null;
+    var em = ['greedy'];
+    if (!cs || cs.autorun_beam !== false) em.push('beam');
+    if (!cs || cs.autorun_dijkstra !== false) em.push('dijkstra');
+    return em;
+  };
 
   /**
    * Beam-only speculative work-ahead. When Beam's queue is idle, hand it the
@@ -754,6 +833,7 @@ var BatchReconstructOrchestrator = (function() {
    */
   Orchestrator.prototype._feedSpeculative = function(method) {
     if (method !== 'beam') return;            // Dijkstra stays escalation-only
+    if (this._enabledMethods().indexOf('beam') < 0) return;  // Beam disabled by setting
     if (!this.speculative || this.cancelled) return;
     var q = this._queues[method];
     if (!q) return;

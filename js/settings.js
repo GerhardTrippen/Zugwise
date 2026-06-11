@@ -16,13 +16,24 @@ var DEFAULT_SETTINGS = {
   enable_quick_fixes: true,      // Layer 1: Try OCR alternatives and similarity swaps
   enable_deep_search: true,      // Layer 2: Backtrack search for fixes (shown for confirmation)
   deep_search_depth: 5,          // Phase 2 depth: how many plies before frontier to search (0=none, 999=full game)
+  // Uncertain-move review: a move whose top OCR confidence is below this
+  // percent forces a mandatory review stop (the 🔍 badge / forced_stop), even
+  // when legal. Read by validation.js getForcedStopMinConfidence(). Lower =
+  // pass more uncertain moves straight through (may bite later); higher =
+  // catch more errors up front but review many more moves.
+  low_confidence_threshold: 50,  // percent (0-100)
   // Auto-fix toggles (when off, fixes are shown as clickable quick fixes instead of auto-applying)
   ocr_autofix: false,            // Auto-apply OCR alternatives (one-or-nothing rule)
   similarity_autofix: false,     // Auto-apply character similarity fixes
   // Auto-run searches on entering interactive mode
   autorun_greedy: true,
   autorun_beam: true,
-  autorun_dijkstra: true
+  autorun_dijkstra: true,
+  // Image preprocessing: remove the printed left vertical grid rule from each
+  // extracted cell before OCR. Defeats the "|a5"→Ng6 corruption where the rule
+  // is read as a leading piece letter. Read by grid-slide.js via the
+  // window.currentSettings mirror.
+  clean_vertical_lines: true
 };
 
 var currentSettings = null;
@@ -91,6 +102,9 @@ function saveSettingsUI() {
     }
   });
   saveSettings(currentSettings);
+  // Refresh the forced-stop floor (and window mirror read by ui.js/beam.js)
+  // so a changed threshold takes effect on the next render without reload.
+  if (typeof getForcedStopMinConfidence === 'function') getForcedStopMinConfidence();
   closeSettings();
   log('Settings saved');
 }

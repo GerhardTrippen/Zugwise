@@ -1636,7 +1636,15 @@ var BatchTournament = (function() {
         // index ("R5B3.jpg" inside U1300) that matchGameToPairing
         // resolved to the actual playing-hall board (44). Carry the
         // original on scanBoard for diagnostics / file-name correlation.
-        if (p.board != null && p.board !== game.board) {
+        //
+        // EXCEPTION: a directory-derived board ("Premier/Round 2/Board 6/")
+        // is the reliable playing-hall number — it's what's written on the
+        // scoresheet. Never let the tournament file override it. This is the
+        // inverse of the U1300 case above: here the FILE numbers a section's
+        // round-robin pairings locally (1-5) while the FOLDERS use the
+        // absolute hall numbers (6-10). Trust the folders. (See CLAUDE.md:
+        // "Trust directory structure".)
+        if (p.board != null && p.board !== game.board && !game.boardFromDirectory) {
           if (game.scanBoard == null) game.scanBoard = game.board;
           game.board = p.board;
         }
@@ -1695,9 +1703,12 @@ var BatchTournament = (function() {
         gamesInRound[i].pairingViaBoardOffset = true;
         // Same adoption as Pass 1: replace scan-folder board with the
         // XLS's actual playing-hall board number, preserving the
-        // original under scanBoard.
+        // original under scanBoard. Same directory-derived carve-out:
+        // a board read from "…/Board 6/" is the real hall number and must
+        // not be overwritten by a section-local pairing index.
         if (availablePairings[i].board != null &&
-            availablePairings[i].board !== gamesInRound[i].board) {
+            availablePairings[i].board !== gamesInRound[i].board &&
+            !gamesInRound[i].boardFromDirectory) {
           if (gamesInRound[i].scanBoard == null) {
             gamesInRound[i].scanBoard = gamesInRound[i].board;
           }
@@ -1755,7 +1766,7 @@ var BatchTournament = (function() {
       White: (pairing && pairing.whiteName) || extra.White || '?',
       Black: (pairing && pairing.blackName) || extra.Black || '?',
       Result: (pairing && pairing.result) || extra.Result || '*',
-      Source: 'Zugwise (gerhardtrippen.github.io/zugwise)'
+      Source: 'Zugwise (gerhardtrippen.github.io/Zugwise)'
     };
 
     if (game.section) headers.Section = game.section;
