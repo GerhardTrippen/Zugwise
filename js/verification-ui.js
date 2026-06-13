@@ -75,6 +75,64 @@ var VerificationUI = (function() {
            state.verification && state.verification.active === true;
   }
 
+  // Per-game operator-action stats, persisted on the batch game record so
+  // the round CSV (batch-export.js) can report measured review effort.
+  // Counts operator ACTIONS taken inside verification mode; work done in
+  // interactive mode after a review exit (edit commits, panel fixes) is not
+  // included, so activeMs is a lower bound on per-game attention.
+  // Lives only as long as batchState — export the CSV before restarting
+  // batch processing or reloading the app.
+  function _reviewStats(gameId) {
+    try {
+      var bgl = window.BatchGameList;
+      if (!bgl || !bgl.batchState || !gameId) return null;
+      var g = bgl.batchState.games.get(gameId);
+      if (!g) return null;
+      if (!g.reviewStats) {
+        g.reviewStats = {
+          confirms: 0,        // algorithm fix accepted as proposed (→ 'fixed')
+          keeps: 0,           // move accepted as written (→ 'locked')
+          overrides: 0,       // user typed a different move (override + requeue)
+          edits: 0,           // review edits launched into interactive edit mode
+          surfacedPlies: [],  // distinct plies the walkthrough presented
+          activeMs: 0,        // wall-clock ms inside verification, all sessions
+          sessions: 0,        // number of verification entries for this game
+          decisions: []       // per-action log — see _logDecision
+        };
+      }
+      return g.reviewStats;
+    } catch (e) { return null; }
+  }
+
+  // Per-decision record, exported as the round decisions CSV
+  // (BatchExport.exportDecisionLogCsv). The per-game counters above lose
+  // WHICH plies were decided and what the choices were; this log keeps the
+  // OCR reading, the algorithm's proposal, and the user's final answer per
+  // action, so OCR-vs-final confusion tables (e.g. a foreign-notation
+  // scoresheet) and decision-latency distributions can be rebuilt offline.
+  // `fix` may be null (no surfaced fix at that ply); finalSan is '' for
+  // edit launches — the committed move lands in the PGN, not here.
+  function _logDecision(v, action, ply, fix, finalSan) {
+    try {
+      if (!v || ply == null) return;
+      var rs = _reviewStats(v.gameId);
+      if (!rs) return;
+      // Stats objects created before this field existed lack the array.
+      if (!Array.isArray(rs.decisions)) rs.decisions = [];
+      rs.decisions.push({
+        ply: ply,
+        action: action,                        // confirm | keep | override | edit
+        ocr: (fix && fix.ocr) || _ocrTextAtPly(ply) || '',
+        proposed: (fix && _fixSan(fix)) || '',
+        finalSan: finalSan || '',
+        method: v.method || '',
+        session: rs.sessions || 0,
+        tSec: v._reviewEnteredMs
+          ? Math.round((Date.now() - v._reviewEnteredMs) / 1000) : null
+      });
+    } catch (e) { /* stats only — never block the user action */ }
+  }
+
   // =========================================================================
   // Enter / Exit
   // =========================================================================
@@ -203,9 +261,44 @@ var VerificationUI = (function() {
     }).filter(function(f) {
       if (f.is_backtrack && typeof f.origin_stuck_ply === 'number' &&
           _lockedForEntry.has(f.origin_stuck_ply)) {
+        // A backtrack fix whose origin_stuck_ply is locked is USUALLY stale —
+        // a prior run proposed repairing an earlier ply to dodge a move the
+        // user has since accepted as-is. BUT there's a legitimate fresh case:
+        // greedy can get STUCK at a locked ply (it can't advance and can't
+        // change the locked move) and correctly backtrack to repair an EARLIER,
+        // unlocked ply. That fix is live, not stale — the picked solution
+        // incorporates it (result.moves carries the new SAN at its ply) and
+        // every downstream fix was computed on top of it.
+        //
+        // Distinguish the two by asking whether the picked solution actually
+        // applies this fix. If it does, KEEP it reviewable: dropping it leaves
+        // the move STAGED on the board by _applyPickedToState but absent from
+        // v.fixes, so it can never be promoted to 'fixed' and silently reverts
+        // to OCR on exit — corrupting the whole reconstruction (downstream
+        // fixes depended on it). Reported: 13.B Qd7 locked, greedy's correct
+        // first fix 12.W Bb3->Qb3 vanished from review and reverted on exit.
+        // Genuinely stale fixes (solution did NOT apply them) are still dropped.
+        var _fp = _fixPly(f);
+        var _fSan = _fixSan(f);
+        var _stagedSan = (_fp != null && picked.result &&
+                          Array.isArray(picked.result.moves))
+          ? picked.result.moves[_fp] : null;
+        var _solutionAppliesFix = !!(_fSan && _stagedSan &&
+          String(_stagedSan).replace(/[+#]$/, '') ===
+          String(_fSan).replace(/[+#]$/, ''));
+        if (_solutionAppliesFix) {
+          if (typeof log === 'function') {
+            log('  ◦ keeping backtrack fix ply=' + f.ply +
+                ' despite locked origin_stuck_ply=' + f.origin_stuck_ply +
+                ' — picked solution applies it (staged ' + _stagedSan +
+                '); it must stay reviewable or it reverts silently on exit');
+          }
+          return true;
+        }
         if (typeof log === 'function') {
           log('  ◦ dropping stale backtrack fix ply=' + f.ply +
-              ' (origin_stuck_ply=' + f.origin_stuck_ply + ' is locked)');
+              ' (origin_stuck_ply=' + f.origin_stuck_ply + ' is locked,' +
+              ' and the picked solution does not apply it)');
         }
         return false;
       }
@@ -221,6 +314,20 @@ var VerificationUI = (function() {
       return false;
     }
     v.overrides = [];
+
+    // Effort instrumentation: session start timestamp (accumulated into
+    // reviewStats.activeMs on exit) + union of surfaced decision plies.
+    v._reviewEnteredMs = Date.now();
+    var _rsEnter = _reviewStats(gameId);
+    if (_rsEnter) {
+      _rsEnter.sessions++;
+      v.fixes.forEach(function(f) {
+        var _sp = _fixPly(f);
+        if (_sp != null && _rsEnter.surfacedPlies.indexOf(_sp) === -1) {
+          _rsEnter.surfacedPlies.push(_sp);
+        }
+      });
+    }
 
     // Resume-at-first-unconfirmed: if the user already walked through some
     // fixes in a prior session on this game (wStatus='fixed' / 'locked' on
@@ -421,6 +528,18 @@ var VerificationUI = (function() {
     var _exitedGameId = v.gameId;
     var _exitedMethodLabel = (typeof _labelForMethod === 'function')
       ? _labelForMethod(v.method) : v.method;
+
+    // Effort instrumentation: bank this session's wall-clock time. Every
+    // exit path (finish, plain exit, override requeue, skip-keep, edit,
+    // confirm-and-save) funnels through here, so this is the single
+    // accumulation point.
+    if (v._reviewEnteredMs && _exitedGameId) {
+      var _rsExit = _reviewStats(_exitedGameId);
+      if (_rsExit) {
+        _rsExit.activeMs += Math.max(0, Date.now() - v._reviewEnteredMs);
+      }
+    }
+    v._reviewEnteredMs = null;
     var _requeueDispatch = null;
     if (clearAndRequeue && _exitedGameId) {
       var rq = (window.BatchGameList && window.BatchGameList.batchState &&
@@ -480,6 +599,9 @@ var VerificationUI = (function() {
       state.missingMoveCandidates = s.missingMoveCandidates || [];
       v._savedState = null;
     }
+    // Clear the per-step Skip-keep context so a stale button never flashes on
+    // the next review entry (it's repopulated by the first _focusFix).
+    v._currentStepStuck = null;
 
     // Undo the global-fn patches before any further interactive code runs.
     _unpatchInteractiveFns();
@@ -1214,23 +1336,31 @@ var VerificationUI = (function() {
     // used by createKeepAsIsButton callers in fixes.js (lines 260, 385,
     // 1902).
     var skipBtn = '';
-    var saved = v._savedState;
-    var savedReason = (saved && saved.stuckInfo) ? saved.stuckInfo.reason : null;
-    var keepEligible = (savedReason === 'bad_trade' ||
-                        savedReason === 'persistent_absurdity' ||
-                        savedReason === 'piece_hanging' ||
-                        savedReason === 'ambiguous');
-    if (keepEligible && typeof saved.stuckPly === 'number' && saved.stuckInfo.move) {
-      var stuckLbl = saved.stuckInfo.num + '.' + saved.stuckInfo.color.toUpperCase();
+    // Track the CURRENT review step's origin stuck move (set per step by
+    // _setupStuckStateForFix), NOT the frozen entry stuck point. At step 1 this
+    // is "14.W Nh2" (the move the focused fix is repairing); at a later step
+    // reviewing 17.W it follows along. When that step's stuck move is illegal
+    // (e.g. 17.W Bh6) the button is hidden \u2014 you cannot keep an illegal move.
+    // Previously it was pinned to the entry stuck (saved.stuckInfo), so it read
+    // a stale "keep 14.W Nh2" on every step and the handler tried to lock the
+    // entry move text at the current ply.
+    var stepStuck = v._currentStepStuck;
+    var stepReason = stepStuck ? stepStuck.reason : null;
+    var keepEligible = (stepReason === 'bad_trade' ||
+                        stepReason === 'persistent_absurdity' ||
+                        stepReason === 'piece_hanging' ||
+                        stepReason === 'ambiguous');
+    if (keepEligible && stepStuck && typeof stepStuck.ply === 'number' && stepStuck.move) {
+      var stuckLbl = stepStuck.lbl;
       // Show the canonical SAN's check/mate marker and capture "x" (OCR
       // "Rf4" for an actual "Rf4+", "Kh5" for an actual "Kxh5") so this chip
       // matches the "Keep Rf4+"/"Keep Kxh5" suggestion button. Same
       // body-unchanged guard as createKeepAsIsButton.
-      var skipMove = saved.stuckInfo.move;
+      var skipMove = stepStuck.move;
       try {
-        if (typeof Chess === 'function' && state.sans && state.sans.length >= saved.stuckPly) {
+        if (typeof Chess === 'function' && state.sans && state.sans.length >= stepStuck.ply) {
           var _sc = new Chess();
-          for (var _si = 0; _si < saved.stuckPly; _si++) { _sc.move(state.sans[_si], { sloppy: true }); }
+          for (var _si = 0; _si < stepStuck.ply; _si++) { _sc.move(state.sans[_si], { sloppy: true }); }
           // Sloppy: chess.js strict rejects "Rf4" for capture "Rxf4", leaving
           // the chip showing the stripped OCR text. Sloppy recovers "Rxf4".
           var _smo = _sc.move(skipMove, { sloppy: true });
@@ -1312,8 +1442,21 @@ var VerificationUI = (function() {
     // left to keep \u2014 return.
     if (state.stuckPly === null || state.stuckPly === undefined) return;
 
-    var lbl = stuckInfo.num + '.' + stuckInfo.color.toUpperCase();
-    var move = stuckInfo.move;
+    // Keep the move the game is NOW stuck on (post-revalidate state.stuckInfo),
+    // NOT the frozen entry move (saved.stuckInfo). Reverting this step's
+    // proposed fix on the way out re-sticks the game at the move the fix was
+    // repairing \u2014 that's the move the Skip button offered to keep. Using the
+    // entry move text at the current ply was the bug (locked "Nh2" at 17.W).
+    var nowInfo = state.stuckInfo || stuckInfo;
+    // Never keep an ILLEGAL move (the button is hidden in that case; defensive).
+    if (!nowInfo || nowInfo.reason === 'illegal') {
+      if (typeof log === 'function') {
+        log('Skip-keep: current stuck move is illegal \u2014 cannot keep as-is; pick a fix or override.');
+      }
+      return;
+    }
+    var lbl = nowInfo.num + '.' + nowInfo.color.toUpperCase();
+    var move = nowInfo.move;
     var ply = state.stuckPly;
 
     // Compute from/to squares so the kept-move arrow lights up correctly,
@@ -1369,6 +1512,41 @@ var VerificationUI = (function() {
     var color = (p % 2 === 0) ? 'w' : 'b';
     var ocrText = fix.ocr || _fixSan(fix) || '';
     state.stuckPly = p;
+
+    // DISPLAY origin stuck ply for a backtrack fix. The backend anchors
+    // origin_stuck_ply at the EAD absurdity ply, which can be re-adjusted onto
+    // an earlier QUIET move whose play isn't itself the culprit — and can even
+    // land on a ply the user has LOCKED/approved (accepted ground truth). The
+    // review must never point its red outline + "piece hanging?" headline at
+    // such a move (reported: "13.B Qd7 — piece hanging?" for a fix that is
+    // really about 14.W Nh2, where the white queen only becomes capturable once
+    // Nh2 unblocks the Bh5–d1 pin). Skip the displayed origin forward past any
+    // locked/approved plies to the first ply where the consequence actually
+    // surfaces — bringing the warning into agreement with the Skip-keep button,
+    // which already shows the true stuck move (saved.stuckInfo). DISPLAY-ONLY:
+    // the candidate-window cutoff below still uses the raw origin_stuck_ply.
+    var _displayOrigin = (fix && typeof fix.origin_stuck_ply === 'number')
+      ? fix.origin_stuck_ply : p;
+    if (fix && fix.is_backtrack && _displayOrigin !== p) {
+      var _lockedDisp = {};
+      if (Array.isArray(state.lockedPlies)) {
+        state.lockedPlies.forEach(function(q){ _lockedDisp[q] = true; });
+      }
+      if (Array.isArray(state.approvedPlies)) {
+        state.approvedPlies.forEach(function(q){ _lockedDisp[q] = true; });
+      }
+      if (Array.isArray(state.moves)) {
+        state.moves.forEach(function(m, mi){
+          if (m && m.wStatus === 'locked') _lockedDisp[mi * 2] = true;
+          if (m && m.bStatus === 'locked') _lockedDisp[mi * 2 + 1] = true;
+        });
+      }
+      var _totDisp = Array.isArray(state.moves) ? state.moves.length * 2 : (_displayOrigin + 1);
+      var _gd = 0;
+      while (_lockedDisp[_displayOrigin] && _displayOrigin < _totDisp - 1 && _gd < 128) {
+        _displayOrigin++; _gd++;
+      }
+    }
     // Origin stuck ply for backtrack-aware highlighting in the move list.
     // When the focused fix is a backtrack proposal, set this to the actual
     // stuck ply so navigation.js::highlightCurrentMove can paint that cell
@@ -1376,8 +1554,8 @@ var VerificationUI = (function() {
     // non-backtrack fixes this stays null so no extra red outline appears.
     state.originStuckPly = (fix && fix.is_backtrack
                             && typeof fix.origin_stuck_ply === 'number'
-                            && fix.origin_stuck_ply !== p)
-      ? fix.origin_stuck_ply : null;
+                            && _displayOrigin !== p)
+      ? _displayOrigin : null;
     state.legalMoves = _legalMovesAtPly(p);
 
     // Determine the stop reason for the headline. Prefer the worker's
@@ -1413,8 +1591,8 @@ var VerificationUI = (function() {
     // the legacy single-ply check.
     var _isBacktrackCheck = !!(fix && fix.is_backtrack &&
                                 typeof fix.origin_stuck_ply === 'number' &&
-                                fix.origin_stuck_ply !== p);
-    var _stuckPlyForCheck = _isBacktrackCheck ? fix.origin_stuck_ply : p;
+                                _displayOrigin !== p);
+    var _stuckPlyForCheck = _isBacktrackCheck ? _displayOrigin : p;
     var _stuckOcrText = ocrText;
     if (_stuckPlyForCheck !== p && Array.isArray(state.moves)) {
       var _smi2 = Math.floor(_stuckPlyForCheck / 2);
@@ -1690,7 +1868,7 @@ var VerificationUI = (function() {
       // the fix is here because of a downstream stuck point, not because
       // this move itself is broken. _isBacktrack is computed earlier
       // (above the pendingConfirmation guard) and reused here.
-      var _stuckPly = _isBacktrack ? fix.origin_stuck_ply : p;
+      var _stuckPly = _isBacktrack ? _displayOrigin : p;
       var _stuckNum = Math.floor(_stuckPly / 2) + 1;
       var _stuckColor = (_stuckPly % 2 === 0) ? 'W' : 'B';
       var _stuckLbl = _stuckNum + '.' + _stuckColor;
@@ -1715,6 +1893,18 @@ var VerificationUI = (function() {
           }
         }
       }
+
+      // Stash THIS step's origin stuck context for the Skip-keep button
+      // (_renderReviewHeader). The button must track the move the user is
+      // looking at right now (e.g. "keep 14.W Nh2"), not the frozen entry
+      // stuck point, and must hide when this step's stuck move is illegal —
+      // you cannot "keep" an illegal move (e.g. 17.W Bh6).
+      v._currentStepStuck = {
+        ply: _stuckPly,
+        lbl: _stuckLbl,
+        move: _stuckMoveText,
+        reason: _stuckReason
+      };
 
       // Stuck label reflects the ORIGIN stuck ply (where the algorithm
       // actually failed), even when the proposed fix lives at an earlier
@@ -2356,6 +2546,10 @@ var VerificationUI = (function() {
     var v = _ensureState();
     if (v && v.active && m && typeof m.ply === 'number' && typeof state !== 'undefined') {
       var overridePly = m.ply;
+      var _rsEdit = _reviewStats(v.gameId);
+      if (_rsEdit) _rsEdit.edits++;
+      var _editFix = (typeof m.fixIndex === 'number') ? v.fixes[m.fixIndex] : null;
+      _logDecision(v, 'edit', m.ply, _editFix, '');
       var pre = v._preReviewMoves || [];
       var reverted = 0;
       for (var i = 0; i < (state.moves || []).length; i++) {
@@ -2832,6 +3026,9 @@ var VerificationUI = (function() {
             if (m.bStatus !== 'fixed' && m.bStatus !== 'locked') m.bStatus = 'fixed';
           }
           state.confirmedPly = Math.max(state.confirmedPly || 0, p + 1);
+          var _rsConf = _reviewStats(v.gameId);
+          if (_rsConf) _rsConf.confirms++;
+          _logDecision(v, 'confirm', p, curFix, _fixSan(curFix));
           renderVerificationMoveList();
         }
       }
@@ -2953,6 +3150,14 @@ var VerificationUI = (function() {
           log('🔒 LOCKED ' + _plyLabel(p) + ' ' + (keepSan || '') +
               ' — accepted as-is, will never be searched again');
         }
+        var _rsKeep = _reviewStats(v.gameId);
+        if (_rsKeep) _rsKeep.keeps++;
+        // Log the algorithm's proposal at this ply (the fix the user is
+        // declining in favor of the as-written move) when the focused fix
+        // is the one at p; otherwise fall back to the keep candidate.
+        var _keepProp = v.fixes[v.currentFixIndex];
+        if (!_keepProp || _fixPly(_keepProp) !== p) _keepProp = keepFix;
+        _logDecision(v, 'keep', p, _keepProp, keepSan);
         renderVerificationMoveList();
       }
     }
@@ -3039,6 +3244,31 @@ var VerificationUI = (function() {
 
     v.overrides = (v.overrides || []).filter(function(o) { return o.ply !== ply; });
     v.overrides.push({ ply: ply, san: userSan });
+
+    // Persist the override onto the batch game record. v.overrides is wiped
+    // on exit, but the round CSV's UserOverrides column reads g.userOverrides
+    // — without this copy that column always reported 0.
+    var _rsOvr = _reviewStats(v.gameId);
+    if (_rsOvr) _rsOvr.overrides++;
+    // Log BEFORE the cells below are reverted, while the surfaced fix at
+    // this ply (if any) is still in v.fixes.
+    var _ovrFix = null;
+    for (var _ofi = 0; _ofi < (v.fixes || []).length; _ofi++) {
+      if (_fixPly(v.fixes[_ofi]) === ply) { _ovrFix = v.fixes[_ofi]; break; }
+    }
+    _logDecision(v, 'override', ply, _ovrFix, userSan);
+    try {
+      var _bglOvr = window.BatchGameList;
+      var _gOvr = (_bglOvr && _bglOvr.batchState)
+        ? _bglOvr.batchState.games.get(v.gameId) : null;
+      if (_gOvr) {
+        if (!Array.isArray(_gOvr.userOverrides)) _gOvr.userOverrides = [];
+        _gOvr.userOverrides = _gOvr.userOverrides.filter(function(o) {
+          return o.ply !== ply;
+        });
+        _gOvr.userOverrides.push({ ply: ply, san: userSan });
+      }
+    } catch (e) { /* non-fatal — stats only */ }
 
     // Snapshot the OCR text at override ply BEFORE we overwrite it (needed
     // to stamp wOriginal on the move list so the user sees old→new).

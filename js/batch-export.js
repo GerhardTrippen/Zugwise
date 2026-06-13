@@ -474,7 +474,28 @@ var BatchExport = (function() {
    *
    * Columns:
    *   GameId, Section, Board, White, Black, Result, TotalMoves,
-   *   OcrCells, AlgorithmFixes, UserOverrides, Tier, TriageReason, Status
+   *   OcrCells, AlgorithmFixes, UserOverrides, Confirmations, Keeps,
+   *   ReviewEdits, SurfacedDecisions, ReviewSeconds, ReviewSessions,
+   *   Tier, TriageReason, Status
+   *
+   * The operator-effort columns (Confirmations..ReviewSessions) are fed by
+   * g.reviewStats, written by verification-ui.js as the user reviews:
+   *   Confirmations    - algorithm fixes accepted as proposed (✓ → 'fixed')
+   *   Keeps            - moves accepted as written (🔒 → 'locked')
+   *   UserOverrides    - moves the user typed over the proposal
+   *   ReviewEdits      - manual edits launched from review mode
+   *   SurfacedDecisions- distinct plies the walkthrough presented
+   *   ReviewSeconds    - wall-clock seconds in verification mode (all visits;
+   *                      excludes interactive-mode work after exiting review,
+   *                      so it is a lower bound on per-game attention)
+   *   AttentionSeconds - seconds of hands-on attention while the game was
+   *                      open, ANY mode (interaction-event timer with a 2-min
+   *                      idle cutoff; batch-game-list.js _attentionTick).
+   *                      Catches the interactive-mode work ReviewSeconds
+   *                      misses; tighter, but still a lower bound.
+   *   ReviewSessions   - number of verification entries for the game
+   * Stats live in batchState (memory only) — export before reloading or
+   * restarting batch processing.
    *
    * @param {number} [round] - Defaults to selectedRound
    * @param {Object} [options]
@@ -493,6 +514,8 @@ var BatchExport = (function() {
     var header = [
       'GameId', 'Section', 'Board', 'White', 'Black', 'Result',
       'TotalMoves', 'OcrCells', 'AlgorithmFixes', 'UserOverrides',
+      'Confirmations', 'Keeps', 'ReviewEdits', 'SurfacedDecisions',
+      'ReviewSeconds', 'AttentionSeconds', 'ReviewSessions',
       'Tier', 'TriageReason', 'Status'
     ];
     var lines = [header.join(',')];
@@ -510,12 +533,18 @@ var BatchExport = (function() {
         ? (window.BatchTournament && window.BatchTournament.matchGameToPairing(g, tournamentData))
         : null);
 
-      var totalMoves = picked && picked.result && picked.result.moves
-        ? picked.result.moves.length : 0;
+      // Prefer the ply count stamped at verification time (markVerified) —
+      // it reflects the user-confirmed game. picked.result.moves is the
+      // algorithm proposal and is gone for edit-only / post-requeue
+      // completions (those rows used to report TotalMoves=0).
+      var totalMoves = g.finalPlyCount ||
+        (picked && picked.result && picked.result.moves
+          ? picked.result.moves.length : 0);
       var algoFixes = picked && picked.result && picked.result.fixes
         ? picked.result.fixes.length : 0;
       var overrides = (rec.userOverrides && rec.userOverrides.length) ||
                       (g.userOverrides && g.userOverrides.length) || 0;
+      var rs = g.reviewStats || {};
 
       var row = [
         g.gameId,
@@ -528,6 +557,13 @@ var BatchExport = (function() {
         g.ocrCellCount || 0,
         algoFixes,
         overrides,
+        rs.confirms || 0,
+        rs.keeps || 0,
+        rs.edits || 0,
+        (rs.surfacedPlies && rs.surfacedPlies.length) || 0,
+        rs.activeMs ? Math.round(rs.activeMs / 1000) : 0,
+        g.attentionMs ? Math.round(g.attentionMs / 1000) : 0,
+        rs.sessions || 0,
         g.tier || '',
         g.triageReason || '',
         g.status || ''
@@ -543,10 +579,104 @@ var BatchExport = (function() {
     return { csv: lines.join('\n') + '\n', filename: filename, count: games.length };
   }
 
+  /**
+   * Build the per-decision log CSV for a round — one row per operator
+   * action recorded by verification-ui.js in g.reviewStats.decisions.
+   *
+   * This is the companion to the per-game report above: the report
+   * aggregates effort into counters, this log preserves WHICH plies were
+   * decided, what the OCR read, what the algorithm proposed, and what the
+   * user finally accepted. From it one can rebuild OCR-vs-final confusion
+   * tables (e.g. a foreign-notation scoresheet) and decision-latency
+   * distributions offline.
+   *
+   * Columns:
+   *   GameId, Board, Ply, Move, Action, OcrText, ProposedSan, FinalSan,
+   *   Method, Session, TSec
+   *     Ply      - 0-based ply index
+   *     Move     - human label ("29.B")
+   *     Action   - confirm | keep | override | edit (edit rows have
+   *                FinalSan='' — the committed move lands in the PGN)
+   *     Session  - which verification visit produced the row (1-based)
+   *     TSec     - seconds since that session's entry
+   * Like reviewStats, decisions are memory-only — export before reloading.
+   *
+   * @param {number} [round] - Defaults to selectedRound
+   * @returns {Promise<{csv:string, filename:string, rowCount:number}>}
+   */
+  async function exportDecisionLogCsv(round, options) {
+    options = options || {};
+    var bgl = window.BatchGameList;
+    if (!bgl || !bgl.batchState) throw new Error('BatchGameList not available');
+    var bs = bgl.batchState;
+    round = round != null ? round : bs.selectedRound;
+    if (round == null) throw new Error('No round selected');
+
+    var tournamentData = options.tournamentData || window._batchTournamentData || null;
+
+    var header = [
+      'GameId', 'Board', 'Ply', 'Move', 'Action',
+      'OcrText', 'ProposedSan', 'FinalSan', 'Method', 'Session', 'TSec'
+    ];
+    var lines = [header.join(',')];
+    var rowCount = 0;
+
+    var games = [];
+    bs.games.forEach(function(g) {
+      if (g.round === round) games.push(g);
+    });
+    games.sort(function(a, b) { return (a.board || 0) - (b.board || 0); });
+
+    games.forEach(function(g) {
+      var decisions = (g.reviewStats && g.reviewStats.decisions) || [];
+      decisions.forEach(function(d) {
+        var moveLabel = (typeof d.ply === 'number')
+          ? (Math.floor(d.ply / 2) + 1) + '.' + (d.ply % 2 === 0 ? 'W' : 'B')
+          : '';
+        var row = [
+          g.gameId,
+          g.board || '',
+          (typeof d.ply === 'number') ? d.ply : '',
+          moveLabel,
+          d.action || '',
+          d.ocr || '',
+          d.proposed || '',
+          d.finalSan || '',
+          d.method || '',
+          d.session || '',
+          (d.tSec != null) ? d.tSec : ''
+        ].map(_csvCell);
+        lines.push(row.join(','));
+        rowCount++;
+      });
+    });
+
+    var tournamentPart = tournamentData && tournamentData.event
+      ? tournamentData.event.replace(/[^A-Za-z0-9_-]+/g, '_')
+      : 'Tournament';
+    var filename = tournamentPart + '_Round' + round + '_decisions.csv';
+
+    return { csv: lines.join('\n') + '\n', filename: filename, rowCount: rowCount };
+  }
+
   async function exportAndSaveErrorCsv(round, options) {
     var out = await exportErrorReportCsv(round, options);
     var savedTo = await saveText(out.csv, out.filename, 'text/csv');
-    return { count: out.count, filename: out.filename, savedTo: savedTo };
+    // Companion per-decision log — only written when this session actually
+    // recorded decisions (an empty file would just shadow a previous
+    // session's real log on disk).
+    var decisions = null;
+    try {
+      var dec = await exportDecisionLogCsv(round, options);
+      if (dec.rowCount > 0) {
+        var decSavedTo = await saveText(dec.csv, dec.filename, 'text/csv');
+        decisions = { filename: dec.filename, count: dec.rowCount, savedTo: decSavedTo };
+      }
+    } catch (e) {
+      console.warn('[BatchExport] decision log export failed:', e);
+    }
+    return { count: out.count, filename: out.filename, savedTo: savedTo,
+             decisions: decisions };
   }
 
   // =========================================================================
@@ -567,6 +697,14 @@ var BatchExport = (function() {
     options = options || {};
     var pgnOut = await exportRoundPgn(round, options);
     var csvOut = await exportErrorReportCsv(round, options);
+    // Per-decision log rides along when any review decisions were recorded.
+    var decOut = null;
+    try {
+      var _dec = await exportDecisionLogCsv(round, options);
+      if (_dec.rowCount > 0) decOut = _dec;
+    } catch (e) {
+      console.warn('[BatchExport] decision log export failed:', e);
+    }
 
     var bs = window.BatchGameList && window.BatchGameList.batchState;
     var folder = bs && bs.folderHandle;
@@ -578,13 +716,18 @@ var BatchExport = (function() {
         ? await saveText(pgnOut.pgn, pgnOut.filename, 'application/x-chess-pgn')
         : null;
       var savedCsv = await saveText(csvOut.csv, csvOut.filename, 'text/csv');
+      var outFiles = [
+        { name: pgnOut.filename, savedTo: savedPgn, count: pgnOut.count },
+        { name: csvOut.filename, savedTo: savedCsv, count: csvOut.count }
+      ];
+      if (decOut) {
+        var savedDec = await saveText(decOut.csv, decOut.filename, 'text/csv');
+        outFiles.push({ name: decOut.filename, savedTo: savedDec, count: decOut.rowCount });
+      }
       return {
         savedTo: 'folder',
         filename: null,
-        files: [
-          { name: pgnOut.filename, savedTo: savedPgn, count: pgnOut.count },
-          { name: csvOut.filename, savedTo: savedCsv, count: csvOut.count }
-        ]
+        files: outFiles
       };
     }
 
@@ -595,6 +738,7 @@ var BatchExport = (function() {
         await saveText(pgnOut.pgn, pgnOut.filename, 'application/x-chess-pgn');
       }
       await saveText(csvOut.csv, csvOut.filename, 'text/csv');
+      if (decOut) await saveText(decOut.csv, decOut.filename, 'text/csv');
       return {
         savedTo: 'download',
         filename: null,
@@ -610,6 +754,7 @@ var BatchExport = (function() {
       files.push({ name: pgnOut.filename, content: pgnOut.pgn });
     }
     files.push({ name: csvOut.filename, content: csvOut.csv });
+    if (decOut) files.push({ name: decOut.filename, content: decOut.csv });
 
     var zipName = _buildBundleFilename(pgnOut.filename, csvOut.filename);
     window.BatchZip.download(files, zipName);
@@ -792,6 +937,7 @@ var BatchExport = (function() {
     exportAndSaveRoundCombinedPgn: exportAndSaveRoundCombinedPgn,
     exportErrorReportCsv: exportErrorReportCsv,
     exportAndSaveErrorCsv: exportAndSaveErrorCsv,
+    exportDecisionLogCsv: exportDecisionLogCsv,
     exportRoundBundle: exportRoundBundle,
     saveText: saveText
   };

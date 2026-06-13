@@ -23,6 +23,7 @@ from absurdity import (find_all_absurdities, find_check_symbol_mismatches,
                        find_free_captures, find_free_captures_with_check,
                        find_hanging_pieces)
 from lenient_normalize import normalize_lenient_move
+from constraints import find_piece_constraint_cluster, find_development_blocker, scan_ocr_for_piece_clusters
 from collections import Counter
 # === EARLY STOPPING (January 2026) ===
 from play import play_until_absurd_or_stuck
@@ -2547,6 +2548,62 @@ def _precompute_backtrack_context(
 
     ctx['hanging_attr_candidates'] = hanging_attr_candidates
 
+    # OCR PIECE-CLUSTER ANALYSIS (diagnostic; wired June 2026)
+    # Verbose-only pre-scan: which piece types does the scoresheet insist are
+    # in play (>=2 high-confidence OCR moves)? Printed as context for the
+    # constraint-cluster heuristic below; no effect on scoring or search, and
+    # zero cost when verbose is off.
+    if verbose and not is_phase_2:
+        scan_ocr_for_piece_clusters(ocr_lookup, total_moves, verbose=True)
+
+    # CONSTRAINT CLUSTER (BLOCKED PIECE) HEURISTIC
+    # Re-wired June 2026. find_piece_constraint_cluster was restored from the
+    # pre-git v4.9.2 monolith but its call site never survived modularization —
+    # orphaned since the initial commit.
+    # If the stuck move's piece TYPE cannot make ANY legal move (bishop
+    # square-color aware) AND the OCR records future high-confidence moves by
+    # that same piece, the piece is genuinely in play and an EARLIER error
+    # blocked it in. find_development_blocker enumerates earlier same-color
+    # replacements that make the stuck move legal end-to-end; their plies join
+    # the extended search and get full scoring there.
+    # Phase 1 only: Phase 2 inherits Phase 1's extensions via the merge, and
+    # the enabler enumeration is the costliest of the targeted heuristics.
+    constraint_cluster = None
+    constraint_enabler_plies = []
+    if stuck_move and not is_phase_2:
+        constraint_cluster = find_piece_constraint_cluster(
+            moves, ocr_lookup, blocker_stuck_ply, total_moves, verbose=verbose)
+        if constraint_cluster:
+            enablers = find_development_blocker(moves, ocr_lookup, constraint_cluster, verbose=verbose)
+            # Enablers are sorted by similarity; keep the first occurrence of
+            # each ply, cap the plies added so a permissive position cannot
+            # flood the search.
+            _seen_enabler_plies = set()
+            for en in enablers:
+                if en['fix_ply'] in _seen_enabler_plies:
+                    continue
+                _seen_enabler_plies.add(en['fix_ply'])
+                constraint_enabler_plies.append(en)
+                if len(_seen_enabler_plies) >= 8:
+                    break
+            for en in constraint_enabler_plies:
+                extended_search_plies.add(en['fix_ply'])
+
+            if verbose:
+                if constraint_enabler_plies:
+                    print(f"   [CLUSTER] Blocked {constraint_cluster['piece_type']} "
+                          f"({constraint_cluster['color']}) with {len(constraint_cluster['future_moves'])} "
+                          f"future OCR move(s) - adding enabler plies to search:")
+                    for en in constraint_enabler_plies:
+                        print(f"      -> {ply_to_str(en['fix_ply'])} '{en['original']}' -> "
+                              f"'{en['replacement']}' (sim={en['char_sim']:.0%})")
+                else:
+                    print(f"   [CLUSTER] Blocked {constraint_cluster['piece_type']} detected "
+                          f"but no enabler plies found")
+
+    ctx['constraint_cluster'] = constraint_cluster
+    ctx['constraint_enabler_plies'] = constraint_enabler_plies
+
     # Find suspicious plies (low OCR confidence)
     suspicious_plies = set()
     for ply in range(min_ply, effective_stuck_ply):
@@ -3090,7 +3147,7 @@ def _search_single_ply_for_fixes(
     # finds the true net gain. Skipping quiescence whenever static says < 3
     # misses all such pin/overload cases.
     # Using find_free_captures (quiescence-backed) not detect_missed_free_capture
-    # (simple check) — critical distinction: traps like Rxe3/g8=Q must NOT fire.
+    # (simple check) — critical distinction: traps like Rxe3/gxh8=Q must NOT fire.
     free_caps_at_ply = find_free_captures(board, board.turn) if best_capture_gain >= 1 else []
 
     # Position at fix_ply - 1 (BEFORE the previous opposing move was played).

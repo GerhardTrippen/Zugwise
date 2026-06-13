@@ -444,6 +444,39 @@ def resolve_forced_stop_choice(moves, ply, ocr_lookup, forced_stop_plies=None,
     # review still surfaces every candidate in all_candidates. ---
     at_ply = [f for f in fixes if f.get('ply') == ply]
     chosen = _decide_forced_stop_change(at_ply, cur)
+    # SAN-AMBIGUITY: cur (e.g. "Re8") is ILLEGAL as written — under-specified,
+    # with >= 2 legal disambiguations (Rde8 / Rhe8). A "keep cur" outcome is
+    # NEVER valid here: it leaves the ambiguous SAN in moves[], so the very next
+    # play_until_absurd_or_stuck re-detects the SAME ambiguity and re-stops at
+    # this ply forever (the Greedy/Dijkstra spin the user hit: "[DISAMBIG]
+    # 'Re8' still ambiguous ['Rde8','Rhe8']", Dijkstra cost climbing by LAM each
+    # pop). _decide_forced_stop_change can still pick "keep" because find_fixes
+    # surfaces the kept reading as a sim=100% candidate that out-scores the
+    # variants. The forced_stop_plies/fixed_plies guards can't break the loop —
+    # the ambiguity is re-derived from the board, not from that set. Force a
+    # CONCRETE variant so the move list advances; both variants ride in
+    # all_candidates for user review.
+    if _is_san_ambig and (chosen is None or chosen.get('san') == cur):
+        _variant_set = set(_san_variants)
+        _variant_cands = [f for f in at_ply
+                          if f.get('san') in _variant_set and f.get('san') != cur]
+        if _variant_cands:
+            chosen = max(_variant_cands, key=lambda f: f.get('unified_score', 0.0))
+        else:
+            # find_fixes didn't surface the variants — synthesize the best by
+            # reach (the rooks land differently, so downstream legality can
+            # differ) so the game still advances past this ply.
+            _best_variant, _best_reach = _san_variants[0], -1
+            for _v in _san_variants:
+                _trial = list(moves)
+                _trial[ply] = _v
+                _vr, _ = play_until_stuck(_trial)
+                if _vr > _best_reach:
+                    _best_reach, _best_variant = _vr, _v
+            chosen = {
+                'ply': ply, 'ply_str': ply_to_str(ply), 'ocr': cur,
+                'san': _best_variant, 'char_sim': 1.0, 'unified_score': 0.0,
+            }
     if chosen is None:
         best = {
             'ply': ply, 'ply_str': ply_to_str(ply), 'ocr': cur, 'san': cur,
@@ -1521,6 +1554,13 @@ def beam_step(state: dict) -> dict:
                 min_ply=eff_min_ply, phase2_depth=max_backtrack)
             _cur = path.moves[reach] if reach < len(path.moves) else ''
             path.fixed_plies.add(reach)
+            # Parking a forced stop IS progress: the path's frontier advanced
+            # (fixed_plies grew), so on the next iteration it completes or moves
+            # to the next stuck point. Without this, a path whose only remaining
+            # work is a forced stop (esp. a single-legal one resolved to None)
+            # leaves any_expanded False -> Guard 2 wrongly reports PARTIAL on a
+            # game that actually reaches the end.
+            any_expanded = True
             if marker and marker.get('san') and marker['san'] != _cur:
                 # Proper scoring favours a different reading — apply it.
                 path.moves[reach] = marker['san']

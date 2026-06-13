@@ -467,20 +467,32 @@ def dijkstra_step(state: dict) -> dict:
         new_node = node.copy_with_fix(
             dict(marker), node.cost + LAM, tier1_agreed_plies=tier1, record=_record)
         heapq.heappush(queue, new_node)
-        return {
+        _step = {
             'done': False, 'step': state['step'],
             'queue_size': len(queue), 'current_cost': int(node.cost),
             'depth': len(node.fixes), 'reach': stuck_at,
             'reach_str': ply_to_str(stuck_at), 'total_plies': total,
             'status': 'exploring', 'pushed': 1,
             'elapsed': round(elapsed, 1),
-            'fix_ply': ply_to_str(stuck_at),
-            'fix_from': marker.get('ocr', ''), 'fix_to': marker.get('san', ''),
-            'message': ((f"[ambiguity] {ply_to_str(stuck_at)}: {marker.get('ocr','')} "
-                         f"-> {marker.get('san','')} (score {marker.get('unified_score',0):.0f})")
-                        if _is_change else
-                        f"[ambiguity] {ply_to_str(stuck_at)} kept as-is; flagged for review"),
         }
+        if _record:
+            # A genuine review step (>= 2 legal readings) — surface it as a fix.
+            _step['fix_ply'] = ply_to_str(stuck_at)
+            _step['fix_from'] = marker.get('ocr', '')
+            _step['fix_to'] = marker.get('san', '')
+            _step['message'] = (
+                (f"[ambiguity] {ply_to_str(stuck_at)}: {marker.get('ocr','')} "
+                 f"-> {marker.get('san','')} (score {marker.get('unified_score',0):.0f})")
+                if _is_change else
+                f"[ambiguity] {ply_to_str(stuck_at)} kept as-is; flagged for review")
+        else:
+            # Single legal reading — accepted SILENTLY (mirrors Greedy/Beam,
+            # which emit no fix step here). Omit fix_ply/fix_from/fix_to so the
+            # UI doesn't render a no-op "Qxe3 -> Qxe3" fix row.
+            _step['message'] = (
+                f"[ambiguity] {ply_to_str(stuck_at)} only one legal reading "
+                f"({marker.get('san','')}) — accepted")
+        return _step
 
     # TEMP DIAG (mirrors GREEDY-DIAG / BEAM-DIAG).
     print(f"[DIJK-DIAG] step={state['step']} depth={len(node.fixes)} "

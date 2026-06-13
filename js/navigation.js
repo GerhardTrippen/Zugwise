@@ -83,6 +83,18 @@ function goToPly(ply, options){
       window.SheetAlignment.runStructuralChecks();
     } else if(typeof window.SheetAlignment.evaluateAtPointAlignment === 'function'){
       window.SheetAlignment.evaluateAtPointAlignment();
+      // Banner active: runStructuralChecks (and the dual-sheet relaunch it
+      // cascades into) was skipped. An edit that changed the move list still
+      // needs the searches re-run — the cached result is now stale. This is
+      // reached on every post-edit revalidate (revalidate → goToPly) as well
+      // as plain navigation; retryReconstructionLaunch → launchBackgroundSearches
+      // self-gates so a navigation tick (unchanged inputs) is a no-op skip and
+      // only a genuine edit relaunches. Without this, dual-sheet edits made
+      // while an alignment banner is showing silently left stale algorithm
+      // panels — the asymmetry vs single-sheet the user reported.
+      if(typeof window.SheetAlignment.retryReconstructionLaunch === 'function'){
+        window.SheetAlignment.retryReconstructionLaunch();
+      }
     }
   }
 }

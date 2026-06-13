@@ -618,11 +618,27 @@ function launchBackgroundSearches(paired) {
   // Don't burn worker time on a game whose structure is still being negotiated
   // — every accepted noise/alignment fix triggers a re-merge that would abort
   // and re-launch this anyway.
+  //
+  // EXCEPTION (dual-sheet edit parity): defer only while the inputs are
+  // UNCHANGED since the last launch. If the user has edited a move since then,
+  // the cached Greedy/Beam/Dijkstra result is stale and must be recomputed even
+  // with an alignment banner up. Single-sheet mode has no banner and always
+  // relaunched on an edit; this keeps dual-sheet in parity instead of leaving
+  // stale panels until the user happens to resolve the banner. A plain
+  // navigation tick (unchanged fingerprint) or a game that never launched yet
+  // (initial structure negotiation, _lastLaunchFingerprint === null) still
+  // defers, preserving the original "don't launch mid-negotiation" intent.
   if (window.SheetAlignment && window.SheetAlignment.hasActiveStructuralBanner()) {
-    if (typeof log === 'function') {
-      log('⏸️ Reconstruction launch deferred: structural suggestion(s) pending user decision.');
+    var _fpBanner = _computeLaunchFingerprint();
+    if (_lastLaunchFingerprint === null || !_fpBanner || _fpBanner === _lastLaunchFingerprint) {
+      if (typeof log === 'function') {
+        log('⏸️ Reconstruction launch deferred: structural suggestion(s) pending user decision.');
+      }
+      return;
     }
-    return;
+    if (typeof log === 'function') {
+      log('▶️ Reconstruction relaunch allowed despite structural banner: move inputs changed since last run (stale result).');
+    }
   }
   // Batch mode: the orchestrator drives the panels via BatchPanelBridge.
   // Spawning duplicate interactive searches would run the same algorithms

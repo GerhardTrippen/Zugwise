@@ -2340,6 +2340,29 @@ function mergeBacktrackFixes(backtrackFixes, missingMoveCandidates) {
   // valuable even if the same move appears elsewhere.
   var allBacktrack = backtrackFixes || [];
 
+  // The effective WALL ply — where the game is actually stuck. In interactive
+  // mode that's state.stuckPly; in backtrack-review mode state.stuckPly is the
+  // focus/fix ply, so the real wall is state.originStuckPly (same convention as
+  // ocrColorClass).
+  var _wallPly = (typeof state.originStuckPly === 'number')
+    ? state.originStuckPly : state.stuckPly;
+  if (typeof _wallPly === 'number') {
+    // Drop keep-as-is candidates that are NOT at the wall. "Keep the flagged
+    // move as-is" only makes sense at the stuck ply. A keep at a backtrack ply
+    // (e.g. "25.W Keep fxg6 as-is" while stuck at 29.B) is a literal no-op —
+    // not changing an upstream move never unsticks the wall — and the panel
+    // mislabels it "Current move". (User-reported.)
+    //
+    // NOTE: backtrack CHANGE fixes are deliberately NOT filtered, even when
+    // their reach lands only back at the wall. A 25.W change can be a genuine
+    // upstream error that must be fixed FIRST before the real 29.B issue can be
+    // resolved (multi-error chains) — hiding it on a reach heuristic would drop
+    // a legitimate prerequisite fix. Only the no-op keeps go.
+    allBacktrack = allBacktrack.filter(function(f) {
+      return !(f.keep_as_is && typeof f.ply === 'number' && f.ply !== _wallPly);
+    });
+  }
+
   if (allBacktrack.length === 0 && (!missingMoveCandidates || missingMoveCandidates.length === 0)) {
     deepSection.innerHTML = '<div class="text-xs text-gray-500 mt-3 pt-2 border-t border-gray-600">No additional fixes found</div>';
     return;

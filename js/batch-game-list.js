@@ -891,6 +891,9 @@ var BatchGameList = (function() {
         game.status !== GAME_STATUS.VERIFIED &&
         game.status !== GAME_STATUS.EXPORTED) {
       game.status = GAME_STATUS.VERIFIED;
+      // Stamp the verified ply count for the round report's TotalMoves,
+      // same as markVerified() — auto-promoted games otherwise export 0.
+      game.finalPlyCount = state.sans.length;
       // Same staleness clear + orchestrator abort as markVerified() — keep
       // the sidebar from showing the pre-review G/B/D failure glyphs and
       // Tier badge on a game that's now hand-verified, and stop in-flight
@@ -2048,6 +2051,14 @@ var BatchGameList = (function() {
         (!game.hasTrailingNoise || game.noiseResolved) &&
         _isCurrentGameReadyToSave()) {
       game.status = GAME_STATUS.VERIFIED;
+      // Stamp the verified ply count for the round report's TotalMoves,
+      // same as markVerified() — functionally-complete games (edit-only
+      // finishes) otherwise export 0 (Premier R7 B7/B8/B10).
+      try {
+        if (typeof state !== 'undefined' && Array.isArray(state.sans)) {
+          game.finalPlyCount = state.sans.length;
+        }
+      } catch (e) { /* stats only */ }
       if (typeof log === 'function') {
         log('✅ Auto-marked ' + batchState.currentGameId + ' as VERIFIED (' +
             (state.sans ? state.sans.length : 0) + ' moves validated, no stuck point)');
@@ -2065,6 +2076,16 @@ var BatchGameList = (function() {
     var game = batchState.games.get(batchState.currentGameId);
     if (game) {
       game.status = GAME_STATUS.VERIFIED;
+      // Stamp the verified game length (in plies). The round report CSV's
+      // TotalMoves column read picked.result.moves, which is null for games
+      // completed without a surviving algorithm pick (edit-only finishes,
+      // post-requeue verifications) — those rows showed TotalMoves=0 even
+      // though the saved PGN had a full game.
+      try {
+        if (typeof state !== 'undefined' && Array.isArray(state.sans)) {
+          game.finalPlyCount = state.sans.length;
+        }
+      } catch (e) { /* stats only */ }
       // Clear the sidebar's stale per-method status, tier, and triage AND
       // stop any orchestrator runs still in flight on the pre-verify input.
       // Without the abort, a late Dijkstra finishing afterwards would re-seed
@@ -3000,6 +3021,9 @@ var BatchGameList = (function() {
       }
       if (!allOk) return;
       g.status = GAME_STATUS.VERIFIED;
+      // Stamp the verified ply count for the round report's TotalMoves,
+      // same as markVerified() — catch-up-promoted games otherwise export 0.
+      g.finalPlyCount = ws.sans.length;
       if (g.hasTrailingNoise) g.noiseResolved = true;
       // Clear the same pre-verify staleness markVerified() and the
       // _saveGameWorkingState auto-mark do, plus abort any in-flight
@@ -3958,6 +3982,50 @@ var BatchGameList = (function() {
     selectGame(gameId);
     return true;
   }
+
+  // =========================================================================
+  // Per-game attention timer
+  // =========================================================================
+  //
+  // ReviewSeconds (g.reviewStats.activeMs) counts verification-mode wall-
+  // clock only, but real per-game work also happens in interactive mode
+  // (manual edits after exiting review, stuck-point fixing, navigation) —
+  // measured against the operator's actual time on a round, roughly half
+  // was invisible. This tracker attributes the time between user input
+  // events to whichever game is open, regardless of mode. Gaps longer than
+  // ATTENTION_IDLE_CUTOFF_MS (walked away / other window) are dropped, so
+  // long reading pauses are excluded too — still a lower bound, but a much
+  // tighter one. Exported as the round report's AttentionSeconds column
+  // (batch-export.js). Like reviewStats, memory-only: export the CSV
+  // before reloading.
+  var ATTENTION_IDLE_CUTOFF_MS = 120000;
+  var _attn = { lastTs: 0, lastGameId: null };
+
+  function _attentionTick() {
+    var now = Date.now();
+    // Attribute the elapsed gap to the game that was open when it STARTED —
+    // a game switch mid-gap books the time to the previous game.
+    if (_attn.lastTs && _attn.lastGameId) {
+      var delta = now - _attn.lastTs;
+      if (delta > 0 && delta <= ATTENTION_IDLE_CUTOFF_MS) {
+        var g = batchState.games.get(_attn.lastGameId);
+        if (g) g.attentionMs = (g.attentionMs || 0) + delta;
+      }
+    }
+    _attn.lastTs = now;
+    _attn.lastGameId = batchState.active ? batchState.currentGameId : null;
+  }
+
+  ['pointerdown', 'pointermove', 'keydown', 'wheel'].forEach(function(evt) {
+    document.addEventListener(evt, _attentionTick, { capture: true, passive: true });
+  });
+  // Tab hidden = attention elsewhere: bank the gap accrued so far, then
+  // stop accumulating until the next interaction after the tab returns.
+  document.addEventListener('visibilitychange', function() {
+    if (document.hidden) _attentionTick();
+    _attn.lastTs = 0;
+    _attn.lastGameId = null;
+  });
 
   // =========================================================================
   // Public API

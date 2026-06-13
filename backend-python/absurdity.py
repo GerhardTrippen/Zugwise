@@ -1809,6 +1809,14 @@ def is_bad_trade_move(board: chess.Board, move: chess.Move,
     our_loss = opp_gain - captured_val
 
     if our_loss >= threshold:
+        # A move that ends the game can never lose material: the "recapture"
+        # SEE found is never played. Covers discovered mates like Bh6-f8#
+        # (bishop lands on a square both rooks attack, but Rxf8 doesn't exist
+        # because the game is over). Checked only on the flag path so the
+        # legal-move generation cost stays off the common case.
+        if test_board.is_checkmate() or test_board.is_stalemate():
+            return False, 0, ""
+
         # Tactical sacrifice check: opponent's capture may enable a forcing
         # reply (mate or big free capture) that compensates the material.
         if _capture_has_tactical_compensation(board, move, to_square, our_loss):

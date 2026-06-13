@@ -502,6 +502,88 @@ function mergeSheets(sheet1Moves, sheet2Moves) {
     if (cell) merged.push(cell);
   });
 
+  return resolveAmbiguityByLegality(merged);
+}
+
+/**
+ * Post-merge pass: a dual-sheet forced-stop (_ambiguous) cell offers two
+ * competing readings in _ambiguousCandidates. If, at the actual board position,
+ * exactly ONE of them is legal, there is nothing for the user to arbitrate —
+ * commit the legal reading and clear the stop. This is the dual-sheet analogue
+ * of the "One or Nothing" auto-fix rule:
+ *   ZERO legal → keep the stop (genuine dead-end, fix-finder territory)
+ *   ONE  legal → safe to auto-resolve (no ambiguity to decide)
+ *   TWO  legal → keep the stop (real ambiguity — e.g. the queen-square carve-out's
+ *                intended case, where both squares are playable but one is a trap)
+ *
+ * This is what makes the queen-square carve-out legality-aware. The carve-out in
+ * mergePly fires on SAN+confidence alone (it has no board), so it flags e.g.
+ * 29.W Qxe3 (legal, summed 1.14) vs Qxc3 (illegal, 0.75) as a forced stop. Here
+ * we have the board, see Qxc3 can't be played, and drop the false stop.
+ *
+ * Legality is tested in chess.js SLOPPY mode so a notation-only mismatch (a
+ * missing 'x'/'+'), which python-chess would accept, is never mistaken for an
+ * illegal move — otherwise a genuinely-ambiguous (both-legal) stop could be
+ * silently dropped. Replays forward through the committed move text; once a ply
+ * can't be played the board beyond is unknown, so we stop resolving (mirrors
+ * classifyTiers' stop-at-first-illegal). Cells are freshly minted by mergePly,
+ * so in-place mutation here is safe.
+ */
+function resolveAmbiguityByLegality(merged) {
+  if (typeof Chess === 'undefined') return merged; // no validator → leave stops intact
+  var board = new Chess();
+  for (var i = 0; i < merged.length; i++) {
+    var cell = merged[i];
+    if (!cell) continue;
+
+    if (cell._ambiguous && Array.isArray(cell._ambiguousCandidates) &&
+        cell._ambiguousCandidates.length >= 2) {
+      var legal = [];
+      cell._ambiguousCandidates.forEach(function(cand) {
+        if (!cand) return;
+        var probe = new Chess(board.fen());
+        var ok = false;
+        try { ok = !!probe.move(cand, { sloppy: true }); } catch (e) {}
+        if (ok && legal.indexOf(cand) < 0) legal.push(cand);
+      });
+      if (legal.length === 1) {
+        var winner = legal[0];
+        var winN = normalizeSanForComparison(winner);
+        // The winner's summed cross-sheet conf already sits in alternatives (the
+        // forced-stop branch unshifted both readings there); fall back to the
+        // cell conf if absent.
+        var winConf = cell.confidence;
+        (cell.alternatives || []).forEach(function(alt) {
+          if (normalizeSanForComparison(alt.move) === winN) winConf = alt.confidence;
+        });
+        cell.move = winner;
+        cell.confidence = winConf;
+        cell._ambiguous = false;
+        delete cell._ambiguousCandidates;
+        cell._resolvedByLegality = true; // the other reading was illegal
+        // Surface the committed (legal) reading first in alternatives.
+        if (Array.isArray(cell.alternatives)) {
+          cell.alternatives.sort(function(x, y) {
+            var xw = normalizeSanForComparison(x.move) === winN ? 1 : 0;
+            var yw = normalizeSanForComparison(y.move) === winN ? 1 : 0;
+            if (xw !== yw) return yw - xw;
+            return (y.confidence || 0) - (x.confidence || 0);
+          });
+        }
+        if (typeof console !== 'undefined') {
+          console.log('[MERGE] ambiguity at ' + cell.num + '.' +
+            (cell.color === 'w' ? 'W' : 'B') + ' auto-resolved by legality → ' +
+            winner + ' (other reading illegal)');
+        }
+      }
+    }
+
+    // Advance the board by the committed move (sloppy). If it can't be played,
+    // the position beyond is unknown — stop resolving further ambiguities.
+    var played = false;
+    try { played = !!board.move(cell.move, { sloppy: true }); } catch (e) {}
+    if (!played) break;
+  }
   return merged;
 }
 
@@ -773,6 +855,7 @@ function agreementSummary(ocrCells) {
 window.MergeSheets = {
   normalizeSanForComparison: normalizeSanForComparison,
   mergeSheets: mergeSheets,
+  resolveAmbiguityByLegality: resolveAmbiguityByLegality,
   mergePly: mergePly,
   mergeAlternatives: mergeAlternatives,
   findAgreementPlies: findAgreementPlies,

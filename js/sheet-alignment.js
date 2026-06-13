@@ -2335,6 +2335,22 @@
       _cacheAlignmentAnalysis();
       evaluateAtPointAlignment();
     }
+
+    // Dual-sheet parity with the single-sheet branch above, which calls
+    // _retryReconstructionLaunch() directly. _runNWAlignmentCheck() / the
+    // old pipeline skip the relaunch on several of their internal exits —
+    // most importantly when they SURFACE an alignment banner this very tick
+    // (it shows the banner and returns without relaunching), but also on the
+    // noise / stale-per-sheet early returns. Because goToPly only calls this
+    // function when NO banner is active at entry, a banner surfaced here meant
+    // the post-edit relaunch never happened at all (and no later goToPly
+    // re-triggers it). Attempt the relaunch unconditionally after the cascade:
+    // launchBackgroundSearches self-gates — unchanged inputs (a plain
+    // navigation tick), no stuck point, unresolved noise, or an active banner
+    // with no edit since the last run are all skipped; only a genuine edit
+    // that changed the move list relaunches, even with a banner up. This is
+    // the single-vs-dual asymmetry the user reported.
+    _retryReconstructionLaunch();
   }
 
   // ---------------------------------------------------------------------------
@@ -3885,7 +3901,12 @@
   }
 
   function _retryReconstructionLaunch() {
-    if (hasActiveStructuralBanner()) return;
+    // NOTE: the active-structural-banner decision is intentionally NOT made
+    // here anymore. launchBackgroundSearches() owns it now, and makes a finer
+    // call: defer while a banner is up AND inputs are unchanged, but allow a
+    // relaunch when the user has edited a move (stale cached result). Gating on
+    // the banner here would re-block that edit relaunch before it ever reached
+    // launchBackgroundSearches — the exact dual-sheet asymmetry being fixed.
     if (typeof launchBackgroundSearches !== 'function') return;
     if (state.stuckPly === undefined || state.stuckPly === null) return;
     // Noise truncation must be resolved before any reconstruction work.
@@ -3974,6 +3995,7 @@
     detectTrailingNoise: detectTrailingNoise,
     runStructuralChecks: runStructuralChecks,
     evaluateAtPointAlignment: evaluateAtPointAlignment,
+    retryReconstructionLaunch: _retryReconstructionLaunch,
     hasActiveStructuralBanner: hasActiveStructuralBanner,
     clearAllStructuralBanners: clearAllStructuralBanners,
     // exposed for testing / batch use

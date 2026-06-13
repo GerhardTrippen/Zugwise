@@ -381,7 +381,34 @@ def validate_moves(
                 board.push(_fs_legal_move)
                 _fs_terminal_mate = board.is_checkmate()
                 board.pop()
+            # GENUINE-AMBIGUITY GATE: a forced stop is only warranted when >= 2 of
+            # the sheet readings are actually LEGAL here. The merge flags the ply
+            # on a dual-sheet near-tie using confidence alone — but if the
+            # competing reading is ILLEGAL (e.g. sheet 2's 'Qxc3' captures the own
+            # c3 pawn, while sheet 1's 'Qxe3' is the only legal reading), there is
+            # nothing to arbitrate: play the legal move and continue, don't stop
+            # for review. Mirrors resolve_forced_stop_choice's >= 2-legal-readings
+            # gate so interactive agrees with Greedy/Beam/Dijkstra (which already
+            # walk through 29.W). Without this, interactive stops at 29.W on a
+            # non-ambiguity. A genuine disagreement (>= 2 legal readings, e.g.
+            # Rb8 vs Qb8) still stops as before.
+            _genuine_ambiguity = False
             if _fs_legal_move is not None and not _fs_terminal_mate:
+                _legal_reading_sans = {board.san(_fs_legal_move)}
+                if i < len(ocr_data) and ocr_data[i].get('alternatives'):
+                    for _alt in ocr_data[i]['alternatives']:
+                        _na = normalize_candidate(_alt)
+                        if not _na:
+                            continue
+                        _amv = _na[0]
+                        try:
+                            _ap = board.parse_san(_amv)
+                        except Exception:
+                            continue
+                        if _ap in board.legal_moves and _is_valid_move_notation(_amv, _ap, board):
+                            _legal_reading_sans.add(board.san(_ap))
+                _genuine_ambiguity = len(_legal_reading_sans) >= 2
+            if _genuine_ambiguity:
                 stuck_at = i
                 stuck_move = san
                 stuck_reason = 'ambiguous'

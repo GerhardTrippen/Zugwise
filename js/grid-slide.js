@@ -1828,14 +1828,16 @@ function miniWarp(srcMat, TL, TR, BR, BL, dstW, dstH) {
  * cell's left boundary being read as a leading stroke. A vertical grid rule is
  * dead straight and spans (nearly) the full cell height — a handwritten stroke
  * wobbles and breaks under a 1px-wide vertical open. We isolate such structures
- * with a tall narrow morphological open, then act ONLY on the leftmost line
- * inside a left-edge band and paint just its pixels white.
+ * with a tall narrow morphological open, find the leftmost edge-to-edge line
+ * inside a left-edge band, and CROP the cell just right of it (+3 px).
  *
  * The left-band restriction is the safety lever: a tall, fairly straight letter
  * stroke (left bar of N/R/K/B/h/b/d) mid-cell would otherwise survive the same
- * open and get erased. Confining removal to the leftmost band leaves real
- * letters alone, and painting (not cropping) preserves writing on BOTH sides of
- * the rule — players sometimes cross it, and there is often no gap to its right.
+ * open and get removed. Confining removal to the leftmost band leaves real
+ * letters alone. (An earlier version PAINTED only the rule's own pixels white
+ * to preserve writing crossing the rule — but the surviving anti-aliased fringe
+ * decoded as a leading piece letter at high confidence, CAUSING the very
+ * corruption this function exists to prevent. See the crop block below.)
  *
  * @param {cv.Mat} cellImg - Cell image (RGBA or grayscale)
  * @param {number} [minLineFrac=0.5] - Min straight-run length (fraction of cell
@@ -1954,25 +1956,27 @@ function cleanCell(cellImg, minLineFrac, leftBandFrac, edgeTolFrac, edgeMode) {
         return cellImg;  // no continuous top-to-bottom rule in the left band
     }
 
-    // Paint ONLY the chosen rule's pixels white. Writing to the left (a player
-    // crossing the rule) and to the right (no-gap writing) survives.
-    var cleaned = cellImg.clone();
-    var numChannels = cleaned.channels();
-    for (var cy = 0; cy < ch; cy++) {
-        for (var cx = startX; cx <= endX; cx++) {
-            if (dilated.ucharAt(cy, cx) > 128) {
-                if (numChannels === 1) {
-                    cleaned.ucharPtr(cy, cx)[0] = 255;
-                } else {
-                    var ptr = cleaned.ucharPtr(cy, cx);
-                    ptr[0] = 255; ptr[1] = 255; ptr[2] = 255;
-                    if (numChannels === 4) ptr[3] = 255;
-                }
-            }
-        }
-    }
-
     dilated.delete();
+
+    // CROP the cell just right of the rule (Jun 2026, replaces pixel painting).
+    // Painting only the mask's pixels white left the rule's anti-aliased FRINGE
+    // behind (light-gray columns the tall-open never reaches >128, worse on 2x
+    // auto-upscaled scans). An isolated faint stub then decodes as a leading
+    // piece letter with HIGH confidence (c4→"Nc4" 0.98, e3→"Ne3" 0.99 — Premier
+    // R7 B6), while the model reads the untouched solid bar correctly. Cropping
+    // removes rule + fringe + everything left of it in one cut; nothing remains
+    // to hallucinate from. Validated offline vs the verified PGN on all 124
+    // cells of that game: crop 75 vs paint 59 vs raw 62 correct. Cost: writing
+    // that crosses the rule loses what sits left of the cut (rare; ~2 marginal
+    // regressions vs ~16 net wins). Margin +3 px clears the right-side fringe;
+    // results were insensitive to +0/+2/+4.
+    var cutX = Math.min(cw - 1, endX + 3);
+    if (cw - cutX < 10) {
+        return cellImg;  // degenerate: rule fills the cell — leave untouched
+    }
+    var roi = cellImg.roi(new cv.Rect(cutX, 0, cw - cutX, ch));
+    var cleaned = roi.clone();   // standalone Mat — caller deletes it safely
+    roi.delete();
     return cleaned;
 }
 

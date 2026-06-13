@@ -1104,6 +1104,27 @@ function initBatchHandlers() {
         var out = await window.BatchExport.exportAndSaveErrorCsv();
         log('Wrote ' + out.filename + ' (' + out.count + ' row(s), ' +
             out.savedTo + ')');
+        if (out.decisions) {
+          log('Wrote ' + out.decisions.filename + ' (' + out.decisions.count +
+              ' decision(s), ' + out.decisions.savedTo + ')');
+        }
+        // Temporary ✓ on the button — same save-is-unmissable feedback as
+        // the Export Round PGN button. Also flash the game-list footer's
+        // "CSV" button, which delegates its click here.
+        function _flashCsvSaved(btn, origHtml, removeCls) {
+          if (!btn) return;
+          btn.innerHTML = '✓ Saved!';
+          btn.classList.add('bg-green-600');
+          btn.classList.remove(removeCls);
+          setTimeout(function() {
+            btn.innerHTML = origHtml;
+            btn.classList.remove('bg-green-600');
+            btn.classList.add(removeCls);
+          }, 3000);
+        }
+        _flashCsvSaved(btnExportCsv, 'Export CSV', 'bg-gray-600');
+        _flashCsvSaved(document.getElementById('btn-batch-export-csv-list'),
+                       'CSV', 'bg-gray-700');
       } catch (e) {
         log('CSV export failed: ' + (e && e.message ? e.message : e));
       }
