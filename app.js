@@ -1,6 +1,6 @@
 var CONFIG={pieceStyle:localStorage.getItem('zugwise_pieceStyle')||'maestro',apiUrl:'http://localhost:5000',usePyodide:false};
 var chess=null;
-var state={board:null,moves:[],sans:[],currentPly:0,stuckPly:null,stuckInfo:null,lastScrolledStuckPly:null,legalMoves:[],selectedFix:null,debugVisible:false,errorArrow:null,fixArrow:null,ocrArrow:null,missingMoveCandidates:[],editMode:null,editSortMode:'similarity',confirmedPly:0,fixedPlies:[],hasGridImage:false,ocrCells:[],inputMode:null,previewPly:null,pendingConfirmation:null,approvedPlies:[],lockedPlies:[],boardSelection:null,boardFlipped:false,mergeTierMap:null,mergeLockedPlies:null,mergeSettings:{lockMode:'tier1'}};
+var state={board:null,moves:[],sans:[],currentPly:0,stuckPly:null,stuckInfo:null,lastScrolledStuckPly:null,legalMoves:[],selectedFix:null,debugVisible:false,errorArrow:null,fixArrow:null,ocrArrow:null,missingMoveCandidates:[],editMode:null,editSortMode:'similarity',confirmedPly:0,fixedPlies:[],hasGridImage:false,ocrCells:[],inputMode:null,previewPly:null,pendingConfirmation:null,approvedPlies:[],lockedPlies:[],boardSelection:null,boardFlipped:false,mergeTierMap:null,mergeLockedPlies:null,mergeSettings:{lockMode:'tier1'},pgnHeaders:{}};
 var INITIAL_FEN='rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
 // ============================================
@@ -227,6 +227,8 @@ function setupEventListeners(){
   });
   document.getElementById('btn-apply').onclick=applyFix;
   document.getElementById('btn-download').onclick=downloadPGN;
+  var btnEditHeaders=document.getElementById('btn-edit-headers');
+  if(btnEditHeaders)btnEditHeaders.onclick=function(){if(window.PgnHeaderEditor)window.PgnHeaderEditor.openSingle();};
   document.getElementById('btn-lichess').onclick=openLichess;
   // Shared handler for both Change buttons (collapsed view header + the
   // expanded view's Upload Scoresheets header). Same full-reset semantics —
@@ -575,7 +577,39 @@ function trimMovesAtCheckmate(moves){
   return out;
 }
 
-function downloadPGN(){var moves=trimMovesAtCheckmate(state.moves);var pgn='[Event "Zugwise"]\n[Result "*"]\n[Source "Zugwise (gerhardtrippen.github.io/Zugwise)"]\n\n';moves.forEach(function(m,i){pgn+=m.num+'. '+m.white+' '+(m.black||'')+' ';if((i+1)%5===0)pgn+='\n';});pgn+='*';var blob=new Blob([pgn],{type:'text/plain'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='game.pgn';a.click();log('📥 Downloaded PGN');}
+function downloadPGN(){
+  var moves=trimMovesAtCheckmate(state.moves);
+  // Flat SAN list (generatePgn re-pairs and applies its own legality net).
+  var sans=[];
+  moves.forEach(function(m){if(m.white)sans.push(m.white);if(m.black)sans.push(m.black);});
+  // Merge user-edited headers (state.pgnHeaders) over sensible defaults.
+  var h=state.pgnHeaders||{};
+  var headers={};Object.keys(h).forEach(function(k){headers[k]=h[k];});
+  if(!headers.Event)headers.Event='Zugwise';
+  if(!headers.Date)headers.Date=new Date().toISOString().slice(0,10).replace(/-/g,'.');
+  if(!headers.Result)headers.Result='*';
+  var pgn;
+  if(window.BatchExport&&typeof window.BatchExport.generatePgn==='function'){
+    // Preferred: shared generator (canonical 7-tag block + legality truncation + Source).
+    pgn=window.BatchExport.generatePgn({},sans,headers);
+  }else{
+    // Inline fallback (no BatchExport, e.g. standalone): emit present tags + Source.
+    var order=['Event','Site','Date','Round','White','Black','Result','WhiteElo','BlackElo'];
+    var lines=[];
+    order.forEach(function(tag){if(headers[tag])lines.push('['+tag+' "'+String(headers[tag]).replace(/"/g,'\\"')+'"]');});
+    if(!headers.Source)lines.push('[Source "Zugwise (gerhardtrippen.github.io/Zugwise)"]');
+    var body='';for(var i=0;i<moves.length;i++){var m=moves[i];body+=m.num+'. '+m.white+' '+(m.black||'')+' ';if((i+1)%5===0)body+='\n';}
+    body+=headers.Result||'*';
+    pgn=lines.join('\n')+'\n\n'+body.trim()+'\n';
+  }
+  // Filename from players when available, else generic.
+  var fn='game.pgn';
+  if(headers.White||headers.Black){
+    var nm=function(s){return String(s||'NN').replace(/[^A-Za-z0-9_-]+/g,'_').replace(/^_+|_+$/g,'')||'NN';};
+    fn=nm(headers.White)+'_vs_'+nm(headers.Black)+'.pgn';
+  }
+  var blob=new Blob([pgn],{type:'application/x-chess-pgn'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=fn;a.click();log('📥 Downloaded PGN ('+fn+')');
+}
 
 function openLichess(){var moves=trimMovesAtCheckmate(state.moves);var pgn=moves.map(function(m){return m.num+'. '+m.white+' '+(m.black||'');}).join(' ');window.open('https://lichess.org/paste?pgn='+encodeURIComponent(pgn),'_blank');log('🔗 Opened in Lichess');}
 
@@ -628,6 +662,7 @@ function initBatchHandlers() {
   var btnFiles = document.getElementById('btn-batch-files');
   var fileInput = document.getElementById('batch-file-input');
   var roundSelect = document.getElementById('batch-round-select');
+  var playerSelect = document.getElementById('batch-player-select');
   var btnStart = document.getElementById('btn-batch-start');
   var btnCancel = document.getElementById('btn-batch-cancel');
   var btnTournament = document.getElementById('btn-batch-tournament');
@@ -709,6 +744,28 @@ function initBatchHandlers() {
         data = await parseTournamentFile(files[0]);
       }
       var playerCount = Object.keys(data.players).length;
+      // Name-keyed exports (chess-results.com per-round XLS) ship no roster, so
+      // data.players is empty even though every pairing names two players — the
+      // status line would read "0 players" while the player selector is full.
+      // Fall back to counting the distinct players across all pairings, using
+      // the same identity rule as BatchNaming.playerIdentity (section-scoped
+      // start number when present, else normalized name).
+      if (playerCount === 0) {
+        var _seenPlayers = {};
+        Object.keys(data.pairings || {}).forEach(function(rk) {
+          (data.pairings[rk] || []).forEach(function(p) {
+            [['whiteSNo', 'whiteName'], ['blackSNo', 'blackName']].forEach(function(side) {
+              var sno = p[side[0]], name = p[side[1]];
+              var hasSNo = (sno != null && !isNaN(sno) && Number(sno) !== 0);
+              var key = hasSNo
+                ? ('sno:' + (p.section || '') + ':' + Number(sno))
+                : (name ? 'name:' + String(name).trim().toLowerCase().replace(/\s+/g, ' ') : null);
+              if (key) _seenPlayers[key] = true;
+            });
+          });
+        });
+        playerCount = Object.keys(_seenPlayers).length;
+      }
       // Pairing keys are section-qualified (OPEN_R1, U1800_R1, ...) when a
       // tournament has multiple sections — naive Object.keys would report
       // "15 rounds" for a 3-section × 5-round event. Count distinct round
@@ -727,6 +784,11 @@ function initBatchHandlers() {
         throw new Error('no rounds parsed from ' + loadingLabel);
       }
       window._batchTournamentData = data;
+      // New tournament data invalidates any prior allGames pairing attachment,
+      // so player-mode re-attaches against the fresh pairings on next use.
+      if (window.BatchGameList && window.BatchGameList.batchState) {
+        window.BatchGameList.batchState._allGamesPairingsAttached = false;
+      }
       var eventType = window.BatchTournament &&
                       typeof window.BatchTournament.detectEventType === 'function'
                       ? window.BatchTournament.detectEventType(data) : null;
@@ -817,7 +879,20 @@ function initBatchHandlers() {
       // "Round_2.xls"); crosstable order is irrelevant — there's usually one.
       perRound.sort();
       crosstable.sort();
-      return crosstable.concat(perRound);
+      // Include any remaining XLS that matched NEITHER keyword bucket. The
+      // chess-results.com "Starting rank" roster ships as a bare section file
+      // ("Open.xlsx", "U1800.xlsx") with no "round"/"pairing"/"crosstable" in
+      // the name — it would otherwise be dropped here, which is exactly why a
+      // folder with OpenRound1-5.xlsx + Open.xlsx loaded "0 players" (the
+      // roster is the SOLE source of player ratings/IDs). The structural sniff
+      // + per-section combine route it correctly. (A "…Cross.xlsx" crosstable
+      // missing the full "crosstable" keyword lands here too — harmless.)
+      var classified = {};
+      perRound.forEach(function(n) { classified[n] = true; });
+      crosstable.forEach(function(n) { classified[n] = true; });
+      var rest = xls.filter(function(n) { return !classified[n]; });
+      rest.sort();
+      return crosstable.concat(perRound).concat(rest);
     }
     if (xls.length > 0) {
       // No filename hints matched — fall back to all XLS files; the parser's
@@ -990,8 +1065,14 @@ function initBatchHandlers() {
   if (sectionSelect) {
     sectionSelect.onchange = function() {
       window.BatchGameList.selectSection(sectionSelect.value || null);
-      window.BatchGameList.renderRoundSelector(roundSelect);
-      roundSelect.value = '';
+      if (window.BatchGameList.batchState.batchMode === 'player') {
+        // Section narrows the player list; re-render it and clear the pick.
+        window.BatchGameList.renderPlayerSelector(playerSelect);
+        playerSelect.value = '';
+      } else {
+        window.BatchGameList.renderRoundSelector(roundSelect);
+        roundSelect.value = '';
+      }
       btnStart.disabled = true;
       var summary = document.getElementById('batch-summary');
       if (summary) summary.classList.add('hidden');
@@ -1014,6 +1095,124 @@ function initBatchHandlers() {
     summary.classList.remove('hidden');
   };
 
+  // --- Step 4b: Round / Player mode toggle ---
+  // "By Round" processes every game in a round; "By Player" processes all of
+  // one player's games across rounds. Player mode needs a tournament file (the
+  // only source of player identities) — renderPlayerSelector shows a hint when
+  // none is loaded.
+  var btnModeRound = document.getElementById('batch-mode-round');
+  var btnModePlayer = document.getElementById('batch-mode-player');
+  var step4Label = document.getElementById('batch-step4-label');
+
+  function _setBatchMode(mode) {
+    var sectionSelect = document.getElementById('batch-section-select');
+    var summary = document.getElementById('batch-summary');
+    var exportBtn = document.getElementById('btn-batch-export-round');
+    // Set the gate now (selectRound/selectPlayer re-affirm it later) so a
+    // section change made BEFORE a player/round is picked branches correctly.
+    if (window.BatchGameList && window.BatchGameList.batchState) {
+      window.BatchGameList.batchState.batchMode = mode;
+    }
+    btnStart.disabled = true;
+    if (summary) summary.classList.add('hidden');
+    _exportButtonsVisible(false);
+    var collectBtn = document.getElementById('btn-batch-collect-sheets');
+    if (collectBtn) collectBtn.classList.add('hidden');  // player-mode + selection only
+    if (exportBtn) {
+      exportBtn.textContent = (mode === 'player') ? 'Export Player PGN' : 'Export Round PGN';
+      exportBtn.title = (mode === 'player')
+        ? "Concatenate all of this player's games into one PGN file"
+        : 'Concatenate all verified games in this round into one PGN file';
+    }
+
+    if (mode === 'player') {
+      if (btnModePlayer) {
+        btnModePlayer.className = 'px-2 py-0.5 rounded text-xs bg-blue-600 text-white';
+      }
+      if (btnModeRound) {
+        btnModeRound.className = 'px-2 py-0.5 rounded text-xs bg-gray-700 text-gray-300 hover:bg-gray-600';
+      }
+      roundSelect.classList.add('hidden');
+      roundSelect.value = '';
+      // Section gate: in player mode the section narrows the PLAYER list (not
+      // rounds), with an "All Sections" entry. Default to All Sections so the
+      // full roster shows; the user can narrow to one section to shorten it.
+      var pmSections = (window.BatchGameList.batchState.availableSections || [])
+        .filter(function(s) { return s.section; });
+      if (sectionSelect && pmSections.length > 1) {
+        window.BatchGameList.renderSectionSelector(sectionSelect, { includeAll: true });
+        sectionSelect.value = '';
+        window.BatchGameList.selectSection(null);
+        sectionSelect.classList.remove('hidden');
+      } else if (sectionSelect) {
+        sectionSelect.classList.add('hidden');
+      }
+      if (playerSelect) {
+        window.BatchGameList.renderPlayerSelector(playerSelect);
+        playerSelect.value = '';
+        playerSelect.classList.remove('hidden');
+      }
+      if (step4Label) {
+        step4Label.textContent = (pmSections.length > 1) ? 'section + player' : 'player';
+      }
+    } else {
+      if (btnModeRound) {
+        btnModeRound.className = 'px-2 py-0.5 rounded text-xs bg-blue-600 text-white';
+      }
+      if (btnModePlayer) {
+        btnModePlayer.className = 'px-2 py-0.5 rounded text-xs bg-gray-700 text-gray-300 hover:bg-gray-600';
+      }
+      if (playerSelect) playerSelect.classList.add('hidden');
+      roundSelect.classList.remove('hidden');
+      // Restore the section selector if this is a multi-section tournament.
+      // Re-render WITHOUT the "All Sections" entry (a round needs a concrete
+      // section) so switching back from player mode drops that option, then
+      // restore a concrete section — selectedSection may be null if the user
+      // left player mode on "All Sections".
+      var sections = (window.BatchGameList.batchState.availableSections || [])
+        .filter(function(s) { return s.section; });
+      if (sectionSelect && sections.length > 1) {
+        window.BatchGameList.renderSectionSelector(sectionSelect);
+        var sec = window.BatchGameList.batchState.selectedSection || sections[0].section;
+        sectionSelect.value = sec;
+        window.BatchGameList.selectSection(sec);
+        window.BatchGameList.renderRoundSelector(roundSelect);
+        roundSelect.value = '';
+        sectionSelect.classList.remove('hidden');
+      }
+      if (step4Label) {
+        step4Label.textContent = (sectionSelect && sections.length > 1)
+          ? 'section + round' : 'round';
+      }
+    }
+  }
+
+  if (btnModeRound) btnModeRound.onclick = function() { _setBatchMode('round'); };
+  if (btnModePlayer) btnModePlayer.onclick = function() { _setBatchMode('player'); };
+
+  if (playerSelect) {
+    playerSelect.onchange = function() {
+      var key = playerSelect.value;
+      if (!key) {
+        btnStart.disabled = true;
+        return;
+      }
+      window.BatchGameList.selectPlayer(key);
+      btnStart.disabled = false;
+      var summary = document.getElementById('batch-summary');
+      var games = window.BatchGameList.batchState.games;
+      var name = window.BatchGameList.batchState.selectedPlayerName || 'player';
+      if (summary) {
+        summary.textContent = games.size + ' game' + (games.size !== 1 ? 's' : '') +
+                              ' for ' + name;
+        summary.classList.remove('hidden');
+      }
+      _exportButtonsVisible(true);
+      var collectBtn = document.getElementById('btn-batch-collect-sheets');
+      if (collectBtn) collectBtn.classList.remove('hidden');
+    };
+  }
+
   // Start batch OCR
   btnStart.onclick = function() {
     btnStart.disabled = true;
@@ -1033,9 +1232,17 @@ function initBatchHandlers() {
   var btnExportRound = document.getElementById('btn-batch-export-round');
   var btnExportCsv = document.getElementById('btn-batch-export-csv');
   var btnDashboard = document.getElementById('btn-batch-dashboard');
+  var btnExportHeaders = document.getElementById('btn-batch-export-headers');
+  var btnCollectSheets = document.getElementById('btn-batch-collect-sheets');
+
+  if (btnExportHeaders) {
+    btnExportHeaders.onclick = function() {
+      if (window.PgnHeaderEditor) window.PgnHeaderEditor.openBatchDefaults();
+    };
+  }
 
   function _exportButtonsVisible(show) {
-    [btnExportRound, btnExportCsv, btnDashboard].forEach(function(b) {
+    [btnExportRound, btnExportCsv, btnDashboard, btnExportHeaders].forEach(function(b) {
       if (!b) return;
       if (show) b.classList.remove('hidden');
       else b.classList.add('hidden');
@@ -1047,6 +1254,37 @@ function initBatchHandlers() {
     _exportButtonsVisible(!!roundSelect.value);
   });
 
+  // "Player Scoresheets" is player-mode only — collects the selected player's
+  // source scans (both copies per game) into a ZIP. Independent of the
+  // round-mode export-button group; shown only after a player is picked.
+  if (btnCollectSheets) {
+    btnCollectSheets.onclick = async function() {
+      if (!window.BatchScoresheetCollect) {
+        log('Scoresheet collector not loaded'); return;
+      }
+      btnCollectSheets.disabled = true;
+      var orig = btnCollectSheets.textContent;
+      try {
+        var out = await window.BatchScoresheetCollect.collectPlayerScoresheets();
+        var msg = '📥 ' + out.filename + ' — ' + out.files + ' sheet(s) from ' +
+                  out.games + ' game(s)';
+        if (out.missing > 0) msg += ' (' + out.missing + ' game(s) had no scans)';
+        log(msg);
+        btnCollectSheets.textContent = '✓ Downloaded!';
+        btnCollectSheets.classList.add('bg-green-600');
+        btnCollectSheets.classList.remove('bg-teal-700');
+        setTimeout(function() {
+          btnCollectSheets.textContent = orig;
+          btnCollectSheets.classList.remove('bg-green-600');
+          btnCollectSheets.classList.add('bg-teal-700');
+        }, 3000);
+      } catch (e) {
+        log('Scoresheet collection failed: ' + (e && e.message ? e.message : e));
+      }
+      btnCollectSheets.disabled = false;
+    };
+  }
+
   if (btnExportRound) {
     btnExportRound.onclick = async function() {
       if (!window.BatchExport) { log('BatchExport module not loaded'); return; }
@@ -1055,11 +1293,15 @@ function initBatchHandlers() {
         // All games go into one file: verified games with their actual result,
         // non-verified games with result=* and a [Termination] tag, move list
         // truncated to the confirmed prefix (stuckPly cutoff — never ships
-        // algorithm-staged moves the user hasn't reviewed).
-        var out = await window.BatchExport.exportAndSaveRoundCombinedPgn();
+        // algorithm-staged moves the user hasn't reviewed). Player mode bundles
+        // the selected player's games across rounds instead of one round.
+        var bs = window.BatchGameList.batchState;
+        var out = (bs.batchMode === 'player')
+          ? await window.BatchExport.exportAndSavePlayerCombinedPgn()
+          : await window.BatchExport.exportAndSaveRoundCombinedPgn();
 
         if (out.count === 0) {
-          log('No games in this round to export');
+          log('No games to export');
         } else {
           var where = (out.savedTo === 'folder') ? 'saved to scan folder' : 'downloaded';
           var detail = '';
@@ -1085,9 +1327,11 @@ function initBatchHandlers() {
             }, 3000);
           }
           _flashSaved(btnExportRound,
-                      'Export Round PGN', 'bg-green-600', 'bg-indigo-600');
-          _flashSaved(document.getElementById('btn-batch-export-round-list'),
-                      '&#128229; Round PGN', 'bg-green-700', 'bg-indigo-700');
+                      btnExportRound.textContent || 'Export PGN', 'bg-green-600', 'bg-indigo-600');
+          var roundListBtn = document.getElementById('btn-batch-export-round-list');
+          _flashSaved(roundListBtn,
+                      (roundListBtn && roundListBtn.innerHTML) || '&#128229; Round PGN',
+                      'bg-green-700', 'bg-indigo-700');
         }
       } catch (e) {
         log('Export failed: ' + (e && e.message ? e.message : e));
@@ -1466,7 +1710,12 @@ var BATCH_HELP_CONTENT = {
       'selected round sequentially. The OCR runs ahead &mdash; you can start reviewing ' +
       'completed games while remaining games are still being processed.</p>' +
       '<p class="mt-2 text-xs text-gray-400">Processing speed: ~30-60 seconds per game, ' +
-      'depending on image quality and the number of moves.</p>'
+      'depending on image quality and the number of moves.</p>' +
+      '<p class="mt-2"><strong>By Player:</strong> switch the toggle to process every ' +
+      'game of a single player across all rounds (e.g. to hand a player their own ' +
+      'games). This needs a loaded tournament file &mdash; player identities come from ' +
+      'the pairings, not the folder structure &mdash; and exports one combined PGN per ' +
+      'player.</p>'
   }
 };
 
@@ -1535,6 +1784,21 @@ function onBatchFilesDiscovered(result) {
 
   var roundSelect = document.getElementById('batch-round-select');
   window.BatchGameList.renderRoundSelector(roundSelect);
+
+  // Reset to round mode for the freshly-loaded folder (the user may have left
+  // the previous session in player mode). The mode toggle handlers live inside
+  // initBatchHandlers, so reset the visible state by id here.
+  window.BatchGameList.batchState.batchMode = 'round';
+  window.BatchGameList.batchState.selectedPlayer = null;
+  roundSelect.classList.remove('hidden');
+  var playerSelectEl = document.getElementById('batch-player-select');
+  if (playerSelectEl) { playerSelectEl.classList.add('hidden'); playerSelectEl.value = ''; }
+  var collectSheetsEl = document.getElementById('btn-batch-collect-sheets');
+  if (collectSheetsEl) collectSheetsEl.classList.add('hidden');
+  var modeRoundBtn = document.getElementById('batch-mode-round');
+  var modePlayerBtn = document.getElementById('batch-mode-player');
+  if (modeRoundBtn) modeRoundBtn.className = 'px-2 py-0.5 rounded text-xs bg-blue-600 text-white';
+  if (modePlayerBtn) modePlayerBtn.className = 'px-2 py-0.5 rounded text-xs bg-gray-700 text-gray-300 hover:bg-gray-600';
 
   if (result.unmatched.length > 0) {
     log(result.unmatched.length + ' file(s) could not be matched to a game');

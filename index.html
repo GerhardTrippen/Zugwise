@@ -284,20 +284,30 @@
                 <span id="batch-tournament-status" class="text-xs text-gray-500"></span>
               </div>
             </div>
-            <!-- Step 4: Round (and optional section) selection -->
+            <!-- Step 4: Round/Player (and optional section) selection -->
             <div id="batch-round-selector" class="hidden">
               <div class="flex items-center gap-1 mb-1">
                 <label class="text-xs text-gray-400">Step 4: Select <span id="batch-step4-label">round</span></label>
                 <button class="batch-help-btn w-4 h-4 rounded-full bg-gray-600 hover:bg-blue-500 text-[10px] leading-4 text-center text-gray-300 hover:text-white" data-help="round" title="Help: Round selection">?</button>
+              </div>
+              <!-- Mode toggle: process a whole round, or one player's games across rounds -->
+              <div class="flex items-center gap-1 mb-1">
+                <button id="batch-mode-round" class="px-2 py-0.5 rounded text-xs bg-blue-600 text-white" title="Process every game in a round">By Round</button>
+                <button id="batch-mode-player" class="px-2 py-0.5 rounded text-xs bg-gray-700 text-gray-300 hover:bg-gray-600" title="Process all games of one player (requires a tournament file)">By Player</button>
               </div>
               <div class="flex items-center gap-2">
                 <select id="batch-section-select" class="bg-gray-700 text-gray-200 rounded px-2 py-1 text-sm border border-gray-600 hidden" title="Section"></select>
                 <select id="batch-round-select" class="bg-gray-700 text-gray-200 rounded px-2 py-1 text-sm border border-gray-600">
                   <option value="">-- Select Round --</option>
                 </select>
+                <select id="batch-player-select" class="bg-gray-700 text-gray-200 rounded px-2 py-1 text-sm border border-gray-600 hidden" title="Player">
+                  <option value="">-- Select Player --</option>
+                </select>
                 <button id="btn-batch-start" class="px-3 py-1.5 bg-green-600 hover:bg-green-500 rounded text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed" disabled>Start Batch OCR</button>
                 <button id="btn-batch-cancel" class="px-3 py-1.5 bg-red-700 hover:bg-red-600 rounded text-sm hidden">Cancel</button>
+                <button id="btn-batch-export-headers" class="px-3 py-1.5 bg-gray-600 hover:bg-gray-500 rounded text-sm hidden" title="Set PGN header defaults (Site, Event, Date…) applied to every exported game — fills gaps the tournament file left blank">✎ Edit Headers</button>
                 <button id="btn-batch-export-round" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm hidden" title="Concatenate all verified games in this round into one PGN file">Export Round PGN</button>
+                <button id="btn-batch-collect-sheets" class="px-3 py-1.5 bg-teal-700 hover:bg-teal-600 rounded text-sm hidden" title="Download a ZIP of this player's scoresheets (both copies per game) to send to them">📥 Player Scoresheets</button>
                 <button id="btn-batch-export-csv" class="px-3 py-1.5 bg-gray-600 hover:bg-gray-500 rounded text-sm hidden" title="Save a CSV report of reconstruction diagnostics">Export CSV</button>
                 <button id="btn-batch-dashboard" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm hidden" title="Show compact color-grid dashboard for this round">Dashboard</button>
               </div>
@@ -507,6 +517,7 @@
         </a>
       </div>
       <div class="flex gap-4">
+        <button id="btn-edit-headers" title="Edit PGN headers (Event, players, result…) before download" class="hover:text-gray-300">✎ Edit headers</button>
         <button id="btn-download" title="Download game as PGN file" class="hover:text-gray-300">📥 Download PGN</button>
         <button id="btn-lichess" title="Analyze position on Lichess.org" class="hover:text-gray-300">🔗 Open in Lichess</button>
       </div>
@@ -700,6 +711,19 @@
         <label class="text-gray-300 text-sm">Profile Name</label>
         <input id="profile-name" type="text" class="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm mt-1">
       </div>
+      <div class="mb-4 grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-gray-300 text-sm">City</label>
+          <input id="profile-city" type="text" placeholder="e.g. Mississauga"
+                 class="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm mt-1">
+        </div>
+        <div>
+          <label class="text-gray-300 text-sm">Country (3-letter)</label>
+          <input id="profile-country" type="text" placeholder="e.g. CAN" maxlength="3"
+                 class="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm mt-1 uppercase">
+        </div>
+        <p class="text-gray-500 text-xs col-span-2 -mt-1">Fills the PGN <code>[Site "City COUNTRY"]</code> tag when the tournament file has no location.</p>
+      </div>
       <div id="profile-pages" class="space-y-3 mb-4"></div>
       <button id="btn-add-page" class="text-blue-400 hover:text-blue-300 text-sm mb-4">+ Add page</button>
       <div class="flex justify-between mt-4">
@@ -761,6 +785,7 @@
   <script src="js/beam.js"></script>
   <script src="js/batch-naming.js"></script>
   <script src="js/batch-folder-paths.js"></script>
+  <script src="js/batch-grid-template.js"></script>
   <script src="js/batch-ocr-queue.js"></script>
   <script src="js/batch-triage.js"></script>
   <script src="js/batch-nw-autoapply.js"></script>
@@ -775,8 +800,10 @@
   <script src="js/batch-export.js"></script>
   <script src="js/verification-ui.js"></script>
   <script src="js/batch-dashboard.js"></script>
+  <script src="js/batch-scoresheet-collect.js"></script>
   <script src="js/batch-game-list.js"></script>
   <script src="js/pgn-batch.js"></script>
+  <script src="js/pgn-header-editor.js"></script>
   <script src="app.js"></script>
 
   <!-- Suggested values shared by all rowCount inputs (per-sheet override + profile editor) -->

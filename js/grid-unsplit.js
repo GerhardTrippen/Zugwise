@@ -675,10 +675,10 @@ function detectSeamByGrid(srcMat, log) {
         + 'px, 0–9 of peak ' + Math.round(peak) + '): ' + prof);
 
     // Seed one column inside each sheet = the strongest-grid column in each
-    // outer half (the seam lies between them). Then find the widest LOW-
-    // foreground run between the seeds: within a sheet the printed grid keeps
-    // foreground high even over blank/unfilled cells, so only the genuine
-    // inter-sheet gap (no printed grid) drops out.
+    // outer half (the seam lies between them). Then find the LOW-foreground
+    // runs between the seeds: within a sheet the printed grid keeps foreground
+    // high even over blank/unfilled cells, so the genuine inter-sheet gap
+    // (no printed grid) drops out.
     var gapThr = peak * 0.35;
     var plateauThr = peak * 0.5;
     var gL = 0, gR = (W >> 1);
@@ -689,21 +689,56 @@ function detectSeamByGrid(srcMat, log) {
             + Math.round(fgs[gL]) + ', right peak ' + Math.round(fgs[gR]) + ', need '
             + Math.round(plateauThr) + ') — may be a single sheet');
     }
-    var bestLen = 0, bestLo = -1, cur = 0, start = gL;
+    // Collect EVERY empty band between the seeds, then pick by SYMMETRY, not
+    // width. Two-up scoresheets are framed symmetrically, so the real inter-
+    // sheet gutter sits near the image centre; an unruled gutter *inside* one
+    // sheet can be WIDER but is off-centre. (Board5/MississaugaOpen2026: a 71px
+    // within-sheet band at 40% beat the true 44px-but-totally-empty gutter at
+    // 50%, clipping a column off each half.) Among real bands (>= a noise
+    // floor) choose the one whose centre is nearest W/2; near-ties on
+    // centrality break toward the emptier (deeper) band.
+    var center = W / 2;
+    var minBandW = Math.max(8, win >> 1);
+    var bands = [], cur = 0, start = gL;
     for (var x2 = gL; x2 < gR; x2++) {
         if (fgs[x2] < gapThr) {
             if (cur === 0) start = x2;
             cur++;
-            if (cur > bestLen) { bestLen = cur; bestLo = start; }
         } else {
+            if (cur > 0) bands.push({ lo: start, len: cur });
             cur = 0;
         }
     }
-    if (bestLo < 0) {
+    if (cur > 0) bands.push({ lo: start, len: cur });
+    // Reject sub-floor noise bands, but never filter down to nothing.
+    var real = bands.filter(function(bd) { return bd.len >= minBandW; });
+    if (!real.length) real = bands;
+    if (!real.length) {
         return done(false, null, 'no empty band (<' + Math.round(gapThr) + ') between the two '
             + 'grid plateaus at x=' + gL + ' and x=' + gR + ' — sheets abut or single sheet');
     }
-    var seamX = bestLo + (bestLen >> 1);
+    real.forEach(function(bd) {
+        bd.center = bd.lo + (bd.len >> 1);
+        var m = Infinity;
+        for (var i = bd.lo; i < bd.lo + bd.len; i++) if (fgs[i] < m) m = fgs[i];
+        bd.depth = m;  // emptiest column inside the band
+    });
+    real.sort(function(p, q) {
+        var d = Math.abs(p.center - center) - Math.abs(q.center - center);
+        if (Math.abs(d) > win) return d;   // clearly more central wins
+        return p.depth - q.depth;          // near-tie → emptier (deeper) wins
+    });
+    var best = real[0], widest = real[0];
+    for (var bi = 1; bi < real.length; bi++) if (real[bi].len > widest.len) widest = real[bi];
+    if (widest !== best) {
+        log('[grid-seam] symmetry prior: chose central band [' + best.lo + '..'
+            + (best.lo + best.len) + '] (' + best.len + 'px, depth ' + Math.round(best.depth)
+            + ', ' + Math.round(best.center / W * 100) + '%) over wider off-centre band ['
+            + widest.lo + '..' + (widest.lo + widest.len) + '] (' + widest.len + 'px, '
+            + Math.round(widest.center / W * 100) + '%)');
+    }
+    var bestLo = best.lo, bestLen = best.len;
+    var seamX = best.center;
     if (seamX < W * 0.20 || seamX > W * 0.80) {
         return done(false, null, 'seam x=' + seamX + ' (' + Math.round(seamX / W * 100)
             + '%) outside central 20–80% band');

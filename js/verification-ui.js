@@ -581,6 +581,18 @@ var VerificationUI = (function() {
     // interactive stuck-position flow is allowed to paint again.
     if (typeof state !== 'undefined' && state) state._verificationActive = false;
 
+    // originStuckPly is a REVIEW-ONLY highlight artifact: _setupStuckStateForFix
+    // sets it to a focused backtrack fix's origin so highlightCurrentMove /
+    // the OCR context grid paint that cell red while the focus ply stays
+    // yellow. It is the ONLY place it is ever set non-null. It is cleared on
+    // review ENTRY (line ~1114) but was never cleared on EXIT, so after an
+    // override/manual board fix exits review and revalidate() lands on a NEW
+    // stuck point, the stale origin kept painting an old cell red (e.g. 18.B)
+    // while the real stuck cell (e.g. 23.W) only got the yellow current-nav
+    // outline. Null it here so the post-exit revalidate paints stuck red on
+    // the actual stuck cell.
+    state.originStuckPly = null;
+
     // Restore state fields we mutated during review. revalidate() will
     // override these with the true post-review values but we clear them
     // first so nothing lingers if revalidate is unavailable.
@@ -2499,7 +2511,12 @@ var VerificationUI = (function() {
       td.addEventListener('click', function(e) {
         if (e.target.classList && e.target.classList.contains('delete-from-here')) return;
         e.stopPropagation();
-        _focusFix(i);
+        // skipScroll: the user clicked this cell, so it's already under the
+        // cursor. Auto-scrolling on the first click of a double-click would
+        // slide the row out from under the pointer, landing the second click
+        // on an adjacent cell (the user-reported double-click misfire). Same
+        // fix as ui.js's plain-cell goToPly({skipScroll:true}).
+        _focusFix(i, { skipScroll: true });
       }, true);
 
       // Double-click → manual edit. enterEditMode rewrites #panel-fixes
@@ -2697,7 +2714,8 @@ var VerificationUI = (function() {
   // write checkpoint if the counter has advanced.
   var _focusFixGeneration = 0;
 
-  async function _focusFix(idx) {
+  async function _focusFix(idx, opts) {
+    opts = opts || {};
     var v = _ensureState();
     if (!v || v.fixes.length === 0) return;
     if (idx < 0 || idx >= v.fixes.length) return;
@@ -2742,7 +2760,7 @@ var VerificationUI = (function() {
     // 2. Board: position BEFORE the stuck move. Use preserveErrorArrow
     //    so goToPly doesn't clobber the arrow we just set.
     if (p != null && typeof goToPly === 'function') {
-      goToPly(p, { preserveErrorArrow: true });
+      goToPly(p, { preserveErrorArrow: true, skipScroll: opts.skipScroll });
     }
 
     // 3. Show a brief "Finding Quick Fixes…" placeholder while the worker
@@ -2817,7 +2835,10 @@ var VerificationUI = (function() {
     _renderReviewHeader();
     _highlightCurrentFix();
     _scrollPanelsToTop();
-    _scrollMoveIntoView(p);
+    // Skip the move-list re-center on a direct cell click (see the click
+    // handler's skipScroll comment): the clicked cell is already in view, and
+    // scrolling mid-double-click misfires the second click onto a neighbor.
+    if (!opts.skipScroll) _scrollMoveIntoView(p);
     if (typeof renderArrows === 'function') {
       try { renderArrows(); } catch (e) { /* non-fatal */ }
     }

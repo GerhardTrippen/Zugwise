@@ -123,6 +123,7 @@ var BatchNaming = (function() {
     };
 
     // Walk path components looking for recognizable patterns
+    var roundIndex = -1;
     for (var i = 0; i < parts.length - 1; i++) {
       var part = parts[i].trim();
 
@@ -130,6 +131,7 @@ var BatchNaming = (function() {
       var roundMatch = part.match(/^(?:Round|Rd|R)\s*(\d+)$/i);
       if (roundMatch) {
         result.round = parseInt(roundMatch[1]);
+        roundIndex = i;
         continue;
       }
 
@@ -143,6 +145,24 @@ var BatchNaming = (function() {
       // If no round or board pattern, treat as section name
       if (!result.section) {
         result.section = part;
+      }
+    }
+
+    // Section refinement: the loop above takes the FIRST non-round/board
+    // component as the section, which is wrong when the real section is nested
+    // under a wrapper folder — e.g. "ZugwiseBatch/Open/Round 1/Board 1/…" would
+    // yield section="ZugwiseBatch", collapsing all sections to the wrapper name
+    // and hiding the section selector. By convention the section sits
+    // immediately before the "Round N" folder ("Open"), so when we located a
+    // round component with a plausible parent, prefer that parent. The
+    // single-level "Section/Round N/Board N" layout is unaffected (parent is
+    // still the section).
+    if (roundIndex > 0) {
+      var parent = parts[roundIndex - 1].trim();
+      if (parent &&
+          !/^(?:Round|Rd|R)\s*\d+$/i.test(parent) &&
+          !/^(?:Board|Bd|B)\s*\d+$/i.test(parent)) {
+        result.section = parent;
       }
     }
 
@@ -182,6 +202,16 @@ var BatchNaming = (function() {
         // Skip Zugwise's own output subtree (PGN/OCR/grid) — it holds only
         // generated artifacts, never source scans (see batch-folder-paths.js).
         if (window.BatchPaths && entry.name === window.BatchPaths.ROOT_DIR) {
+          continue;
+        }
+        // Skip preprocessing scratch dirs so their intermediate images don't
+        // become phantom games when the picker is aimed at the parent that
+        // holds BOTH the final dual-sheet output (e.g. "ZugwiseBatch/") and
+        // the temp work area beside it. Two conventions: a "<name>_work"
+        // sibling (the splitter's caller names its work dir this way) and the
+        // splitter's own "_normalized" page cache. The final output dir itself
+        // ("ZugwiseBatch", no "_work" suffix) is NOT matched, so it's scanned.
+        if (/_work$/i.test(entry.name) || entry.name === '_normalized') {
           continue;
         }
         var children = await readDirectoryRecursive(entry, entryPath);
@@ -244,6 +274,32 @@ var BatchNaming = (function() {
     var scanFiles = files.filter(function(f) {
       return isScanFile(f.name);
     });
+
+    // Drop loose source PDFs sitting at the TOP LEVEL of the picked folder.
+    // These are the splitter's INPUT — a whole-round multi-page PDF like
+    // "Open_Round1.pdf" that has already been split into the per-board tree
+    // (ZugwiseBatch/Open/Round 1/Board N/…). They resolve to a round but no
+    // board, so today they land in `unmatched` and clutter the "could not be
+    // matched" notice; worse, a stray top-level PDF is never a genuine
+    // per-board scan in a structured batch. Scope is deliberately narrow so a
+    // flat filename-convention workflow (e.g. "R1B1.pdf" at the root) is NOT
+    // affected: only PDFs that (a) sit directly in the picked root — path has
+    // no "/" — AND (b) carry no board token in their filename are dropped.
+    var droppedLoosePdf = 0;
+    scanFiles = scanFiles.filter(function(f) {
+      var atTopLevel = (f.path || f.name).indexOf('/') === -1;
+      if (!atTopLevel || !isPDF(f.name)) return true;
+      var fn = parseImageFilename(f.name) || {};
+      if (fn.board != null) return true;   // explicit per-board scan — keep
+      droppedLoosePdf++;
+      console.log('[GROUP-FILES] Skipping loose top-level source PDF (no board): ' +
+                  f.name);
+      return false;
+    });
+    if (droppedLoosePdf > 0) {
+      console.log('[GROUP-FILES] Skipped ' + droppedLoosePdf +
+                  ' loose top-level source PDF(s).');
+    }
 
     // Always log what came in, even when no duplicates -- helps confirm
     // groupFilesIntoGames is the path producing game.files (vs some other
@@ -498,6 +554,100 @@ var BatchNaming = (function() {
     return filtered;
   }
 
+  // =========================================================================
+  // Player-specific filtering (parallel to round filtering)
+  // =========================================================================
+  //
+  // The scan folder is organized Section/Round N/Board N/ — a player's
+  // identity is NOT in the directory structure or filenames. The only place a
+  // player→games mapping exists is the tournament-file pairings attached to
+  // each game (game.pairing.whiteName/blackName + whiteSNo/blackSNo). So these
+  // helpers REQUIRE that attachPairings() has already run on the games map.
+  // A game with no pairing simply contributes no player.
+
+  function _normPlayerName(n) {
+    return String(n || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+
+  /**
+   * Canonical identity for one side ('w'|'b') of a game's pairing.
+   * Keyed by section-scoped start number when present (robust, e.g.
+   * SwissManager/SwissSys), else by normalized name (name-keyed formats like
+   * chess-results.com which carry no start number). Returns null when the
+   * side has neither a name nor a start number, or no pairing is attached.
+   * @returns {{key:string, name:string, sNo:(number|null), section:string}|null}
+   */
+  function playerIdentity(game, side) {
+    var p = game && game.pairing;
+    if (!p) return null;
+    var name = (side === 'w') ? p.whiteName : p.blackName;
+    var sNo  = (side === 'w') ? p.whiteSNo  : p.blackSNo;
+    var hasSNo = (sNo != null && !isNaN(sNo) && Number(sNo) !== 0);
+    if (!hasSNo && !name) return null;
+    var section = game.section || '';
+    var key = hasSNo
+      ? 'sno:' + section + ':' + Number(sNo)
+      : 'name:' + _normPlayerName(name);
+    return { key: key, name: name || '', sNo: hasSNo ? Number(sNo) : null,
+             section: section };
+  }
+
+  /**
+   * List the distinct players across a set of games, with a game count each.
+   * Used to populate the player selector (parallel to getAvailableRounds).
+   * Requires pairings attached. Sorted by name.
+   *
+   * @param {Map<string, Object>} games
+   * @returns {Array<{key:string, name:string, sNo:(number|null),
+   *                  section:string, gameCount:number}>}
+   */
+  function getAvailablePlayers(games) {
+    var byKey = {};
+    if (!games || typeof games.forEach !== 'function') return [];
+    games.forEach(function(game) {
+      ['w', 'b'].forEach(function(side) {
+        var id = playerIdentity(game, side);
+        if (!id) return;
+        if (!byKey[id.key]) {
+          byKey[id.key] = { key: id.key, name: id.name, sNo: id.sNo,
+                            section: id.section, gameCount: 0 };
+        }
+        byKey[id.key].gameCount++;
+      });
+    });
+    return Object.keys(byKey).map(function(k) { return byKey[k]; })
+      .sort(function(a, b) {
+        var n = a.name.localeCompare(b.name);
+        return n !== 0 ? n : (a.section || '').localeCompare(b.section || '');
+      });
+  }
+
+  /**
+   * Filter games to those in which the given player (by identity key) played
+   * either color, across ALL rounds. Mirror of filterGamesByRound.
+   *
+   * @param {Map<string, Object>} games
+   * @param {string} playerKey - A key from getAvailablePlayers / playerIdentity
+   * @param {string} [section] - Optional section narrowing (usually redundant —
+   *   the player key is section-scoped for start-number identities).
+   * @returns {Map<string, Object>}
+   */
+  function filterGamesByPlayer(games, playerKey, section) {
+    var filtered = new Map();
+    if (!games || typeof games.forEach !== 'function' || !playerKey) {
+      return filtered;
+    }
+    games.forEach(function(game, gameId) {
+      if (section && game.section !== section) return;
+      var idW = playerIdentity(game, 'w');
+      var idB = playerIdentity(game, 'b');
+      if ((idW && idW.key === playerKey) || (idB && idB.key === playerKey)) {
+        filtered.set(gameId, game);
+      }
+    });
+    return filtered;
+  }
+
   /**
    * Build a display label for a game.
    *
@@ -545,6 +695,9 @@ var BatchNaming = (function() {
     getAvailableRounds: getAvailableRounds,
     getAvailableSections: getAvailableSections,
     filterGamesByRound: filterGamesByRound,
+    playerIdentity: playerIdentity,
+    getAvailablePlayers: getAvailablePlayers,
+    filterGamesByPlayer: filterGamesByPlayer,
     gameDisplayLabel: gameDisplayLabel
   };
 })();

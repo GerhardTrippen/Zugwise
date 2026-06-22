@@ -75,6 +75,35 @@ function getAmbiguousPlies() {
 }
 if (typeof window !== 'undefined') window.getAmbiguousPlies = getAmbiguousPlies;
 
+// True when the user has explicitly settled this ply (picked an alternative,
+// kept-as-is, locked, or overrode the algorithm's choice). Mirrors the
+// resolved-ply carve-out inside getAmbiguousPlies, but is consumed by the
+// SECOND forced-stop trigger — the low-confidence gate — which previously had
+// no such carve-out. Rationale: forced_stop fires on EITHER a dual-sheet
+// disagreement (_ambigPlies, already override-aware) OR a sub-threshold OCR
+// confidence (m.*Conf < getForcedStopMinConfidence()). An explicit override is
+// a stronger "I've settled this" signal than the confidence it replaced, so a
+// resolved cell must not re-trip the low-confidence gate. Without this, an
+// override onto a sub-threshold read (e.g. exd5 @49% vs the 50% default) exits
+// the algorithm review but immediately re-stops with a redundant "needs
+// review" in the fix panel.
+function isPlyResolved(ply) {
+  if (ply == null) return false;
+  var arrs = [state.approvedPlies, state.lockedPlies, state.fixedPlies];
+  for (var i = 0; i < arrs.length; i++) {
+    if (Array.isArray(arrs[i]) && arrs[i].indexOf(ply) >= 0) return true;
+  }
+  // Move STATUS is the robust signal: _confirmCurrentFix / applyOverride flip
+  // wStatus/bStatus to 'fixed' without always touching the arrays above.
+  var mv = Array.isArray(state.moves) ? state.moves[Math.floor(ply / 2)] : null;
+  if (mv) {
+    var st = (ply % 2 === 0) ? mv.wStatus : mv.bStatus;
+    if (st === 'fixed' || st === 'locked') return true;
+  }
+  return false;
+}
+if (typeof window !== 'undefined') window.isPlyResolved = isPlyResolved;
+
 // A locked/fixed ply preserves the user's chosen MOVE, but its stored SAN must
 // still be one the board renderer (chess.js v0.12.0, strict) can replay. OCR
 // routinely drops the capture 'x' (e.g. "Ra8" for a rook capture whose
@@ -170,7 +199,7 @@ async function validateAndDisplay(paired,filename,opts){
       if(m.wAlts&&m.wAlts.length>0){m.wAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.wLenientAlts&&m.wLenientAlts.length>0){m.wLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<getForcedStopMinConfidence())});
+      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<getForcedStopMinConfidence()&&!isPlyResolved((m.num-1)*2))});
     }
     if(m.black){
       flat.push(m.black);
@@ -178,7 +207,7 @@ async function validateAndDisplay(paired,filename,opts){
       if(m.bAlts&&m.bAlts.length>0){m.bAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.bLenientAlts&&m.bLenientAlts.length>0){m.bLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<getForcedStopMinConfidence())});
+      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<getForcedStopMinConfidence()&&!isPlyResolved((m.num-1)*2+1))});
     }
   });
   // Debug: count lenient alternatives in OCR data
@@ -613,7 +642,7 @@ async function fetchFixes(){
         }
         var lenientAlts=[];
         if(m.wLenientAlts&&m.wLenientAlts.length>0){m.wLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-        ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<getForcedStopMinConfidence())});
+        ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<getForcedStopMinConfidence()&&!isPlyResolved((m.num-1)*2))});
       }
       if(m.black){
         flat.push(m.black);
@@ -623,7 +652,7 @@ async function fetchFixes(){
         }
         var lenientAlts=[];
         if(m.bLenientAlts&&m.bLenientAlts.length>0){m.bLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-        ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<getForcedStopMinConfidence())});
+        ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<getForcedStopMinConfidence()&&!isPlyResolved((m.num-1)*2+1))});
       }
     });
 
@@ -878,7 +907,7 @@ async function revalidate(opts){
       if(m.wAlts&&m.wAlts.length>0){m.wAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.wLenientAlts&&m.wLenientAlts.length>0){m.wLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<getForcedStopMinConfidence())});
+      ocrData.push({move:m.white,confidence:m.wConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2)>=0)||((m.wConf||0.9)<getForcedStopMinConfidence()&&!isPlyResolved((m.num-1)*2))});
     }
     if(m.black){
       flat.push(m.black);
@@ -886,7 +915,7 @@ async function revalidate(opts){
       if(m.bAlts&&m.bAlts.length>0){m.bAlts.forEach(function(a){alts.push({move:Array.isArray(a)?a[0]:(a.move||a),confidence:Array.isArray(a)?(a[1]||0.1):(a.confidence||0.1)});});}
       var lenientAlts=[];
       if(m.bLenientAlts&&m.bLenientAlts.length>0){m.bLenientAlts.forEach(function(a){lenientAlts.push({move:a.move||a,confidence:a.confidence||0.1});});}
-      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<getForcedStopMinConfidence())});
+      ocrData.push({move:m.black,confidence:m.bConf||0.9,alternatives:alts,lenientAlternatives:lenientAlts,forced_stop:(_ambigPlies.indexOf((m.num-1)*2+1)>=0)||((m.bConf||0.9)<getForcedStopMinConfidence()&&!isPlyResolved((m.num-1)*2+1))});
     }
   });
   // Pass confirmedPly as startPly to skip re-checking already-confirmed moves

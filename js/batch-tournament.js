@@ -116,6 +116,23 @@ var BatchTournament = (function() {
       await _ensureXlsxLoaded();
       var buffer = await file.arrayBuffer();
       var sec = extractSectionFromFilename(file.name);
+
+      // chess-results.com web export? (different layout from desktop SwissManager)
+      var crRows = _xlsRows(buffer);
+      if (_isChessResultsRows(crRows)) {
+        var crSec = _chessResultsSection(crRows, sec);
+        var crKind = _sniffChessResultsXlsKind(crRows);
+        if (crKind === 'roster') {
+          return parseChessResultsRosterXLS(buffer, { section: crSec, _rows: crRows });
+        }
+        if (crKind === 'crosstable') {
+          return parseChessResultsCrosstableXLS(buffer, { section: crSec, _rows: crRows });
+        }
+        return parseChessResultsRoundXLS(buffer, {
+          section: crSec, round: _roundFromName(file.name), _rows: crRows
+        });
+      }
+
       var sectionOpts = sec ? { section: sec } : undefined;
       var kind = _sniffXlsKind(file.name, buffer);
       if (kind === 'crosstable') {
@@ -1260,14 +1277,363 @@ var BatchTournament = (function() {
           if (!p.whiteFideId && w.id) p.whiteFideId = w.id;
           if (!p.whiteRtg && w.rating) p.whiteRtg = w.rating;
           if (!p.whiteTitle && w.title) p.whiteTitle = w.title;
+          // chess-results rosters carry a national (CFC) number distinct from
+          // the FIDE id; donate it as the CFC id. No-op for chessmanager
+          // rosters (they have no cfcId field).
+          if (!p.whiteId && w.cfcId) p.whiteId = w.cfcId;
         }
         if (b) {
           if (!p.blackFideId && b.id) p.blackFideId = b.id;
           if (!p.blackRtg && b.rating) p.blackRtg = b.rating;
           if (!p.blackTitle && b.title) p.blackTitle = b.title;
+          if (!p.blackId && b.cfcId) p.blackId = b.cfcId;
         }
       });
     });
+  }
+
+  // =========================================================================
+  // chess-results.com web export (XLS/XLSX)
+  //
+  // The Chess-Results server (the web front-end to Swiss-Manager) exports a
+  // DIFFERENT layout from the Swiss-Manager desktop "Pairings & Results":
+  //   - Every file opens with the banner row
+  //       "From the Tournament-Database of Chess-Results https://chess-results.com"
+  //   - Pairings are split into ONE file per round, header
+  //       "Bo. | White | Pts. | Result | Pts. | Black"
+  //     and NO start-number (SNo) column — players are identified by NAME.
+  //     A "Round N on YYYY/MM/DD at HH:MM" banner carries the round + date,
+  //     and unplayed players appear as rows whose Black cell reads "not paired".
+  //   - Ratings / IDs live only in the separate "Starting rank" roster file
+  //     (header "No. | Name | ID | FideID | RtgI | RtgN | sex | Typ"; ID is the
+  //     national/CFC number, FideID the FIDE id, RtgN the national rating).
+  //   - A "Final Ranking crosstable" file has no board numbers, so it is only a
+  //     name source of last resort (when no roster is present).
+  //
+  // Because there is no SNo to key on, the combine path mirrors the
+  // chessmanager.com no-all-rounds branch: per-round files supply the pairings
+  // (board + names + result) and the roster donates ratings / IDs onto those
+  // pairings BY NAME via _attachPairingMetaByName.
+  // =========================================================================
+
+  function _xlsRows(buffer) {
+    if (typeof XLSX === 'undefined') throw new Error('SheetJS (XLSX) library not loaded');
+    var wb = XLSX.read(buffer, { type: 'array' });
+    var sheet = wb.Sheets[wb.SheetNames[0]];
+    return XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+  }
+
+  // The unmistakable chess-results.com banner sits in one of the first rows.
+  function _isChessResultsRows(rows) {
+    var n = Math.min(rows.length, 4);
+    for (var i = 0; i < n; i++) {
+      var joined = (rows[i] || []).map(function(c) { return String(c); }).join(' ');
+      if (/tournament-?database of chess-?results/i.test(joined)) return true;
+    }
+    return false;
+  }
+
+  // 'round' | 'roster' | 'crosstable'
+  function _sniffChessResultsXlsKind(rows) {
+    var n = Math.min(rows.length, 8);
+    for (var i = 0; i < n; i++) {
+      var c0 = String((rows[i] || [])[0] || '').trim();
+      if (/crosstable/i.test(c0)) return 'crosstable';
+      if (/^starting rank/i.test(c0)) return 'roster';
+      if (/^pairings\/results/i.test(c0) || /^Round\s+\d+\s+on\b/i.test(c0)) return 'round';
+    }
+    return 'round';
+  }
+
+  // Section name from the title row, e.g. "2026 Mississauga Open - Open" -> "Open".
+  function _chessResultsSection(rows, fallback) {
+    var n = Math.min(rows.length, 6);
+    for (var i = 0; i < n; i++) {
+      var c0 = String((rows[i] || [])[0] || '').trim();
+      if (!c0) continue;
+      if (/tournament-?database of chess-?results/i.test(c0)) continue;
+      if (/^last update/i.test(c0)) continue;
+      var m = c0.match(/\s[-–]\s(.+)$/);
+      if (m) return m[1].trim();
+      break;  // title row reached, no section suffix
+    }
+    return fallback || '';
+  }
+
+  // Which rating column feeds [WhiteElo]. The Mississauga Open sections are all
+  // FIDE-rated "as far as possible" AND nationally rated — a game is FIDE-rated
+  // whenever both players hold a FIDE rating, in EVERY section including
+  // U1800/U1300 (confirmed by the club's 2025 FIDE-results correspondence: a
+  // U1800 player's games against FIDE-rated opponents were FIDE-rated; his own
+  // rating only failed to update because he hadn't yet *established* a FIDE
+  // rating, a separate FIDE rule). So default to FIDE-first with national (CFC)
+  // fallback for players who have no FIDE rating. A genuinely CFC-only event can
+  // override per call with opts.ratingSource = 'national'. (section reserved for
+  // a future per-section override map.)
+  function _crRatingSource(section, opts) {
+    return (opts && opts.ratingSource) || 'fide';
+  }
+
+  // Clean event name = title row with any trailing " - Section" removed.
+  function _chessResultsEvent(rows) {
+    var n = Math.min(rows.length, 6);
+    for (var i = 0; i < n; i++) {
+      var c0 = String((rows[i] || [])[0] || '').trim();
+      if (!c0) continue;
+      if (/tournament-?database of chess-?results/i.test(c0)) continue;
+      if (/^last update/i.test(c0)) continue;
+      return c0.replace(/\s[-–]\s[^-–]+$/, '').trim();
+    }
+    return '';
+  }
+
+  // One per-round pairings file -> tournamentData (pairings keyed by name).
+  function parseChessResultsRoundXLS(buffer, opts) {
+    var rows = (opts && opts._rows) || _xlsRows(buffer);
+    var section = (opts && opts.section) || _chessResultsSection(rows, '');
+    var tournament = {
+      event: _chessResultsEvent(rows), site: '',
+      players: {}, pairings: {}, sections: section ? [section] : []
+    };
+
+    var round = (opts && opts.round) || null;
+    var date = '';
+    var cols = null;
+
+    for (var i = 0; i < rows.length; i++) {
+      var row = (rows[i] || []).map(function(c) { return String(c).trim(); });
+      var c0 = row[0] || '';
+
+      var rb = c0.match(/^Round\s+(\d+)\b/i);
+      if (rb) {
+        round = parseInt(rb[1], 10);
+        var d = _findDate(row);
+        if (d) date = d;
+        continue;
+      }
+
+      if (/^(Bo\.?|Board)$/i.test(c0)) { cols = _parseHeaderRow(row); continue; }
+      if (cols == null) continue;
+
+      var board = parseInt(row[cols.bo >= 0 ? cols.bo : 0], 10);
+      if (isNaN(board)) continue;  // footer / blank / banner rows
+
+      var whiteName = (cols.white >= 0) ? (row[cols.white] || '') : '';
+      var blackName = (cols.black >= 0) ? (row[cols.black] || '') : '';
+      if (!whiteName) continue;
+      // Skip unplayed/bye rows ("not paired", "bye", "-").
+      if (!blackName || /^not paired$/i.test(blackName) ||
+          /^bye$/i.test(blackName) || blackName === '-') continue;
+
+      if (round == null) round = (opts && opts.round) || 1;
+      var key = _pairingKey(section, round);
+      if (!tournament.pairings[key]) tournament.pairings[key] = [];
+      tournament.pairings[key].push({
+        board: board, section: section,
+        whiteSNo: null, blackSNo: null,
+        whiteName: whiteName, blackName: blackName,
+        whiteRtg: 0, blackRtg: 0, whiteTitle: '', blackTitle: '',
+        result: _normalizeResult((cols.result >= 0) ? row[cols.result] : ''),
+        date: date
+      });
+    }
+
+    if (date) { tournament.startDate = date; tournament.endDate = date; }
+    Object.keys(tournament.pairings).forEach(function(rk) {
+      tournament.pairings[rk].sort(function(a, b) {
+        return (a.board == null ? 9999 : a.board) - (b.board == null ? 9999 : b.board);
+      });
+    });
+    return tournament;
+  }
+
+  // The "Starting rank" roster file -> players keyed by start number, carrying
+  // FIDE id (.id), national/CFC id (.cfcId) and rating (national, FIDE fallback).
+  function parseChessResultsRosterXLS(buffer, opts) {
+    var rows = (opts && opts._rows) || _xlsRows(buffer);
+    var section = (opts && opts.section) || _chessResultsSection(rows, '');
+    var tournament = {
+      event: _chessResultsEvent(rows), site: '',
+      players: {}, pairings: {}, sections: section ? [section] : []
+    };
+
+    var ratingSource = _crRatingSource(section, opts);
+    var idx = null;
+    for (var i = 0; i < rows.length; i++) {
+      var row = (rows[i] || []).map(function(c) { return String(c).trim(); });
+      var c0 = row[0] || '';
+
+      if (idx == null) {
+        if (/^No\.?$/i.test(c0)) {
+          idx = { name: -1, cfcId: -1, fideId: -1, rtgI: -1, rtgN: -1 };
+          for (var c = 0; c < row.length; c++) {
+            var h = row[c].toLowerCase().replace(/\.+$/, '');
+            if (h === 'name') idx.name = c;
+            else if (h === 'fideid') idx.fideId = c;
+            else if (h === 'id') idx.cfcId = c;
+            else if (h === 'rtgi') idx.rtgI = c;
+            else if (h === 'rtgn') idx.rtgN = c;
+          }
+        }
+        continue;
+      }
+
+      var no = parseInt(c0, 10);
+      if (isNaN(no)) continue;  // footer / blank
+      var name = (idx.name >= 0) ? row[idx.name] : '';
+      if (!name) continue;
+      var rtgN = (idx.rtgN >= 0) ? (parseInt(row[idx.rtgN], 10) || 0) : 0;
+      var rtgI = (idx.rtgI >= 0) ? (parseInt(row[idx.rtgI], 10) || 0) : 0;
+      tournament.players[_playerKey(section, no)] = {
+        name: name,
+        // Section-based: FIDE-rated sections (Open) use the FIDE rating;
+        // CFC sections (U1800/U1300) use the national rating even for players
+        // who also hold a FIDE rating. Both kept as ratingFide/ratingNat.
+        rating: (ratingSource === 'national') ? (rtgN || rtgI) : (rtgI || rtgN),
+        ratingNat: rtgN, ratingFide: rtgI,
+        title: '',
+        id: (idx.fideId >= 0) ? row[idx.fideId] : '',   // FIDE id
+        cfcId: (idx.cfcId >= 0) ? row[idx.cfcId] : '',   // national/CFC number
+        sno: no, section: section
+      };
+    }
+    return tournament;
+  }
+
+  // Lone "Final Ranking crosstable": no boards, no ratings — names only.
+  // Returned so a single-file load doesn't error; boards need the round files.
+  function parseChessResultsCrosstableXLS(buffer, opts) {
+    var rows = (opts && opts._rows) || _xlsRows(buffer);
+    var section = (opts && opts.section) || _chessResultsSection(rows, '');
+    var tournament = {
+      event: _chessResultsEvent(rows), site: '',
+      players: {}, pairings: {}, sections: section ? [section] : []
+    };
+    var nameCol = -1, started = false, rk = 0;
+    for (var i = 0; i < rows.length; i++) {
+      var row = (rows[i] || []).map(function(c) { return String(c).trim(); });
+      var c0 = row[0] || '';
+      if (!started) {
+        if (/^Rk\.?$/i.test(c0)) {
+          started = true;
+          for (var c = 0; c < row.length; c++) {
+            if (row[c].toLowerCase().replace(/\.+$/, '') === 'name') { nameCol = c; break; }
+          }
+        }
+        continue;
+      }
+      if (isNaN(parseInt(c0, 10))) continue;
+      var name = (nameCol >= 0) ? row[nameCol] : '';
+      if (!name) continue;
+      tournament.players[_playerKey(section, 'rk' + (++rk))] = {
+        name: name, rating: 0, title: '', id: '', section: section
+      };
+    }
+    return tournament;
+  }
+
+  // Combine a set of chess-results.com web-export XLS files (roster + one file
+  // per round + optional crosstable) into a single tournamentData. Items are
+  // grouped by section so a roster only donates within its own section.
+  // items: [{ buffer, name, kind, section, round }]
+  function _combineChessResultsXls(items) {
+    var bySection = {};
+    items.forEach(function(it) {
+      var s = it.section || '';
+      (bySection[s] = bySection[s] || []).push(it);
+    });
+    var parts = Object.keys(bySection).map(function(s) {
+      return _combineChessResultsSection(bySection[s]);
+    });
+    if (parts.length === 1) return parts[0];
+
+    // Fold the per-section parts directly. They have disjoint round keys
+    // ("Open_R1" vs "U1800_R1") and disjoint player keys, so a plain merge is
+    // safe. We must NOT use mergeTournamentData here: these pairings carry no
+    // start numbers (whiteSNo/blackSNo === null), and mergeTournamentData
+    // dedups pairings by (min,max) SNo — which is (0,0) for every game, which
+    // would collapse each round to a single pairing.
+    var out = { event: '', site: '', players: {}, pairings: {}, sections: [] };
+    parts.forEach(function(td) {
+      if (!td) return;
+      if (!out.event && td.event) out.event = td.event;
+      if (!out.site && td.site) out.site = td.site;
+      if (td.startDate && (!out.startDate || td.startDate < out.startDate)) out.startDate = td.startDate;
+      if (td.endDate && (!out.endDate || td.endDate > out.endDate)) out.endDate = td.endDate;
+      (td.sections || []).forEach(function(s) {
+        if (s && out.sections.indexOf(s) < 0) out.sections.push(s);
+      });
+      Object.keys(td.players || {}).forEach(function(k) {
+        if (!out.players[k]) out.players[k] = td.players[k];
+      });
+      Object.keys(td.pairings || {}).forEach(function(rk) {
+        out.pairings[rk] = (out.pairings[rk] || []).concat(td.pairings[rk]);
+      });
+    });
+    return out;
+  }
+
+  function _combineChessResultsSection(items) {
+    var rosterTd = null;
+    items.filter(function(it) { return it.kind === 'roster'; }).forEach(function(it) {
+      var td;
+      try { td = parseChessResultsRosterXLS(it.buffer, { section: it.section }); }
+      catch (e) { return; }
+      rosterTd = rosterTd ? mergeTournamentData([rosterTd, td]) : td;
+    });
+
+    var donorParts = [];
+    items.filter(function(it) { return it.kind === 'round'; }).forEach(function(it) {
+      try {
+        donorParts.push(parseChessResultsRoundXLS(it.buffer, {
+          section: it.section, round: it.round || null
+        }));
+      } catch (e) { /* skip an unparseable round file, don't fail the set */ }
+    });
+
+    // No roster -> fall back to crosstable names so players aren't empty.
+    if (!rosterTd) {
+      items.filter(function(it) { return it.kind === 'crosstable'; }).forEach(function(it) {
+        var td;
+        try { td = parseChessResultsCrosstableXLS(it.buffer, { section: it.section }); }
+        catch (e) { return; }
+        rosterTd = rosterTd ? mergeTournamentData([rosterTd, td]) : td;
+      });
+    }
+
+    var out = { event: '', site: '', players: {}, pairings: {}, sections: [] };
+    function seedMeta(td) {
+      if (!td) return;
+      if (!out.event && td.event) out.event = td.event;
+      if (!out.site && td.site) out.site = td.site;
+      if (td.startDate && (!out.startDate || td.startDate < out.startDate)) out.startDate = td.startDate;
+      if (td.endDate && (!out.endDate || td.endDate > out.endDate)) out.endDate = td.endDate;
+      (td.sections || []).forEach(function(s) {
+        if (s && out.sections.indexOf(s) < 0) out.sections.push(s);
+      });
+    }
+    donorParts.forEach(seedMeta);
+    seedMeta(rosterTd);
+
+    donorParts.forEach(function(rt) {
+      Object.keys(rt.pairings).forEach(function(rk) {
+        out.pairings[rk] = (out.pairings[rk] || []).concat(rt.pairings[rk]);
+      });
+    });
+
+    if (rosterTd) {
+      Object.keys(rosterTd.players).forEach(function(k) {
+        if (!out.players[k]) out.players[k] = Object.assign({}, rosterTd.players[k]);
+      });
+      _attachPairingMetaByName(out, rosterTd);
+    }
+
+    Object.keys(out.pairings).forEach(function(rk) {
+      out.pairings[rk].sort(function(a, b) {
+        return (a.board == null ? 9999 : a.board) - (b.board == null ? 9999 : b.board);
+      });
+    });
+    return out;
   }
 
   // =========================================================================
@@ -1433,6 +1799,11 @@ var BatchTournament = (function() {
         return e === 'xls' || e === 'xlsx';
       });
       if (needsXlsx) await _ensureXlsxLoaded();
+      // chess-results.com web-export XLS files are gathered here and combined
+      // together (roster donates ratings/IDs onto per-round pairings by name),
+      // which a per-file parse + SNo-based merge cannot do (these files carry
+      // no start numbers).
+      var crXlsItems = [];
       for (var i = 0; i < otherFiles.length; i++) {
         var file = otherFiles[i];
         var ext = extOf(file);
@@ -1442,6 +1813,16 @@ var BatchTournament = (function() {
         }
         if (ext !== 'xls' && ext !== 'xlsx') continue;
         var buffer = await file.arrayBuffer();
+        var crRows = _xlsRows(buffer);
+        if (_isChessResultsRows(crRows)) {
+          crXlsItems.push({
+            buffer: buffer, name: file.name,
+            kind: _sniffChessResultsXlsKind(crRows),
+            section: _chessResultsSection(crRows, extractSectionFromFilename(file.name)),
+            round: _roundFromName(file.name)
+          });
+          continue;
+        }
         var kind = _sniffXlsKind(file.name, buffer);
         var sec = extractSectionFromFilename(file.name);
         var sectionOpts = sec ? { section: sec } : undefined;
@@ -1451,6 +1832,7 @@ var BatchTournament = (function() {
           parts.push(parseSwissManagerXLS(buffer, sectionOpts));
         }
       }
+      if (crXlsItems.length > 0) parts.push(_combineChessResultsXls(crXlsItems));
     }
 
     if (parts.length === 0) throw new Error('No parseable tournament files found');
@@ -1756,9 +2138,17 @@ var BatchTournament = (function() {
       roundStr = extra.Round || '?';
     }
 
+    // Location from the selected scoresheet template (city/country) — fills
+    // Site/EventCountry when the tournament file carries neither (chess-
+    // results.com per-round XLS never does). Ranks below the file and the
+    // header-editor override (extra, applied last below), above '?'.
+    var profLoc = (typeof window !== 'undefined' && window.SheetProfiles &&
+                   window.SheetProfiles.getActiveProfileLocation)
+      ? window.SheetProfiles.getActiveProfileLocation() : { site: '', country: '' };
+
     var headers = {
       Event: (tournamentData && tournamentData.event) || extra.Event || 'Tournament',
-      Site: (tournamentData && tournamentData.site) || extra.Site || '?',
+      Site: (tournamentData && tournamentData.site) || extra.Site || profLoc.site || '?',
       Date: extra.Date || (pairing && pairing.date) ||
             (tournamentData && tournamentData.startDate) ||
             new Date().toISOString().slice(0, 10).replace(/-/g, '.'),
@@ -1783,6 +2173,7 @@ var BatchTournament = (function() {
       if (pairing.blackFideId) headers.BlackFideId = String(pairing.blackFideId);
     }
 
+    if (profLoc.country) headers.EventCountry = profLoc.country;
     if (tournamentData) {
       if (tournamentData.startDate) headers.EventDate = tournamentData.startDate;
       if (tournamentData.country) headers.EventCountry = tournamentData.country;
@@ -1824,6 +2215,9 @@ var BatchTournament = (function() {
     parseChessManagerRoundCSV: parseChessManagerRoundCSV,
     parseChessManagerRosterCSV: parseChessManagerRosterCSV,
     parseChessManagerPgnHeaders: parseChessManagerPgnHeaders,
+    parseChessResultsRoundXLS: parseChessResultsRoundXLS,
+    parseChessResultsRosterXLS: parseChessResultsRosterXLS,
+    parseChessResultsCrosstableXLS: parseChessResultsCrosstableXLS,
     mergeTournamentData: mergeTournamentData,
     detectEventType: detectEventType,
     extractSectionFromFilename: extractSectionFromFilename,

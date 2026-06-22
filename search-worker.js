@@ -29,9 +29,17 @@ async function initSearchWorker() {
         });
 
         postMessage({ type: 'status', message: 'Installing python-chess...' });
+        // Vendored wheel for true offline install (precached by the service worker).
+        // Resolve against the worker's own location so it works under any deploy path
+        // (e.g. github.io/Zugwise/). Fall back to PyPI if the local file is missing.
+        const chessWheelUrl = new URL('vendor/chess-1.10.0-py3-none-any.whl', self.location).href;
+        pyodide.globals.set('CHESS_WHEEL_URL', chessWheelUrl);
         await pyodide.runPythonAsync(`
 import micropip
-await micropip.install('chess')
+try:
+    await micropip.install(CHESS_WHEEL_URL)
+except Exception:
+    await micropip.install('chess')  # network fallback
         `);
 
         postMessage({ type: 'status', message: 'Loading reconstruction modules...' });

@@ -54,9 +54,13 @@ var BatchGameList = (function() {
     games: new Map(),          // gameId -> game metadata + status
     ocrResults: {},            // gameId -> {ocrCells, gridSidecar}
     currentGameId: null,
+    batchMode: 'round',        // 'round' | 'player' — which gate is active
     selectedRound: null,
+    selectedPlayer: null,      // player identity key when batchMode === 'player'
+    selectedPlayerName: null,  // display name for the selected player
     selectedSection: null,     // null = "all sections"; only meaningful when >1 section
     allGames: null,            // All games from folder (all rounds, all sections)
+    _allGamesPairingsAttached: false, // attachPairings ran on allGames (player mode)
     availableRounds: [],
     availableSections: [],
     folderHandle: null,        // File System Access API handle
@@ -91,6 +95,7 @@ var BatchGameList = (function() {
       defaultSection: dirHandle.name || null
     });
     batchState.allGames = result.games;
+    batchState._allGamesPairingsAttached = false;
     batchState.availableSections = window.BatchNaming.getAvailableSections(result.games);
     batchState.selectedSection = null;
     batchState.availableRounds = window.BatchNaming.getAvailableRounds(result.games);
@@ -146,6 +151,7 @@ var BatchGameList = (function() {
       defaultSection: defaultSection
     });
     batchState.allGames = result.games;
+    batchState._allGamesPairingsAttached = false;
     batchState.availableSections = window.BatchNaming.getAvailableSections(result.games);
     batchState.selectedSection = null;
     batchState.availableRounds = window.BatchNaming.getAvailableRounds(result.games);
@@ -179,6 +185,9 @@ var BatchGameList = (function() {
    * @param {number} round
    */
   function selectRound(round) {
+    batchState.batchMode = 'round';
+    batchState.selectedPlayer = null;
+    batchState.selectedPlayerName = null;
     batchState.selectedRound = round;
     var roundGames = window.BatchNaming.filterGamesByRound(
       batchState.allGames, round, batchState.selectedSection);
@@ -219,6 +228,203 @@ var BatchGameList = (function() {
     }
 
     renderGameList();
+  }
+
+  // =========================================================================
+  // Player-specific batch mode (parallel to round mode)
+  // =========================================================================
+  //
+  // Round mode filters allGames by round; player mode filters by player across
+  // ALL rounds. The two are mutually-exclusive gates (batchState.batchMode).
+  // Everything downstream — OCR queue, reconstruct, triage, verification UI —
+  // operates on batchState.games and is mode-agnostic; only the gate and the
+  // combined export differ.
+  //
+  // A player's games can only be identified from the tournament-file pairings,
+  // so player mode REQUIRES a loaded tournament file. Pairings are normally
+  // attached per round-subset inside selectRound; for player mode we must
+  // attach them to the FULL allGames map first so filterGamesByPlayer can see
+  // every game's players.
+
+  /**
+   * Ensure pairing data is attached to every game in allGames (idempotent).
+   * Returns true if pairings are available, false if no tournament file is
+   * loaded (player mode is impossible in that case).
+   */
+  function _ensureAllGamesPairings() {
+    if (!batchState.allGames) return false;
+    var tournamentData = window._batchTournamentData || null;
+    if (!tournamentData || !window.BatchTournament ||
+        typeof window.BatchTournament.attachPairings !== 'function') {
+      return false;
+    }
+    if (!batchState._allGamesPairingsAttached) {
+      var matched = window.BatchTournament.attachPairings(
+        batchState.allGames, tournamentData);
+      batchState._allGamesPairingsAttached = true;
+      if (typeof log === 'function') {
+        log('[Batch] Attached pairings to ' + matched + '/' +
+            batchState.allGames.size + ' games for player selection');
+      }
+    }
+    return true;
+  }
+
+  /**
+   * List players available for player-mode selection. Returns [] when no
+   * tournament file is loaded (player identities are unknowable otherwise).
+   * @returns {Array<{key, name, sNo, section, gameCount}>}
+   */
+  function getAvailablePlayers() {
+    if (!_ensureAllGamesPairings()) return [];
+    return window.BatchNaming.getAvailablePlayers(batchState.allGames);
+  }
+
+  /**
+   * Select a player and populate the game list with all of that player's
+   * games across rounds. Mirror of selectRound.
+   * @param {string} playerKey - identity key from getAvailablePlayers
+   */
+  function selectPlayer(playerKey) {
+    batchState.batchMode = 'player';
+    batchState.selectedRound = null;
+    batchState.selectedPlayer = playerKey;
+
+    if (!_ensureAllGamesPairings()) {
+      batchState.games = new Map();
+      batchState.selectedPlayerName = null;
+      renderGameList();
+      return;
+    }
+
+    var playerGames = window.BatchNaming.filterGamesByPlayer(
+      batchState.allGames, playerKey, batchState.selectedSection);
+
+    // Resolve a display name from any matched game (white or black side).
+    var displayName = null;
+    playerGames.forEach(function(game) {
+      if (displayName) return;
+      var idW = window.BatchNaming.playerIdentity(game, 'w');
+      var idB = window.BatchNaming.playerIdentity(game, 'b');
+      if (idW && idW.key === playerKey) displayName = idW.name;
+      else if (idB && idB.key === playerKey) displayName = idB.name;
+    });
+    batchState.selectedPlayerName = displayName;
+
+    // Build game status entries. Unlike selectRound, pairing is already
+    // attached to allGames, so carry it straight onto the copy.
+    batchState.games = new Map();
+    playerGames.forEach(function(game, gameId) {
+      batchState.games.set(gameId, {
+        gameId: game.gameId,
+        section: game.section,
+        round: game.round,
+        board: game.board,
+        boardFromDirectory: game.boardFromDirectory,
+        files: game.files,
+        status: GAME_STATUS.QUEUED,
+        ocrCellCount: 0,
+        pairing: game.pairing || null
+      });
+    });
+
+    batchState.active = true;
+    renderGameList();
+  }
+
+  /**
+   * Refresh the on-disk combined PGN for the current gate (round or player),
+   * fire-and-forget. Routes to the round- or player-combined exporter so both
+   * gates keep an up-to-date file as games get verified. No-op when nothing is
+   * selected or BatchExport is unavailable.
+   * @returns {Promise|null}
+   */
+  function _autoSaveCombinedPgn(reasonTag) {
+    if (!window.BatchExport) return null;
+    var tag = reasonTag || 'Auto-save';
+    if (batchState.batchMode === 'player' && batchState.selectedPlayer != null &&
+        window.BatchExport.exportAndSavePlayerCombinedPgn) {
+      return window.BatchExport.exportAndSavePlayerCombinedPgn(batchState.selectedPlayer)
+        .then(function() {
+          if (typeof log === 'function') {
+            log('[' + tag + '] Player combined PGN refreshed (' +
+                (batchState.selectedPlayerName || 'player') + ')');
+          }
+        })
+        .catch(function(e) {
+          console.warn('[Batch] Player PGN refresh failed:', e);
+        });
+    }
+    if (batchState.batchMode === 'round' && batchState.selectedRound != null &&
+        window.BatchExport.exportAndSaveRoundCombinedPgn) {
+      return window.BatchExport.exportAndSaveRoundCombinedPgn(batchState.selectedRound)
+        .then(function() {
+          if (typeof log === 'function') {
+            log('[' + tag + '] Round ' + batchState.selectedRound +
+                ' combined PGN refreshed');
+          }
+        })
+        .catch(function(e) {
+          console.warn('[Batch] Round PGN refresh failed:', e);
+        });
+    }
+    return null;
+  }
+
+  /**
+   * Persist a game that just reached VERIFIED: write its individual .pgn AND
+   * refresh the combined (round/player) PGN.
+   *
+   * Why this exists: the individual .pgn was previously written ONLY by
+   * _autoSaveGame, which fires solely when reconstruction lands a SOLVED result
+   * (the auto-solved games). Games the user finished by hand — manual fixes,
+   * edit-only completions, catch-up promotions — flipped to VERIFIED without an
+   * individual file ever being written; only the combined PGN got refreshed (and
+   * some verify paths didn't even do that). That's why a 5-game round could end
+   * with only the 3 auto-solved individual PGNs on disk. Routing every verify
+   * path through here makes the per-game autosave reliable across the board.
+   *
+   * Gated on a folder handle: autosave writes silently to the scan folder.
+   * Without a folder, saveText would fall back to a browser DOWNLOAD — firing
+   * one per verify (and a duplicate of the explicit Save button) — so we skip
+   * the individual write in that mode and leave downloads to the user-initiated
+   * Save / combined-export paths, matching their existing behavior.
+   *
+   * Fire-and-forget; reads the authoritative confirmed moves via
+   * BatchExport._movesForGame, so it's correct for the current game (live
+   * state.sans) and for non-current games (workingState.sans) alike.
+   */
+  function _persistVerifiedGame(gameId, reasonTag, opts) {
+    opts = opts || {};
+    var tag = reasonTag || 'Auto-save';
+    if (gameId && window.BatchExport &&
+        typeof window.BatchExport.exportAndSaveGamePgn === 'function' &&
+        batchState.folderHandle) {
+      var game = batchState.games.get(gameId);
+      if (game) {
+        var fileName = _buildPgnFilename(gameId, game) || (gameId + '.pgn');
+        Promise.resolve(window.BatchExport.exportAndSaveGamePgn(game, fileName))
+          .then(function(savedTo) {
+            if (savedTo && typeof log === 'function') {
+              log('[' + tag + '] ' + gameId + ' → ' + fileName +
+                  (savedTo === 'folder' ? ' (folder)' : ' (downloaded)'));
+            }
+          })
+          .catch(function(e) {
+            console.warn('[Batch] Individual PGN auto-save failed for', gameId, e);
+          });
+      }
+    }
+    // Refresh the combined PGN regardless of folder handle — this mirrors
+    // markVerified()'s pre-existing _autoSaveCombinedPgn call (it already
+    // downloaded the combined file in no-folder mode, so no behavior change).
+    // Callers promoting several games in one pass (the renderGameList catch-up
+    // loop) pass skipCombined and fire ONE combined refresh after the loop, so
+    // concurrent writes to the same combined file can't race.
+    if (!opts.skipCombined) {
+      var refresh = _autoSaveCombinedPgn(tag);
+      if (refresh && typeof refresh.then === 'function') refresh.catch(function() {});
+    }
   }
 
   // =========================================================================
@@ -437,6 +643,44 @@ var BatchGameList = (function() {
           window.BatchPanelBridge.onGameComplete(gameId, payload, method);
         }
         renderGameList();
+
+        // Re-sync the live "Fix Suggestions" middle panel when a rerun for the
+        // OPEN game finishes SOLVED. BatchPanelBridge.onGameComplete above only
+        // repaints the LEFT Algorithm-Lab panels ("Solved!"); the middle live
+        // panel keeps whatever stuck/loading state it held before the rerun. A
+        // truncate→rerun that ends SOLVED-with-0-fixes leaves the game legal but
+        // the middle panel frozen on the pre-rerun stuck view — and a stale
+        // cross-game leftover fix can persist there with state.stuckInfo (e.g.
+        // "1.W") desynced from state.stuckPly (the real move-43 board).
+        //
+        // revalidate() re-derives stuckPly AND stuckInfo together from the
+        // user's CURRENT state.moves, so it clears the desync + leftover and
+        // repaints either "Game complete!" (now legal) or the genuine stuck
+        // point with a fresh fetchFixes(). It validates the user's input, NOT
+        // the algorithm's solution, so the no-auto-apply rule holds (adopting
+        // the algorithm's fixes still requires an explicit Review). Scoped to
+        // the open game + SOLVED only, and skipped while the user is mid-Review
+        // / edit / noise-review so we never disrupt an active walkthrough.
+        try {
+          var _psOpen = payload && payload.picked && payload.picked.result &&
+                        payload.picked.result.status;
+          var _solvedOpen = (_psOpen === 'SOLVED' || _psOpen === 'VALID');
+          var _verifyActive = window.VerificationUI &&
+            typeof window.VerificationUI.isActive === 'function' &&
+            window.VerificationUI.isActive();
+          if (gameId === batchState.currentGameId && _solvedOpen &&
+              !_verifyActive && !state.pendingNoiseReview && !state.editMode &&
+              typeof revalidate === 'function') {
+            if (typeof log === 'function') {
+              log('🔄 Re-syncing live fix panel for open game ' + gameId +
+                  ' after SOLVED rerun');
+            }
+            revalidate().catch(function(e) {
+              console.warn('[Batch] Post-rerun revalidate failed for ' +
+                           gameId + ':', e);
+            });
+          }
+        } catch (e) { /* non-fatal — live-panel re-sync is best-effort */ }
       };
 
       reconstructQueue.onQueueComplete = function(results) {
@@ -903,6 +1147,10 @@ var BatchGameList = (function() {
         log('✅ Auto-marked ' + gameId + ' as VERIFIED (' +
             state.sans.length + ' moves validated, no stuck point)');
       }
+      // Persist on the game-switch auto-verify too. gameId === currentGameId
+      // here (ownership guard above), and state still mirrors this game, so the
+      // individual .pgn is built from the just-snapshotted confirmed moves.
+      _persistVerifiedGame(gameId, 'Verify');
     }
   }
 
@@ -1238,6 +1486,12 @@ var BatchGameList = (function() {
       // and the stuckPly/currentPly update.
       state.currentPly = 0;
       state.stuckPly = null;
+      // originStuckPly is a review-only red-highlight artifact (set by
+      // VerificationUI._setupStuckStateForFix). If it carries the OUTGOING
+      // game's backtrack origin into the incoming game, highlightCurrentMove
+      // and the OCR context grid paint a phantom red cell on a move the new
+      // game never got stuck at. Clear it alongside stuckPly.
+      state.originStuckPly = null;
     }
     // Reset the Apply button to its neutral disabled state. Subsequent
     // render flows for the incoming game (validateAndDisplay → fetchFixes,
@@ -2063,6 +2317,11 @@ var BatchGameList = (function() {
         log('✅ Auto-marked ' + batchState.currentGameId + ' as VERIFIED (' +
             (state.sans ? state.sans.length : 0) + ' moves validated, no stuck point)');
       }
+      // Persist the individual .pgn + refresh the combined PGN. This path
+      // (live edit/fix completion without an explicit Save) previously wrote
+      // neither file — one of the gaps that left hand-finished games without
+      // an individual PGN on disk.
+      _persistVerifiedGame(batchState.currentGameId, 'Complete');
     }
 
     renderGameList();
@@ -2113,27 +2372,15 @@ var BatchGameList = (function() {
 
     renderGameList();
 
-    // Refresh the on-disk round combined PGN so it reflects the user-confirmed
-    // move list, not the pre-review algorithm proposal. _autoSaveGame writes
-    // this file when each game *completes reconstruction* (before the user
-    // overrides any fix), so without this re-save the round file keeps the raw
-    // algorithm suggestion — e.g. Greedy's Qxe7+ instead of the user's Qf7# —
-    // for any game whose verification isn't followed by another game finishing.
-    // Fire-and-forget (mirrors _autoSaveGame); _movesForGame now reads the
-    // confirmed state.sans for this current game.
-    if (batchState.selectedRound != null &&
-        window.BatchExport && window.BatchExport.exportAndSaveRoundCombinedPgn) {
-      window.BatchExport.exportAndSaveRoundCombinedPgn(batchState.selectedRound)
-        .then(function() {
-          if (typeof log === 'function') {
-            log('[Verify] Round ' + batchState.selectedRound +
-                ' combined PGN refreshed with confirmed moves');
-          }
-        })
-        .catch(function(e) {
-          console.warn('[Batch] Round PGN refresh after verify failed:', e);
-        });
-    }
+    // Persist the individual .pgn AND refresh the combined PGN so both reflect
+    // the user-confirmed move list, not the pre-review algorithm proposal.
+    // _autoSaveGame writes the individual file only when reconstruction lands a
+    // SOLVED result (before any user override); hand-verified games never got
+    // one, which is why a round could end with individual PGNs for only the
+    // auto-solved games. Routing through _persistVerifiedGame closes that gap
+    // and also re-saves the combined file (Greedy's Qxe7+ → the user's Qf7#).
+    // Fire-and-forget; _movesForGame reads the confirmed state.sans here.
+    _persistVerifiedGame(batchState.currentGameId, 'Verify');
   }
 
   // =========================================================================
@@ -2539,11 +2786,23 @@ var BatchGameList = (function() {
     // ready" was landing on games that actually need scissors first.
     if (s === GAME_STATUS.NEEDS_TRUNCATION) return false;
     if (game.hasTrailingNoise && !game.noiseResolved) return false;
-    // A method solved it, the chain is exhausted, or the user already started.
-    if (s === GAME_STATUS.NEEDS_REVIEW || s === GAME_STATUS.IN_REVIEW) return true;
-    // Still reconstructing, but at least one algorithm already produced a
-    // usable result — let the user dive in on the partial.
-    if (s === GAME_STATUS.RECONSTRUCTING && _hasUsablePartial(game.gameId)) return true;
+    // Ready only when there is actually something to review. A method solved
+    // it, the chain is exhausted, the user already started (NEEDS_REVIEW /
+    // IN_REVIEW), or it's still reconstructing but one algorithm already
+    // produced a partial (RECONSTRUCTING). In every case gate on a usable
+    // result: a requeue (fix override / re-run) deletes
+    // reconstructResults[gameId] but leaves the game at NEEDS_REVIEW /
+    // IN_REVIEW until a method restarts and an onProgress 'reconstructing'
+    // event flips it back to RECONSTRUCTING. That transient window otherwise
+    // inflated the "Next ready (N)" count with a game that has nothing to show
+    // yet (user-reported: button said 2 with only one game actually ready).
+    // The normal completion path always populates reconstructResults BEFORE
+    // flipping to NEEDS_REVIEW, so genuinely-ready games are unaffected.
+    if (s === GAME_STATUS.NEEDS_REVIEW ||
+        s === GAME_STATUS.IN_REVIEW ||
+        s === GAME_STATUS.RECONSTRUCTING) {
+      return _hasUsablePartial(game.gameId);
+    }
     return false;
   }
 
@@ -2910,17 +3169,11 @@ var BatchGameList = (function() {
           (savedTo === 'folder' ? ' (folder)' : ' (downloaded)'));
     }
 
-    // Refresh the round combined PGN so the TD can open an up-to-date file
-    // even while remaining games are still being reviewed.
-    if (batchState.selectedRound != null && window.BatchExport.exportAndSaveRoundCombinedPgn) {
-      try {
-        await window.BatchExport.exportAndSaveRoundCombinedPgn(batchState.selectedRound);
-        if (typeof log === 'function') {
-          log('[Auto-save] Round ' + batchState.selectedRound + ' combined PGN updated');
-        }
-      } catch (e) {
-        console.warn('[Batch] Round PGN auto-save failed:', e);
-      }
+    // Refresh the combined PGN (round- or player-scoped) so the TD can open an
+    // up-to-date file even while remaining games are still being reviewed.
+    var refresh = _autoSaveCombinedPgn('Auto-save');
+    if (refresh && typeof refresh.then === 'function') {
+      try { await refresh; } catch (e) {}
     }
   }
 
@@ -2981,6 +3234,7 @@ var BatchGameList = (function() {
     //   middle — everything in progress or not yet done
     //   bottom — verified / exported (done; pushed out of the way so the
     //            "what's left to work on" list stays compact in big sections)
+    var _isPlayerMode = batchState.batchMode === 'player';
     var sortedGames = [];
     batchState.games.forEach(function(game) {
       sortedGames.push(game);
@@ -2993,6 +3247,12 @@ var BatchGameList = (function() {
     sortedGames.sort(function(a, b) {
       var ba = _sortBucket(a), bb = _sortBucket(b);
       if (ba !== bb) return ba - bb;
+      // Player mode spans rounds — order by round first so the list reads
+      // R1, R2, R3… instead of a board-number jumble across rounds.
+      if (_isPlayerMode) {
+        var ra = a.round || 0, rb = b.round || 0;
+        if (ra !== rb) return ra - rb;
+      }
       return a.board - b.board;
     });
 
@@ -3004,6 +3264,7 @@ var BatchGameList = (function() {
     // the noise turned out to be benign — every cell still validated. The
     // counter and the ✅/🟡 icon both depend on game.status, so promoting
     // here keeps "X verified" consistent with the per-row "N/N ✓" indicators.
+    var _promotedAny = false;
     sortedGames.forEach(function(g) {
       if (g.status !== GAME_STATUS.NEEDS_REVIEW) return;
       var ws = g.workingState;
@@ -3031,7 +3292,21 @@ var BatchGameList = (function() {
       // catch-up path keeps the algorithm-era "G◐35 B✓ D✓ Tier C" badges
       // alongside its now-✅ status icon — user-reported inconsistency.
       _clearStalenessAndAbort(g);
+      // Persist the individual .pgn for this promoted game too. g may be a
+      // NON-current game here; exportAndSaveGamePgn reads g.workingState.sans
+      // via _movesForGame, so it writes the right moves without needing g
+      // loaded. Fires once per game (the NEEDS_REVIEW guard above dedups).
+      // skipCombined: coalesce the combined refresh to a single call after the
+      // loop so multiple promotions don't race on the same combined file.
+      _persistVerifiedGame(g.gameId, 'Verify', { skipCombined: true });
+      _promotedAny = true;
     });
+    if (_promotedAny) {
+      var _catchUpRefresh = _autoSaveCombinedPgn('Verify');
+      if (_catchUpRefresh && typeof _catchUpRefresh.then === 'function') {
+        _catchUpRefresh.catch(function() {});
+      }
+    }
 
     // Count statuses
     var verified = 0, ocrDone = 0, total = sortedGames.length;
@@ -3110,27 +3385,40 @@ var BatchGameList = (function() {
       html += '</div>';
     }
 
-    // Header — round info on the left, round-level export buttons on the
-    // right (Round PGN / CSV / Dashboard mirror the Step 4 buttons at the
-    // top of the page so they remain reachable while scrolled into review).
+    // Header — scope info on the left, export buttons on the right (Round/Player
+    // PGN / CSV / Dashboard mirror the Step 4 buttons at the top of the page so
+    // they remain reachable while scrolled into review). In player mode the
+    // scope is the selected player across rounds, and a "Scoresheets" button
+    // (collect that player's source scans into a ZIP) joins the group.
     html += '<div class="px-3 py-2 border-b border-gray-700 flex justify-between items-center gap-2">';
     html += '<div class="flex items-baseline gap-2 min-w-0">';
     html += '<span class="text-sm font-semibold text-gray-300 truncate">';
-    html += 'Round ' + (batchState.selectedRound || '?');
-    if (sortedGames.length > 0 && sortedGames[0].section) {
-      html += ' &mdash; ' + sortedGames[0].section;
+    if (_isPlayerMode) {
+      html += _esc(batchState.selectedPlayerName || 'Player');
+    } else {
+      html += 'Round ' + (batchState.selectedRound || '?');
+      if (sortedGames.length > 0 && sortedGames[0].section) {
+        html += ' &mdash; ' + sortedGames[0].section;
+      }
     }
     html += '</span>';
     html += '<span class="text-xs text-gray-500 shrink-0">' + verified + '/' + total + ' done</span>';
     html += '</div>';
     html += '<div class="flex items-center gap-1 shrink-0">';
     html += '<button id="btn-batch-export-round-list" class="px-2 py-1 bg-indigo-700 hover:bg-indigo-600 rounded text-xs font-medium text-white" ' +
-            'title="Concatenate all games in this round into one PGN file">' +
-            '&#128229; Round PGN</button>';
+            'title="' + (_isPlayerMode
+              ? "Concatenate all of this player's games into one PGN file"
+              : 'Concatenate all games in this round into one PGN file') + '">' +
+            '&#128229; ' + (_isPlayerMode ? 'Player PGN' : 'Round PGN') + '</button>';
+    if (_isPlayerMode) {
+      html += '<button id="btn-batch-collect-sheets-list" class="px-2 py-1 bg-teal-700 hover:bg-teal-600 rounded text-xs text-white" ' +
+              "title=\"Download a ZIP of this player's scoresheets (both copies per game)\">" +
+              '&#128229; Scoresheets</button>';
+    }
     html += '<button id="btn-batch-export-csv-list" class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs text-white" ' +
             'title="Save a CSV report of reconstruction diagnostics">CSV</button>';
     html += '<button id="btn-batch-dashboard-list" class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs text-white" ' +
-            'title="Show compact color-grid dashboard for this round">Dashboard</button>';
+            'title="Show compact color-grid dashboard">Dashboard</button>';
     html += '</div>';
     html += '</div>';
 
@@ -3242,6 +3530,13 @@ var BatchGameList = (function() {
         html += '<span class="text-green-400 line-through" title="Trailing noise truncated">\u2702\uFE0F</span>';
       }
       html += '<span class="flex-1 truncate">';
+      // Player mode lists a player's games across rounds, so lead with the
+      // round (R1, R2…) — otherwise the rows read as a board-number jumble
+      // with no way to tell which round each game belongs to. Round mode
+      // already has the round in the panel header, so skip it there.
+      if (_isPlayerMode && game.round != null) {
+        html += '<span class="text-gray-400 font-mono">R' + _esc(game.round) + '</span> ';
+      }
       html += window.BatchNaming.gameDisplayLabel(game, game.pairing);
       // Inline OCR progress while the per-image OCR queue is chewing on
       // this game. Similar to the single-game in-line progress the user
@@ -3465,6 +3760,13 @@ var BatchGameList = (function() {
         if (src) src.click();
       };
     }
+    var btnCollectSheetsList = document.getElementById('btn-batch-collect-sheets-list');
+    if (btnCollectSheetsList) {
+      btnCollectSheetsList.onclick = function() {
+        var src = document.getElementById('btn-batch-collect-sheets');
+        if (src) src.click();
+      };
+    }
     var btnExportCsvList = document.getElementById('btn-batch-export-csv-list');
     if (btnExportCsvList) {
       btnExportCsvList.onclick = function() {
@@ -3570,15 +3872,60 @@ var BatchGameList = (function() {
   }
 
   /**
+   * Render the player selector dropdown (player-mode gate). Lists every
+   * player found in the tournament file with a game count. Shows a disabled
+   * "load a tournament file" hint when no pairings are available.
+   * @param {HTMLElement} selectEl - The <select> element
+   */
+  function renderPlayerSelector(selectEl) {
+    if (!selectEl) return;
+    var players = getAvailablePlayers();
+    if (!players.length) {
+      selectEl.innerHTML =
+        '<option value="">-- Load a tournament file first --</option>';
+      selectEl.disabled = true;
+      return;
+    }
+    // Narrow to the chosen section when the section gate is set (player mode
+    // section selector). selectedSection === null means "All Sections".
+    var sec = batchState.selectedSection;
+    if (sec) {
+      players = players.filter(function(p) { return p.section === sec; });
+    }
+    selectEl.disabled = false;
+    selectEl.innerHTML = '<option value="">-- Select Player --</option>';
+    var multiSection = (batchState.availableSections || [])
+      .filter(function(s) { return s.section; }).length > 1;
+    players.forEach(function(p) {
+      var opt = document.createElement('option');
+      opt.value = p.key;
+      var label = p.name || ('#' + p.sNo);
+      if (multiSection && p.section) label += ' [' + p.section + ']';
+      label += ' (' + p.gameCount + ' game' + (p.gameCount !== 1 ? 's' : '') + ')';
+      opt.textContent = label;
+      selectEl.appendChild(opt);
+    });
+  }
+
+  /**
    * Render the section selector dropdown. Includes only named sections
    * (skips the empty-string entry that arises when some scans lack any
    * section classification). Caller decides whether to show or hide the
    * element based on whether multiple sections were discovered.
    * @param {HTMLElement} selectEl
    */
-  function renderSectionSelector(selectEl) {
+  function renderSectionSelector(selectEl, opts) {
     if (!selectEl) return;
     selectEl.innerHTML = '';
+    // Player mode passes {includeAll:true} so the user can list every player
+    // across sections (value="" → no section filter). Round mode omits it —
+    // a round needs a concrete section, so "All Sections" would be ambiguous.
+    if (opts && opts.includeAll) {
+      var allOpt = document.createElement('option');
+      allOpt.value = '';
+      allOpt.textContent = 'All Sections';
+      selectEl.appendChild(allOpt);
+    }
     (batchState.availableSections || []).forEach(function(s) {
       if (!s.section) return;
       var opt = document.createElement('option');
@@ -4038,6 +4385,8 @@ var BatchGameList = (function() {
     initFromFiles: initFromFiles,
     selectRound: selectRound,
     selectSection: selectSection,
+    selectPlayer: selectPlayer,
+    getAvailablePlayers: getAvailablePlayers,
     startBatchOcr: startBatchOcr,
     cancelBatchOcr: cancelBatchOcr,
     selectGame: selectGame,
@@ -4051,6 +4400,7 @@ var BatchGameList = (function() {
     saveBatchGamePgn: saveBatchGamePgn,
     renderGameList: renderGameList,
     renderRoundSelector: renderRoundSelector,
+    renderPlayerSelector: renderPlayerSelector,
     renderSectionSelector: renderSectionSelector,
     requeueAfterFix: requeueAfterFix,
     rerunCurrentGame: rerunCurrentGame,

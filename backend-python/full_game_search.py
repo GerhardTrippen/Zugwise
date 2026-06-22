@@ -894,6 +894,33 @@ def greedy_step(state: dict) -> dict:
             fixes, eff_min_ply, phase2_floor, _funnel, _raw_snapshot, _emptied_by = \
                 _search_and_funnel(stuck, stuck_reason='illegal')
 
+    # FORWARD PROBE (absurd anchor DID yield candidates): the candidates may be
+    # spurious rewrites of a LEGAL move while the genuine, unambiguous error is a
+    # downstream ILLEGAL move. Reported case: EAD stops absurd at 23.W and offers
+    # to change the legal 23.W Qd3 -> Qd2 (score 31); that shift makes 22.W look
+    # absurd too, so the next iter hits the backward-regression guard and Greedy
+    # surfaces the spurious Qd2 for review — while the real fix is the illegal
+    # 26.W Rh1 -> Kh1 (score 116) the legality-anchored Fix Suggestions panel
+    # finds. The not-fixes branch above handles the empty-candidate version of
+    # this; here the absurd anchor produced candidates, so it never fired. Probe
+    # the legality anchor and ADOPT it only when its best fix outscores the
+    # absurd-anchor best. The score is the reconstruction signal (no move-quality
+    # added), and an illegal move is a confirmed error where a merely-flagged
+    # absurdity is not — so a strictly-higher illegal-anchor score is the right
+    # tiebreak. Same tight guard as above: non-illegal EAD stop, not a residual
+    # pass, and a real illegal move strictly ahead (legality_stuck == total means
+    # only the absurdity remains, so don't bounce forward and loop).
+    elif fixes and stop_reason != 'illegal' and not residual_pending:
+        legality_stuck, _ = play_until_stuck(moves)
+        if stuck < legality_stuck < total:
+            _fwd = _search_and_funnel(legality_stuck, stuck_reason='illegal')
+            _fwd_fixes = _fwd[0]
+            if _fwd_fixes and (_fwd_fixes[0].get('unified_score', 0)
+                               > fixes[0].get('unified_score', 0)):
+                stuck = legality_stuck
+                fixes, eff_min_ply, phase2_floor, _funnel, _raw_snapshot, \
+                    _emptied_by = _fwd
+
     # TEMP DIAG: show top 5 after all filters so we can compare iter-N
     # rankings against manual "confirm + re-run" rankings. The e5-vs-c4
     # case is hunting why two paths with identical state pick differently.

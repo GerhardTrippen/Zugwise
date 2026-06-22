@@ -465,18 +465,192 @@ var BatchExport = (function() {
     };
   }
 
+  /**
+   * Save a SINGLE game's individual .pgn from the user-confirmed move list.
+   *
+   * Reuses the same authoritative move source as the combined export
+   * (_movesForGame: current game → live state.sans, others → workingState.sans,
+   * falling back to the algorithm pick only when neither exists), so it writes
+   * correctly for ANY game — not just the currently-open one. This is the
+   * autosave used by every verify path in batch-game-list.js so a hand-verified
+   * game gets its individual file too, mirroring the auto-SOLVED games that
+   * already get one via the reconstruction-complete callback.
+   *
+   * @param {Object} game     - batchState game entry
+   * @param {string} fileName - destination filename (built by the caller)
+   * @param {Object} [options] - {tournamentData, site} passed to _headersForGame
+   * @returns {Promise<string|null>} saveText result ('folder' | 'download') or
+   *          null when there were no confirmed moves to write.
+   */
+  async function exportAndSaveGamePgn(game, fileName, options) {
+    options = options || {};
+    if (!game || !fileName) return null;
+    var bgl = window.BatchGameList;
+    if (!bgl || !bgl.batchState) return null;
+    var bs = bgl.batchState;
+
+    var moves = _movesForGame(game, bs);
+    if (!moves || moves.length === 0) return null;
+    // Same legality net the single-game / combined exports apply.
+    moves = _truncateToLegalPrefix(moves);
+    if (!moves.length) return null;
+
+    var tournamentData = options.tournamentData || (window._batchTournamentData || null);
+    var headers = _headersForGame(game, tournamentData, options);
+    var pgn = generatePgn(game, moves, headers);
+    return saveText(pgn, fileName, 'application/x-chess-pgn');
+  }
+
+  // =========================================================================
+  // Combined player export (single file: all of one player's games)
+  // =========================================================================
+
+  /**
+   * Export ALL games of the currently-selected player into one PGN file
+   * (across rounds). Mirror of exportRoundCombinedPgn: verified games carry
+   * their real result, non-verified games get result=* + a [Termination] tag
+   * with their confirmed prefix.
+   *
+   * batchState.games is ALREADY the player subset (BatchGameList.selectPlayer
+   * filtered it), so no per-game player re-check is needed here. Games are
+   * sorted by round then board so the file reads in playing order.
+   *
+   * @param {string} [playerKey] - Defaults to batchState.selectedPlayer
+   * @param {Object} [options] - {tournamentData, site}
+   * @returns {Promise<{pgn, filename, count, verifiedCount, incompleteCount}>}
+   */
+  async function exportPlayerCombinedPgn(playerKey, options) {
+    options = options || {};
+    var bgl = window.BatchGameList;
+    if (!bgl || !bgl.batchState) throw new Error('BatchGameList not available');
+    var bs = bgl.batchState;
+    playerKey = playerKey != null ? playerKey : bs.selectedPlayer;
+    if (playerKey == null) throw new Error('No player selected');
+
+    var tournamentData = options.tournamentData || (window._batchTournamentData || null);
+
+    var games = [];
+    bs.games.forEach(function(g) { games.push(g); });
+    games.sort(function(a, b) {
+      if ((a.round || 0) !== (b.round || 0)) return (a.round || 0) - (b.round || 0);
+      return (a.board || 0) - (b.board || 0);
+    });
+
+    var pgns = [];
+    var verifiedCount = 0;
+    var incompleteCount = 0;
+
+    games.forEach(function(g) {
+      var isVerified = (g.status === 'verified' || g.status === 'exported');
+      var headers = _headersForGame(g, tournamentData, options);
+
+      if (isVerified) {
+        var moves = _movesForGame(g, bs);
+        pgns.push(generatePgn(g, moves, headers));
+        verifiedCount++;
+      } else {
+        var confirmedMoves = _confirmedPrefixForGame(g, bs);
+        var hdrs = {};
+        Object.keys(headers).forEach(function(k) { hdrs[k] = headers[k]; });
+        if (!hdrs.Result || hdrs.Result === '?') hdrs.Result = '*';
+        hdrs.Termination = TERMINATION_INCOMPLETE;
+        var endComment = (confirmedMoves.length === 0)
+          ? 'No moves verified — algorithm output not reviewed'
+          : 'Reconstruction stopped at ply ' + confirmedMoves.length + ' — review pending';
+        pgns.push(generatePgn(g, confirmedMoves, hdrs, { endComment: endComment }));
+        incompleteCount++;
+      }
+    });
+
+    var playerName = bs.selectedPlayerName ||
+      (games[0] && _playerNameFromGame(games[0], playerKey)) || 'Player';
+    var filename = _buildPlayerFilename(playerName, tournamentData);
+    return {
+      pgn: pgns.join('\n'),
+      filename: filename,
+      count: pgns.length,
+      verifiedCount: verifiedCount,
+      incompleteCount: incompleteCount,
+      player: playerName
+    };
+  }
+
+  async function exportAndSavePlayerCombinedPgn(playerKey, options) {
+    var out = await exportPlayerCombinedPgn(playerKey, options);
+    if (out.count === 0) {
+      return { count: 0, filename: out.filename, savedTo: null,
+               verifiedCount: 0, incompleteCount: 0, player: out.player };
+    }
+    var savedTo = await saveText(out.pgn, out.filename, 'application/x-chess-pgn');
+    return {
+      count: out.count,
+      filename: out.filename,
+      savedTo: savedTo,
+      verifiedCount: out.verifiedCount,
+      incompleteCount: out.incompleteCount,
+      player: out.player
+    };
+  }
+
+  // Resolve a player's display name from one of their games, given the
+  // identity key. Falls back to whichever side matches.
+  function _playerNameFromGame(game, playerKey) {
+    if (!window.BatchNaming || !window.BatchNaming.playerIdentity) return null;
+    var idW = window.BatchNaming.playerIdentity(game, 'w');
+    if (idW && idW.key === playerKey) return idW.name;
+    var idB = window.BatchNaming.playerIdentity(game, 'b');
+    if (idB && idB.key === playerKey) return idB.name;
+    return null;
+  }
+
   // =========================================================================
   // Error report CSV
   // =========================================================================
 
   /**
-   * Build a CSV report of reconstruction diagnostics for all games in a round.
+   * Resolve the export scope for the CSV/report functions.
+   *
+   * Round mode scopes to a single round (games filtered by g.round, sorted by
+   * board) — the historical behavior. Player mode scopes to the entire
+   * selected-player subset across rounds (batchState.games is already that
+   * subset; sorted by round then board) and builds a player-named file stem.
+   *
+   * @returns {{games:Array, stem:string}} - games (sorted) and filename stem
+   *   (without the _report.csv / _decisions.csv suffix).
+   */
+  function _reportScope(bs, round, tournamentData) {
+    var tournamentPart = tournamentData && tournamentData.event
+      ? tournamentData.event.replace(/[^A-Za-z0-9_-]+/g, '_') : 'Tournament';
+    var games = [];
+    if (bs.batchMode === 'player') {
+      if (bs.selectedPlayer == null) throw new Error('No player selected');
+      bs.games.forEach(function(g) { games.push(g); });
+      games.sort(function(a, b) {
+        if ((a.round || 0) !== (b.round || 0)) return (a.round || 0) - (b.round || 0);
+        return (a.board || 0) - (b.board || 0);
+      });
+      var name = String(bs.selectedPlayerName || 'Player')
+        .replace(/[^A-Za-z0-9_-]+/g, '_');
+      return { games: games, stem: tournamentPart + '_' + name };
+    }
+    round = round != null ? round : bs.selectedRound;
+    if (round == null) throw new Error('No round selected');
+    bs.games.forEach(function(g) { if (g.round === round) games.push(g); });
+    games.sort(function(a, b) { return (a.board || 0) - (b.board || 0); });
+    return { games: games, stem: tournamentPart + '_Round' + round };
+  }
+
+  /**
+   * Build a CSV report of reconstruction diagnostics. Scope is the selected
+   * round (round mode) or the selected player's games across rounds (player
+   * mode) — see _reportScope.
    *
    * Columns:
-   *   GameId, Section, Board, White, Black, Result, TotalMoves,
+   *   GameId, Section, Round, Board, White, Black, Result, TotalMoves,
    *   OcrCells, AlgorithmFixes, UserOverrides, Confirmations, Keeps,
    *   ReviewEdits, SurfacedDecisions, ReviewSeconds, ReviewSessions,
    *   Tier, TriageReason, Status
+   *   (Round is constant in round mode, varies in player mode.)
    *
    * The operator-effort columns (Confirmations..ReviewSessions) are fed by
    * g.reviewStats, written by verification-ui.js as the user reviews:
@@ -506,13 +680,12 @@ var BatchExport = (function() {
     var bgl = window.BatchGameList;
     if (!bgl || !bgl.batchState) throw new Error('BatchGameList not available');
     var bs = bgl.batchState;
-    round = round != null ? round : bs.selectedRound;
-    if (round == null) throw new Error('No round selected');
 
     var tournamentData = options.tournamentData || window._batchTournamentData || null;
+    var scope = _reportScope(bs, round, tournamentData);
 
     var header = [
-      'GameId', 'Section', 'Board', 'White', 'Black', 'Result',
+      'GameId', 'Section', 'Round', 'Board', 'White', 'Black', 'Result',
       'TotalMoves', 'OcrCells', 'AlgorithmFixes', 'UserOverrides',
       'Confirmations', 'Keeps', 'ReviewEdits', 'SurfacedDecisions',
       'ReviewSeconds', 'AttentionSeconds', 'ReviewSessions',
@@ -520,11 +693,7 @@ var BatchExport = (function() {
     ];
     var lines = [header.join(',')];
 
-    var games = [];
-    bs.games.forEach(function(g) {
-      if (g.round === round) games.push(g);
-    });
-    games.sort(function(a, b) { return (a.board || 0) - (b.board || 0); });
+    var games = scope.games;
 
     games.forEach(function(g) {
       var rec = (bs.reconstructResults && bs.reconstructResults[g.gameId]) || {};
@@ -549,6 +718,7 @@ var BatchExport = (function() {
       var row = [
         g.gameId,
         g.section || '',
+        (g.round != null) ? g.round : '',
         g.board || '',
         (pairing && pairing.whiteName) || '',
         (pairing && pairing.blackName) || '',
@@ -571,10 +741,7 @@ var BatchExport = (function() {
       lines.push(row.join(','));
     });
 
-    var tournamentPart = tournamentData && tournamentData.event
-      ? tournamentData.event.replace(/[^A-Za-z0-9_-]+/g, '_')
-      : 'Tournament';
-    var filename = tournamentPart + '_Round' + round + '_report.csv';
+    var filename = scope.stem + '_report.csv';
 
     return { csv: lines.join('\n') + '\n', filename: filename, count: games.length };
   }
@@ -591,7 +758,7 @@ var BatchExport = (function() {
    * distributions offline.
    *
    * Columns:
-   *   GameId, Board, Ply, Move, Action, OcrText, ProposedSan, FinalSan,
+   *   GameId, Round, Board, Ply, Move, Action, OcrText, ProposedSan, FinalSan,
    *   Method, Session, TSec
    *     Ply      - 0-based ply index
    *     Move     - human label ("29.B")
@@ -609,23 +776,18 @@ var BatchExport = (function() {
     var bgl = window.BatchGameList;
     if (!bgl || !bgl.batchState) throw new Error('BatchGameList not available');
     var bs = bgl.batchState;
-    round = round != null ? round : bs.selectedRound;
-    if (round == null) throw new Error('No round selected');
 
     var tournamentData = options.tournamentData || window._batchTournamentData || null;
+    var scope = _reportScope(bs, round, tournamentData);
 
     var header = [
-      'GameId', 'Board', 'Ply', 'Move', 'Action',
+      'GameId', 'Round', 'Board', 'Ply', 'Move', 'Action',
       'OcrText', 'ProposedSan', 'FinalSan', 'Method', 'Session', 'TSec'
     ];
     var lines = [header.join(',')];
     var rowCount = 0;
 
-    var games = [];
-    bs.games.forEach(function(g) {
-      if (g.round === round) games.push(g);
-    });
-    games.sort(function(a, b) { return (a.board || 0) - (b.board || 0); });
+    var games = scope.games;
 
     games.forEach(function(g) {
       var decisions = (g.reviewStats && g.reviewStats.decisions) || [];
@@ -635,6 +797,7 @@ var BatchExport = (function() {
           : '';
         var row = [
           g.gameId,
+          (g.round != null) ? g.round : '',
           g.board || '',
           (typeof d.ply === 'number') ? d.ply : '',
           moveLabel,
@@ -651,10 +814,7 @@ var BatchExport = (function() {
       });
     });
 
-    var tournamentPart = tournamentData && tournamentData.event
-      ? tournamentData.event.replace(/[^A-Za-z0-9_-]+/g, '_')
-      : 'Tournament';
-    var filename = tournamentPart + '_Round' + round + '_decisions.csv';
+    var filename = scope.stem + '_decisions.csv';
 
     return { csv: lines.join('\n') + '\n', filename: filename, rowCount: rowCount };
   }
@@ -869,12 +1029,33 @@ var BatchExport = (function() {
     return [];
   }
 
+  // Round/tournament-level header OVERRIDES, set via the PGN header editor
+  // (window.PgnHeaderEditor.openBatchDefaults → window._batchHeaderDefaults).
+  // These fill gaps the tournament file left blank (most importantly Site, which
+  // chess-results.com per-round XLS never carries) and win over tournament data
+  // because buildPgnHeaders applies `extra` last. Only non-empty values are
+  // applied, so a blank field never clobbers good data. Explicit per-call
+  // `options.*` (e.g. options.site) take precedence over the editor defaults.
+  function _overrideExtras(options) {
+    var extra = {};
+    var defaults = window._batchHeaderDefaults || {};
+    // Editor defaults: PGN-tag keys (Event/Site/Date/EventCountry).
+    Object.keys(defaults).forEach(function (k) {
+      if (defaults[k] != null && String(defaults[k]) !== '') extra[k] = defaults[k];
+    });
+    // Explicit options (lowercase) override the editor defaults.
+    if (options.event) extra.Event = options.event;
+    if (options.site) extra.Site = options.site;
+    if (options.date) extra.Date = options.date;
+    if (options.country) extra.EventCountry = options.country;
+    return extra;
+  }
+
   function _headersForGame(game, tournamentData, options) {
+    var ov = _overrideExtras(options);
     // Preferred: BatchTournament builder (applies pairing data + fallbacks).
     if (window.BatchTournament && window.BatchTournament.buildPgnHeaders) {
-      var extra = {};
-      if (options.site) extra.Site = options.site;
-      return window.BatchTournament.buildPgnHeaders(game, tournamentData, extra);
+      return window.BatchTournament.buildPgnHeaders(game, tournamentData, ov);
     }
 
     // Minimal inline fallback — no tournament module available.
@@ -889,9 +1070,12 @@ var BatchExport = (function() {
     } else {
       roundStr = '?';
     }
+    var profLoc = (typeof window !== 'undefined' && window.SheetProfiles &&
+                   window.SheetProfiles.getActiveProfileLocation)
+      ? window.SheetProfiles.getActiveProfileLocation() : { site: '', country: '' };
     var h = {
       Event: (tournamentData && tournamentData.event) || 'Tournament',
-      Site: options.site || (tournamentData && tournamentData.site) || '?',
+      Site: options.site || (tournamentData && tournamentData.site) || profLoc.site || '?',
       Date: (p && p.date) || (tournamentData && tournamentData.startDate) ||
             new Date().toISOString().slice(0, 10).replace(/-/g, '.'),
       Round: roundStr,
@@ -903,11 +1087,15 @@ var BatchExport = (function() {
     if (game.section) h.Section = game.section;
     if (p && p.whiteRtg) h.WhiteElo = String(p.whiteRtg);
     if (p && p.blackRtg) h.BlackElo = String(p.blackRtg);
+    if (profLoc.country) h.EventCountry = profLoc.country;
     if (tournamentData) {
       if (tournamentData.startDate) h.EventDate = tournamentData.startDate;
       if (tournamentData.country) h.EventCountry = tournamentData.country;
       h.EventType = 'tourn';
     }
+    // Apply round/tournament header overrides last (same precedence as the
+    // buildPgnHeaders path) so the editor defaults win over tournament data.
+    Object.keys(ov).forEach(function (k) { h[k] = ov[k]; });
     return h;
   }
 
@@ -920,6 +1108,14 @@ var BatchExport = (function() {
       sectionPart = '_' + sectionNames[0].replace(/[^A-Za-z0-9_-]+/g, '_');
     }
     return base + sectionPart + '_Round' + round + '.pgn';
+  }
+
+  function _buildPlayerFilename(playerName, tournamentData) {
+    var base = tournamentData && tournamentData.event
+      ? tournamentData.event.replace(/[^A-Za-z0-9_-]+/g, '_')
+      : 'Tournament';
+    var name = String(playerName || 'Player').replace(/[^A-Za-z0-9_-]+/g, '_');
+    return base + '_' + name + '.pgn';
   }
 
   // =========================================================================
@@ -935,10 +1131,13 @@ var BatchExport = (function() {
     exportAndSaveRoundIncompletePgn: exportAndSaveRoundIncompletePgn,
     exportRoundCombinedPgn: exportRoundCombinedPgn,
     exportAndSaveRoundCombinedPgn: exportAndSaveRoundCombinedPgn,
+    exportPlayerCombinedPgn: exportPlayerCombinedPgn,
+    exportAndSavePlayerCombinedPgn: exportAndSavePlayerCombinedPgn,
     exportErrorReportCsv: exportErrorReportCsv,
     exportAndSaveErrorCsv: exportAndSaveErrorCsv,
     exportDecisionLogCsv: exportDecisionLogCsv,
     exportRoundBundle: exportRoundBundle,
+    exportAndSaveGamePgn: exportAndSaveGamePgn,
     saveText: saveText
   };
 })();

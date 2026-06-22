@@ -46,7 +46,11 @@ function _computeLaunchFingerprint() {
     parts.push(m.num + 'w=' + w + 'b=' + b);
   });
   parts.push('stuck=' + state.stuckPly);
-  var locked = (state.lockedPlies || []).slice().sort(function(a, b) { return a - b; }).join(',');
+  // Use the EFFECTIVE locked set (state.lockedPlies + status-fixed/locked) so a
+  // status flip to 'fixed' (e.g. an override/keep that doesn't change the SAN
+  // text) still re-fingerprints and relaunches — matching what we now pass to
+  // the worker via _effectiveLockedPlies().
+  var locked = _effectiveLockedPlies().slice().sort(function(a, b) { return a - b; }).join(',');
   parts.push('locked=' + locked);
   return parts.join('|');
 }
@@ -196,6 +200,14 @@ function buildSearchOcrMoves(paired) {
   var _ambig = (typeof getAmbiguousPlies === 'function')
     ? getAmbiguousPlies() : (state.ambiguousPlies || []);
   var _LOW = (typeof window !== 'undefined' && window.FORCED_STOP_MIN_CONFIDENCE) || 0.50;
+  // Resolved-ply carve-out for the low-confidence gate — mirror validation.js.
+  // _ambig (getAmbiguousPlies) already drops user-resolved plies, but the
+  // low-confidence branch below must too, or a sub-threshold move the user has
+  // overridden/kept/locked (e.g. exd5 @49%) stays in forced_stop_plies and the
+  // search re-stops at it every relaunch (play.py:403 re-stops on forced_stop
+  // unless approved), surfacing an endless no-op "[fix] 9.B exd5 -> exd5".
+  var _resolved = (typeof isPlyResolved === 'function')
+    ? isPlyResolved : function () { return false; };
   source.forEach(function(m) {
     if (m.white) {
       var alts = [];
@@ -209,7 +221,7 @@ function buildSearchOcrMoves(paired) {
       }
       var wPly = (m.num - 1) * 2;
       ocrMoves.push({ num: m.num, color: 'w', move: m.white, confidence: m.wConf || 0.9, alternatives: alts,
-                      forced_stop: (_ambig.indexOf(wPly) >= 0) || ((m.wConf || 0.9) < _LOW) });
+                      forced_stop: (_ambig.indexOf(wPly) >= 0) || ((m.wConf || 0.9) < _LOW && !_resolved(wPly)) });
     }
     if (m.black) {
       var alts = [];
@@ -223,7 +235,7 @@ function buildSearchOcrMoves(paired) {
       }
       var bPly = (m.num - 1) * 2 + 1;
       ocrMoves.push({ num: m.num, color: 'b', move: m.black, confidence: m.bConf || 0.9, alternatives: alts,
-                      forced_stop: (_ambig.indexOf(bPly) >= 0) || ((m.bConf || 0.9) < _LOW) });
+                      forced_stop: (_ambig.indexOf(bPly) >= 0) || ((m.bConf || 0.9) < _LOW && !_resolved(bPly)) });
     }
   });
   return ocrMoves;
@@ -732,7 +744,7 @@ function launchBackgroundSearches(paired) {
 
   log('Launching background searches (' + methods.join(' + ') + ')...');
   window.searchManager.launchSearches(ocrMoves, methods, methodOptions,
-    state.lockedPlies || [], _collectTier1AgreedPlies());
+    _effectiveLockedPlies(), _collectTier1AgreedPlies());
   _lastLaunchFingerprint = fingerprint;
 }
 
@@ -758,6 +770,45 @@ function _collectTier1AgreedPlies() {
 }
 
 /**
+ * Plies the user has settled — state.lockedPlies UNION every move whose live
+ * status is 'fixed'/'locked'. The worker treats locked_plies as user_confirmed
+ * (approved → EAD + forced_stop skipped, never modified). Passing only
+ * state.lockedPlies misses overrides/keeps/applied-fixes that flip bStatus to
+ * 'fixed' WITHOUT touching state.lockedPlies, so the worker re-derives a
+ * forced_stop from the still-stale sub-threshold confidence (search-worker.js
+ * _conf < lowConfFloor) at a ply the user already resolved — Greedy then
+ * re-stops there every relaunch with a no-op "[fix] 9.B exd5 -> exd5". The
+ * interactive validator already sees these via isPlyResolved (status branch),
+ * and the review requeue path already augments its locked set the same way
+ * (verification-ui.js _exitVerificationMode); this brings the background /
+ * manual launches to parity. Mirrors feedback_lock_enforce_at_launch: derive
+ * locked from visible cell statuses at launch.
+ */
+function _effectiveLockedPlies() {
+  var seen = {};
+  var out = [];
+  function _add(p) {
+    if (p == null || p < 0) return;
+    p = p | 0;
+    if (!seen[p]) { seen[p] = true; out.push(p); }
+  }
+  // Same sources isPlyResolved consults, so whatever the interactive validator
+  // treats as settled, the worker's user_confirmed/approved set sees too.
+  [state.lockedPlies, state.fixedPlies, state.approvedPlies].forEach(function(arr) {
+    if (Array.isArray(arr)) arr.forEach(_add);
+  });
+  if (Array.isArray(state.moves)) {
+    state.moves.forEach(function(m) {
+      if (!m) return;
+      var wp = (m.num - 1) * 2;
+      if (m.wStatus === 'fixed' || m.wStatus === 'locked') _add(wp);
+      if (m.bStatus === 'fixed' || m.bStatus === 'locked') _add(wp + 1);
+    });
+  }
+  return out;
+}
+
+/**
  * Manual greedy button click.
  */
 function runGreedySearch() {
@@ -775,7 +826,7 @@ function runGreedySearch() {
   if (state && state.inputMode === 'pgn') _gOpts.max_backtrack = 999;
   window.searchManager.launchSearches(ocrMoves, ['greedy'], {
     greedy: _gOpts
-  }, state.lockedPlies || [], _collectTier1AgreedPlies());
+  }, _effectiveLockedPlies(), _collectTier1AgreedPlies());
 }
 
 /**
@@ -796,7 +847,7 @@ function runBeamSearch() {
   if (state && state.inputMode === 'pgn') _bOpts.max_backtrack = 999;
   window.searchManager.launchSearches(ocrMoves, ['beam'], {
     beam: _bOpts
-  }, state.lockedPlies || [], _collectTier1AgreedPlies());
+  }, _effectiveLockedPlies(), _collectTier1AgreedPlies());
 }
 
 /**
@@ -817,7 +868,7 @@ function runDijkstraSearch() {
   if (state && state.inputMode === 'pgn') _dOpts.max_backtrack = 999;
   window.searchManager.launchSearches(ocrMoves, ['dijkstra'], {
     dijkstra: _dOpts
-  }, state.lockedPlies || [], _collectTier1AgreedPlies());
+  }, _effectiveLockedPlies(), _collectTier1AgreedPlies());
 }
 
 function runAllSearches() {

@@ -107,18 +107,39 @@ var BatchDashboard = (function() {
   }
 
   function _renderHtml(state) {
-    // Group by section, then sort by board.
-    var bySection = {};
+    var isPlayer = state.batchMode === 'player';
+
+    // Player mode groups by round (a player's games span rounds; board numbers
+    // repeat, so round is the distinguishing axis). Round mode groups by
+    // section. Either way: one labelled group per key, games sorted within.
+    var groups = {};
     state.games.forEach(function(g) {
-      var sec = g.section || '(no section)';
-      if (!bySection[sec]) bySection[sec] = [];
-      bySection[sec].push(g);
+      var key = isPlayer
+        ? 'Round ' + (g.round != null ? g.round : '?')
+        : (g.section || '(no section)');
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(g);
     });
-    Object.keys(bySection).forEach(function(sec) {
-      bySection[sec].sort(function(a, b) { return (a.board || 0) - (b.board || 0); });
+    Object.keys(groups).forEach(function(k) {
+      groups[k].sort(function(a, b) {
+        if (isPlayer && (a.round || 0) !== (b.round || 0)) {
+          return (a.round || 0) - (b.round || 0);
+        }
+        return (a.board || 0) - (b.board || 0);
+      });
     });
 
-    var sectionNames = Object.keys(bySection).sort();
+    // Order group headers: round mode alphabetically by section; player mode
+    // numerically by round.
+    var groupKeys = Object.keys(groups).sort(function(a, b) {
+      if (isPlayer) {
+        var ra = parseInt(a.replace(/\D+/g, ''), 10);
+        var rb = parseInt(b.replace(/\D+/g, ''), 10);
+        if (!isNaN(ra) && !isNaN(rb)) return ra - rb;
+      }
+      return a.localeCompare(b);
+    });
+    var multiGroup = groupKeys.length > 1;
     var totals = _totals(state);
 
     var h = '';
@@ -128,7 +149,10 @@ var BatchDashboard = (function() {
     h += '<div class="flex items-center justify-between px-4 py-3 border-b border-gray-700">';
     h += '<div>';
     h += '<h2 class="text-lg font-semibold text-gray-100">Tournament Dashboard</h2>';
-    h += '<p class="text-xs text-gray-400">Round ' + (state.selectedRound != null ? state.selectedRound : '?') +
+    var scopeLabel = isPlayer
+      ? 'Player ' + _escape(state.selectedPlayerName || '?')
+      : 'Round ' + (state.selectedRound != null ? state.selectedRound : '?');
+    h += '<p class="text-xs text-gray-400">' + scopeLabel +
          ' \u2014 ' + totals.verified + '/' + totals.total + ' verified, ' +
          totals.ocrDone + '/' + totals.total + ' OCR done</p>';
     h += '</div>';
@@ -137,8 +161,8 @@ var BatchDashboard = (function() {
 
     // Body
     h += '<div class="flex-1 overflow-y-auto px-4 py-3 space-y-4">';
-    sectionNames.forEach(function(sec) {
-      h += _renderSection(sec, bySection[sec], state);
+    groupKeys.forEach(function(key) {
+      h += _renderSection(key, groups[key], state, multiGroup, isPlayer);
     });
     h += '</div>';
 
@@ -157,20 +181,20 @@ var BatchDashboard = (function() {
     return h;
   }
 
-  function _renderSection(sectionName, games, state) {
+  function _renderSection(groupLabel, games, state, multiGroup, isPlayer) {
     var h = '';
-    if (Object.keys(_groupBySectionOnly(state)).length > 1) {
-      h += '<div class="text-sm font-medium text-gray-300 mb-1">' + _escape(sectionName) + '</div>';
+    if (multiGroup) {
+      h += '<div class="text-sm font-medium text-gray-300 mb-1">' + _escape(groupLabel) + '</div>';
     }
     h += '<div class="grid gap-1" style="grid-template-columns: repeat(auto-fill, minmax(44px, 1fr))">';
     games.forEach(function(g) {
-      h += _renderCell(g, state);
+      h += _renderCell(g, state, isPlayer);
     });
     h += '</div>';
     return h;
   }
 
-  function _renderCell(game, state) {
+  function _renderCell(game, state, isPlayer) {
     var color = STATUS_COLOR[game.status] || STATUS_COLOR.queued;
     var isActive = game.gameId === state.currentGameId;
     var tier = game.tier || '';
@@ -202,7 +226,9 @@ var BatchDashboard = (function() {
 
   function _tooltip(game, pairing) {
     var parts = [];
-    parts.push('Board ' + (game.board != null ? game.board : '?'));
+    var loc = (game.round != null ? 'Round ' + game.round + ', ' : '') +
+              'Board ' + (game.board != null ? game.board : '?');
+    parts.push(loc);
     if (pairing && (pairing.whiteName || pairing.blackName)) {
       parts.push((pairing.whiteName || '?') + ' vs ' + (pairing.blackName || '?'));
     }
@@ -225,15 +251,6 @@ var BatchDashboard = (function() {
       if (g.status !== 'queued' && g.status !== 'ocr_running') ocrDone++;
     });
     return { total: total, verified: verified, ocrDone: ocrDone };
-  }
-
-  function _groupBySectionOnly(state) {
-    var out = {};
-    state.games.forEach(function(g) {
-      var s = g.section || '(no section)';
-      out[s] = true;
-    });
-    return out;
   }
 
   function _escape(s) {

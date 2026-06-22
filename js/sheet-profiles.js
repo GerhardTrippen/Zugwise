@@ -66,6 +66,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Annex Chess Club Carbon Copy (2 cols x 25 rows, 1 page)",
         builtin: true,
+        city: "Toronto", country: "CAN",
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -74,6 +75,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Aurora Chess Club Carbon Copy (2 cols x 25 rows, 1 page)",
         builtin: true,
+        city: "Aurora", country: "CAN",
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -82,6 +84,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Bob & Gord's Milton Rapid (2 cols x 20 rows x 2 pages)",
         builtin: true,
+        city: "Milton", country: "CAN",
         pages: [
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 41 }
@@ -98,6 +101,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, 2 pages)",
         builtin: true,
+        country: "CAN",
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 15, headerRows: 0, footerRows: 0, startingMove: 51 }
@@ -106,6 +110,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Chess'n Math Association Carbon Copy (3 cols x 25 rows, 1 page)",
         builtin: true,
+        country: "CAN",
         pages: [
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -114,6 +119,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, 1 page)",
         builtin: true,
+        city: "Collingwood", country: "CAN",
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -122,6 +128,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Excelsior Chess Club Carbon Copy (2 cols x 24 rows, 1 page)",
         builtin: true,
+        country: "CAN",
         pages: [
             { format: '2col', rowCount: 24, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 24, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -130,6 +137,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, 1 page)",
         builtin: true,
+        country: "CAN",
         pages: [
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -146,6 +154,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Hart House Chess Club Carbon Copy (3 cols x 25 rows, 1 page)",
         builtin: true,
+        city: "Toronto", country: "CAN",
         pages: [
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -154,6 +163,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Kitchener Waterloo Chess Club (2 cols x 30 rows x 2 pages)",
         builtin: true,
+        city: "Kitchener", country: "CAN",
         pages: [
             { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 61 }
@@ -162,6 +172,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, 2 pages)",
         builtin: true,
+        city: "Mississauga", country: "CAN",
         pages: [
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 41 }
@@ -170,6 +181,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Mississauga Chess Club Carbon Copy Old (2 cols x 20 rows, 1 page)",
         builtin: true,
+        city: "Mississauga", country: "CAN",
         pages: [
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -178,6 +190,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Mississauga Chess Club Carbon Copy (3 cols x 20 rows, 1 page)",
         builtin: true,
+        city: "Mississauga", country: "CAN",
         pages: [
             { format: '3col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '3col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -186,6 +199,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Niagara Chess Carbon Copy (2 cols x 25 rows, 1 page)",
         builtin: true,
+        country: "CAN",
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -194,6 +208,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Scarborough Chess Club Carbon Copy (3 cols x 26 rows, 1 page)",
         builtin: true,
+        city: "Scarborough", country: "CAN",
         pages: [
             { format: '3col', rowCount: 26, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '3col', rowCount: 26, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -202,6 +217,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, 1 page)",
         builtin: true,
+        city: "Brampton", country: "CAN",
         pages: [
             { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -210,6 +226,7 @@ var DEFAULT_PROFILES = [
     {
         name: "Vancity Chess Carbon Copy (2 cols x 30 rows, 1 page)",
         builtin: true,
+        city: "Vancouver", country: "CAN",
         pages: [
             { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
             { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 }
@@ -404,6 +421,25 @@ function setActiveProfile(name) {
     } catch (e) {
         console.warn('[Profiles] Error saving active profile:', e);
     }
+}
+
+/**
+ * Location (city/country) associated with the active scoresheet template.
+ * Used to populate the PGN [Site] tag and [EventCountry] when the tournament
+ * file doesn't carry them (chess-results.com per-round XLS never does).
+ * `site` follows the PGN convention "City COUNTRY" (e.g. "Mississauga CAN").
+ * Returns empty strings (not '?') when the profile has no location set, so
+ * callers keep their own '?' fallback.
+ */
+function getActiveProfileLocation() {
+    var p = getActiveProfile() || {};
+    var city = String(p.city || '').trim();
+    var country = String(p.country || '').trim();
+    // Site needs a city ("City COUNTRY"); a country alone is not a valid Site,
+    // so country-only templates leave Site to its '?' fallback while still
+    // supplying EventCountry.
+    var site = city ? (country ? city + ' ' + country : city) : '';
+    return { city: city, country: country, site: site };
 }
 
 // =============================================================================
@@ -651,6 +687,10 @@ function openProfileEditor(name) {
     }
 
     document.getElementById('profile-name').value = profile.name;
+    var cityEl = document.getElementById('profile-city');
+    var countryEl = document.getElementById('profile-country');
+    if (cityEl) cityEl.value = profile.city || '';
+    if (countryEl) countryEl.value = profile.country || '';
 
     // Show/hide delete button (can't delete if it's the only profile or if creating new)
     var btnDelete = document.getElementById('btn-delete-profile');
@@ -809,7 +849,13 @@ function saveProfileFromEditor() {
         return;
     }
 
+    var cityEl = document.getElementById('profile-city');
+    var countryEl = document.getElementById('profile-country');
     var profile = { name: name, builtin: false, pages: pages };
+    var city = cityEl ? cityEl.value.trim() : '';
+    var country = countryEl ? countryEl.value.trim() : '';
+    if (city) profile.city = city;
+    if (country) profile.country = country;
 
     if (_editorOriginalName) {
         // Check for name conflict with a different profile
@@ -862,6 +908,7 @@ if (typeof window !== 'undefined') {
         loadProfiles: loadProfiles,
         getActiveProfile: getActiveProfile,
         setActiveProfile: setActiveProfile,
+        getActiveProfileLocation: getActiveProfileLocation,
         getProfileGridConfig: getProfileGridConfig,
         renderProfileDropdown: renderProfileDropdown,
         renderProfileSummary: renderProfileSummary,

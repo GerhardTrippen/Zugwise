@@ -371,6 +371,11 @@ var BatchOcrQueue = (function() {
    */
   Queue.prototype.setOutputDir = function(dirHandle) {
     this.outputDirHandle = dirHandle;
+    // Let the grid-template consensus persist/seed under Zugwise/grid/ so a
+    // paused/resumed round keeps the geometry it learned (auto-consensus).
+    if (window.BatchGridTemplate && window.BatchGridTemplate.setPersistDir) {
+      window.BatchGridTemplate.setPersistDir(dirHandle);
+    }
   };
 
   /**
@@ -579,6 +584,14 @@ var BatchOcrQueue = (function() {
             if (img) { cell.imageDataUrl = img.imageDataUrl; cell.cellBelowImageUrl = img.cellBelowImageUrl; }
           });
         }
+        // Auto-consensus: cached sidecars are clean detections too — feed them
+        // in so the round's grid-template still forms when most games are cached.
+        try {
+          if (window.BatchGridTemplate) {
+            if (p1Grid) window.BatchGridTemplate.contribute(p1Grid);
+            if (p2Grid) window.BatchGridTemplate.contribute(p2Grid);
+          }
+        } catch (e) { console.warn('[BatchOCR] grid-template contribute (cache) skipped:', e && e.message); }
         // Load page-level thumbnails for 📄P1.1 / 📄P2.1 links (fast — canvas split only)
         var pageImgs = await this._loadPageImages(game);
         return {
@@ -622,6 +635,10 @@ var BatchOcrQueue = (function() {
             var img = singleImgMap.get('0_' + cell.num + '_' + (cell.color || '').toLowerCase());
             if (img) { cell.imageDataUrl = img.imageDataUrl; cell.cellBelowImageUrl = img.cellBelowImageUrl; }
           });
+          // Auto-consensus: a cached single-sheet grid is a clean detection too.
+          try {
+            if (window.BatchGridTemplate && cachedGrid) window.BatchGridTemplate.contribute(cachedGrid);
+          } catch (e) { console.warn('[BatchOCR] grid-template contribute (cache) skipped:', e && e.message); }
           return {
             ocrCells: cachedCells,
             gridSidecar: cachedGrid,
@@ -870,6 +887,51 @@ var BatchOcrQueue = (function() {
               _nMoves > 0 ? 'good' : 'warn');
           }
 
+          // --- Grid-template rescue (auto-consensus, fallback only) ---------
+          // When detection collapses on a noisy sheet (signature across the
+          // table, scribbled numbers) it returns far fewer cells than the
+          // layout expects. If the round has learned a consensus grid, re-run
+          // once with its column positions fed through the proven
+          // predefinedAnchorXs path. grid-slide keeps its own columns if the
+          // prior doesn't gather enough ink, so this can only help — and we
+          // only adopt the retry if it actually recovers MORE cells.
+          try {
+            var _tplR = window.BatchGridTemplate;
+            var _movesN = (result && result.moves) ? result.moves.length : 0;
+            var _colsPerRow = (gridConfig.format === '3col') ? 3 : 2;
+            var _expected = (gridConfig.rowCount || 0) * _colsPerRow;
+            var _weak = _expected > 0 ? (_movesN < 0.5 * _expected) : (_movesN < 10);
+            var _haveAnchors = gridConfig.predefinedAnchorXs && gridConfig.predefinedAnchorXs.length > 0;
+            if (_tplR && _weak && !_haveAnchors && result && result.imageWidth && result.imageHeight) {
+              var _rSig = currentLayoutSignature();
+              var _rAspect = result.imageWidth / result.imageHeight;
+              await _tplR.ensureLoaded(_rSig, _rAspect);
+              var _anchorXs = _tplR.toPredefinedAnchorXs(_rSig, _rAspect, result.imageWidth);
+              if (_anchorXs && _anchorXs.length >= 2) {
+                if (this.onProgress) {
+                  this.onProgress(game.gameId, 'ocr_running',
+                    'Weak grid (' + _movesN + ' cells) on ' + ocrInput.name +
+                    ' — retrying with round template');
+                }
+                var _rcfg = Object.assign({}, gridConfig, { predefinedAnchorXs: _anchorXs });
+                var _retry = await window.zugwise.processScoresheet(
+                  ocrInput.file, function() {}, _rcfg, null, null, 'slide');
+                if (_retry && _retry.moves && _retry.moves.length > _movesN) {
+                  console.log('[BatchOCR] Template rescue on ' + ocrInput.name + ': ' +
+                              _movesN + ' -> ' + _retry.moves.length + ' cells');
+                  if (window.GridDebugPanel) {
+                    window.GridDebugPanel.line('  template rescue: ' + _movesN +
+                      ' -> ' + _retry.moves.length + ' cells', 'good');
+                  }
+                  result = _retry;
+                }
+              }
+            }
+          } catch (_tplErr) {
+            console.warn('[BatchOCR] template rescue skipped:',
+              _tplErr && _tplErr.message ? _tplErr.message : _tplErr);
+          }
+
           if (result.moves && result.moves.length > 0) {
             if (hasDualSheet) {
               // Store halves separately for later merge
@@ -942,6 +1004,22 @@ var BatchOcrQueue = (function() {
       sheet2Sidecar = buildGridSidecar(sheet2SidecarCells, sheet2SidecarName, 'slide', sheet2SidecarW, sheet2SidecarH);
     if (singleSidecarCells.length > 0)
       gridSidecar = buildGridSidecar(singleSidecarCells, singleSidecarName, 'slide', singleSidecarW, singleSidecarH);
+
+    // Auto-consensus: feed every clean detection into the round's grid-template.
+    // Cheap and gated internally on grid quality; later sheets whose detection
+    // collapses borrow this geometry as a fallback prior (see the OCR loop's
+    // template-rescue block above).
+    try {
+      var _tpl = window.BatchGridTemplate;
+      if (_tpl) {
+        var _sig = currentLayoutSignature();
+        if (sheet1Sidecar) _tpl.contribute(sheet1Sidecar, _sig);
+        if (sheet2Sidecar) _tpl.contribute(sheet2Sidecar, _sig);
+        if (gridSidecar) _tpl.contribute(gridSidecar, _sig);
+      }
+    } catch (e) {
+      console.warn('[BatchOCR] grid-template contribute skipped:', e && e.message);
+    }
 
     // If dual-sheet, return both halves separately for proper merge
     if (hasDualSheet && (dualSheetLeft.length > 0 || dualSheetRight.length > 0)) {

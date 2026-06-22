@@ -1,7 +1,7 @@
 // sw.js - Service Worker for Zugwise PWA
 // Place this file in your root directory (same level as index.html)
 
-const CACHE_NAME = 'zugwise-v0.11.13';
+const CACHE_NAME = 'zugwise-v0.11.15';
 
 // Origins that don't send CORS headers — must use no-cors (gives opaque responses)
 const NO_CORS_ORIGINS = ['docs.opencv.org', 'cdn.tailwindcss.com'];
@@ -37,24 +37,55 @@ const STATIC_ASSETS = [
   './lenient-grammar.js',
   './beam-decoder.js',
   './opencv_image_processor.js',
-  
-  // JS modules (in js/ subfolder)
-  './js/settings.js',
-  './js/sheets.js',
-  './js/board.js',
-  './js/navigation.js',
-  './js/ui.js',
-  './js/utils.js',
-  './js/fixes.js',
-  './js/ocr.js',
-  './js/validation.js',
-  './js/beam.js',
+
+  // JS modules (in js/ subfolder) — keep in sync with the <script> tags in index.html
+  // Grid detection
   './js/grid-geometry.js',
   './js/grid-columns.js',
   './js/grid-rows.js',
   './js/grid-detection.js',
-  './js/sheet-profiles.js',
+  './js/grid-anchor.js',
+  './js/grid-slide.js',
+  './js/grid-debug-panel.js',
+  './js/grid-unsplit.js',
   './js/g-tail-detection.js',
+  // Settings / profiles / utils
+  './js/settings.js',
+  './js/sheet-profiles.js',
+  './js/utils.js',
+  // Sheet handling
+  './js/batch-pdf.js',
+  './js/merge-sheets.js',
+  './js/sheet-alignment.js',
+  './js/sheet-nw-alignment.js',
+  './js/sheets.js',
+  './js/board.js',
+  './js/navigation.js',
+  './js/ui.js',
+  './js/fixes.js',
+  './js/shift-ops.js',
+  './js/ocr.js',
+  './js/validation.js',
+  './js/beam.js',
+  // Batch mode
+  './js/batch-naming.js',
+  './js/batch-folder-paths.js',
+  './js/batch-ocr-queue.js',
+  './js/batch-triage.js',
+  './js/batch-nw-autoapply.js',
+  './js/batch-autoapply-review.js',
+  './js/batch-reconstruct-queue.js',
+  './js/batch-reconstruct-orchestrator.js',
+  './js/batch-panel-bridge.js',
+  './js/batch-tournament.js',
+  './js/batch-folder-store.js',
+  './js/batch-grid-robust.js',
+  './js/batch-zip.js',
+  './js/batch-export.js',
+  './js/verification-ui.js',
+  './js/batch-dashboard.js',
+  './js/batch-game-list.js',
+  './js/pgn-batch.js',
   
   // Python modules (served by dev server at /backend-python/)
   './backend-python/data_structures.py',
@@ -69,6 +100,9 @@ const STATIC_ASSETS = [
   './backend-python/fix_finding.py',
   './backend-python/full_game_search.py',
   './backend-python/validation.py',
+
+  // Vendored Python wheel (installed by search-worker.js via micropip for offline use)
+  './vendor/chess-1.10.0-py3-none-any.whl',
 
   // ONNX model (loaded from HuggingFace, but could cache)
   // 'https://huggingface.co/GerhardTrippen/chess-ocr-bilstm/resolve/main/chess_ocr.onnx',
