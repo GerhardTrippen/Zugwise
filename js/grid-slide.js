@@ -581,7 +581,29 @@ function scoreHoleMatch(observed, expectedNum) {
     return 0;
 }
 
-function alignColumnByHoles(holeData, rowYs, rowCount, isFirstCol, isBackPage, colIndex, format, log, label, frontRows) {
+/**
+ * The number PRINTED in this column's first row — what the hole aligner scores
+ * detected row numbers against. Not the logical move number: a page that reuses
+ * an earlier page's blank form prints 1..N again while its moves continue at 41+.
+ * Callers pass config.printedStartingMove (see getProfileGridConfig).
+ *
+ * The frontCols*frontRows fallback is legacy and only holds when the sheet's
+ * pages have equal row counts AND page 2 really continues the numbering.
+ * No caller has ever set config.frontRows, so `frontRows || rowCount` used the
+ * BACK page's own row count: with Mississauga CC (2x20 front, 2x25 back) it
+ * expected 51/76 instead of 41/66. Every row number then mismatched in the tens
+ * digit, alignment collapsed from ~90% to ~45%, and the grid slid ~3 rows so
+ * header rows were extracted as move cells.
+ */
+function slideColumnStartNum(rowCount, isBackPage, colIndex, format, frontRows, startingMove) {
+    if (typeof startingMove === 'number' && startingMove > 0) {
+        return startingMove + colIndex * rowCount;
+    }
+    if (!isBackPage) return colIndex * rowCount + 1;
+    return colCountFromFormat(format) * (frontRows || rowCount) + colIndex * rowCount + 1;
+}
+
+function alignColumnByHoles(holeData, rowYs, rowCount, isFirstCol, isBackPage, colIndex, format, log, label, frontRows, startingMove) {
     var nRows = holeData.length;
     if (nRows < 3) return null;
 
@@ -626,11 +648,7 @@ function alignColumnByHoles(holeData, rowYs, rowCount, isFirstCol, isBackPage, c
     //
     // Total iterations = maxTruncHead + excess + maxTruncTail + 1
 
-    var frontCols = colCountFromFormat(format);
-    var frontRowCount = frontRows || rowCount; // fallback to rowCount if not specified
-    var startNum = isBackPage
-        ? (frontCols * frontRowCount + colIndex * rowCount + 1)
-        : (colIndex * rowCount + 1);
+    var startNum = slideColumnStartNum(rowCount, isBackPage, colIndex, format, frontRows, startingMove);
 
     var S = slots.length;
     var R = rowCount;
@@ -802,7 +820,11 @@ function alignColumnByHoles(holeData, rowYs, rowCount, isFirstCol, isBackPage, c
 // WIDTH-BASED ROW CLASSIFICATION (header/footer detection)
 // =============================================================================
 
-function classifyClusterRows(rowStats, rowCount, log, label, colIndex, isBackPage) {
+// startsSingleDigit (optional): does this column's PRINTED numbering begin below
+// 10? Pass it whenever the printed start number is known — the colIndex/isBackPage
+// proxy below assumes page 2 continues page 1's numbering, which is false for a
+// page that reuses the front form and prints 1..N again.
+function classifyClusterRows(rowStats, rowCount, log, label, colIndex, isBackPage, startsSingleDigit) {
     if (rowStats.length < 5) return {dataRows: rowStats.map(function(_,i){return i;}), headerRows: [], footerRows: [], transitionIdx: null, startsAt1: false};
 
     // Step 1: Compute median component height from the core (middle 60%)
@@ -815,7 +837,9 @@ function classifyClusterRows(rowStats, rowCount, log, label, colIndex, isBackPag
     // Step 2: Classify each row-group by width-to-height ratio
     // Only col1 on front page has single digits (1-9).
     // Col2+ on front page AND all columns on back page are all double-digit.
-    var isFirstCol = (colIndex === 0 && !isBackPage);
+    var isFirstCol = (typeof startsSingleDigit === 'boolean')
+        ? startsSingleDigit
+        : (colIndex === 0 && !isBackPage);
 
     var classifications = rowStats.map(function(r, ri) {
         var wRatio = r.totalW / Math.max(1, medDigitH);
@@ -2211,9 +2235,14 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
     var isBackPage = (config.pageType === 'back');
 
     var frontRows = config.frontRows || rowCount;
+    // Authoritative when present; frontRows is only the legacy fallback.
+    var startingMove = (typeof config.startingMove === 'number' && config.startingMove > 0)
+        ? config.startingMove : null;
     log('\n=== SLIDE PIPELINE (clusters=' + numClusters + ') ===');
     log('  Image: ' + srcMat.cols + 'x' + srcMat.rows + ' | format=' + format + ' rows=' + rowCount
-        + (isBackPage ? ' (BACK page, front=' + frontRows + ')' : '') + ' maxColW=' + maxWP + '%');
+        + (isBackPage ? ' (BACK page, front=' + frontRows + ')' : '')
+        + ' startMove=' + (startingMove !== null ? startingMove : 'derived')
+        + ' maxColW=' + maxWP + '%');
 
     // Extract clusters at the chosen N
     var clusters = extractClustersAtN(autoResult.cands, autoResult.clResult.edges, numClusters);
@@ -2710,18 +2739,15 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
             return {cy: cy2, medH: medH2, totalW: tw, count: g.length, group: g};
         });
 
-        var classification = classifyClusterRows(rowStatsForClassify, rowCount, log, 'Col' + (ti + 1), ti, isBackPage);
+        // Printed first number of this column — drives both the single/double
+        // digit width classification and the hole alignment, so compute it once.
+        var colStartNum = slideColumnStartNum(rowCount, isBackPage, ti, format, frontRows, startingMove);
+        var colSingleDigit = (startingMove !== null) ? (colStartNum < 10) : undefined;
+
+        var classification = classifyClusterRows(rowStatsForClassify, rowCount, log, 'Col' + (ti + 1), ti, isBackPage, colSingleDigit);
 
         // Hole-based alignment
         if (binary) {
-            var frontCols = colCountFromFormat(format);
-            var colStartNum;
-            if (isBackPage) {
-                colStartNum = frontCols * frontRows + ti * rowCount + 1;
-            } else {
-                colStartNum = ti * rowCount + 1;
-            }
-
             var dataGrpIndices = [];
             for (var dgi = 0; dgi < grps.length; dgi++) {
                 if (classification.headerRows.indexOf(dgi) < 0 &&
@@ -2737,8 +2763,8 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
             });
             var alignment = alignColumnByHoles(
                 holeDataForAlign, rowYsForAlign, rowCount,
-                (ti === 0 && !isBackPage),
-                isBackPage, ti, format, log, 'Col' + (ti + 1), frontRows
+                (colSingleDigit !== undefined) ? colSingleDigit : (ti === 0 && !isBackPage),
+                isBackPage, ti, format, log, 'Col' + (ti + 1), frontRows, startingMove
             );
             colAlignments.push({
                 alignment: alignment,
@@ -2822,7 +2848,10 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
                        - Math.min.apply(null, g.map(function(c) { return c.x; }));
                 return {cy: cy2, medH: medH2, totalW: tw, count: g.length, group: g};
             });
-            var candClassify = classifyClusterRows(candRowStats, rowCount, function(){}, 'CandCol', reji, isBackPage);
+            var candStartNum = slideColumnStartNum(rowCount, isBackPage, reji, format, frontRows, startingMove);
+            var candSingleDigit = (startingMove !== null) ? (candStartNum < 10) : undefined;
+
+            var candClassify = classifyClusterRows(candRowStats, rowCount, function(){}, 'CandCol', reji, isBackPage, candSingleDigit);
 
             var candDataIndices = [];
             for (var cdi = 0; cdi < candGrps.length; cdi++) {
@@ -2842,18 +2871,10 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
                 return candGrps[idx2].reduce(function(s, c) { return s + c.cy; }, 0) / candGrps[idx2].length;
             });
 
-            var frontCols = colCountFromFormat(format);
-            var candStartNum;
-            if (isBackPage) {
-                candStartNum = frontCols * frontRows + reji * rowCount + 1;
-            } else {
-                candStartNum = reji * rowCount + 1;
-            }
-
             var candAlign = alignColumnByHoles(
                 candHoleData, candRowYs, rowCount,
-                (reji === 0 && !isBackPage),
-                isBackPage, reji, format, log, 'CandCol' + (reji + 1), frontRows
+                (candSingleDigit !== undefined) ? candSingleDigit : (reji === 0 && !isBackPage),
+                isBackPage, reji, format, log, 'CandCol' + (reji + 1), frontRows, startingMove
             );
 
             if (!candAlign) continue;
@@ -3547,7 +3568,28 @@ function slideRunPipeline(srcMat, srcGray, binary, autoResult, config, log) {
     //      exceeds 0.7 × median row spacing (after the v9o fix that catches
     //      Scarborough-style cases). For mismatched templates the alignment
     //      lands on different rows in different columns.
+    //   4. Hole alignment collapsed — we matched the printed row numbers
+    //      against the wrong expected sequence.
     var templateWarnings = [];
+
+    // Signal 4. A healthy page scores 85-95% here; the Crown R3 page-2 failure
+    // (page 2 reuses the FRONT form, printed 1..40 again, but the profile said
+    // it starts at 41) scored 39-48% on every column and slid the grid onto the
+    // header block. Take the BEST column so one genuinely damaged column on an
+    // otherwise fine page stays quiet. Absolute, not front-vs-back relative:
+    // each half is detected independently, and 45% is far below any healthy page.
+    var ALIGN_OK_PCT = 65;
+    var bestAlignPct = -1;
+    for (var tmai = 0; tmai < colAlignments.length; tmai++) {
+        var tma = colAlignments[tmai] && colAlignments[tmai].alignment;
+        if (tma && typeof tma.pct === 'number' && tma.pct > bestAlignPct) bestAlignPct = tma.pct;
+    }
+    if (bestAlignPct >= 0 && bestAlignPct < ALIGN_OK_PCT) {
+        templateWarnings.push('row-number alignment only ' + Math.round(bestAlignPct)
+            + '% (healthy pages score 85%+) — the numbers printed on this page are '
+            + 'not the ones this template expects; check the page\'s rows and starting move');
+    }
+
     var tmExpCols = expCols;
     if (colR.length < tmExpCols) {
         templateWarnings.push('detected ' + colR.length + ' column(s) but template expects ' + tmExpCols);

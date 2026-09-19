@@ -15,7 +15,7 @@ var DEFAULT_PROFILES = [
     // --- Generic defaults (cols-first matches the scoresheet's visual unit:
     //     you fill move-by-move down a column before moving to the next) ---
     {
-        name: "2 cols x 20 rows Default (2 pages)",
+        name: "2 cols x 20 rows Default (page 2 continues at 41)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -23,7 +23,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "2 cols x 25 rows Default (2 pages)",
+        name: "2 cols x 25 rows Default (page 2 continues at 51)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -31,7 +31,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "2 cols x 30 rows Default (2 pages)",
+        name: "2 cols x 30 rows Default (page 2 continues at 61)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 30, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -39,7 +39,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "2 cols x 35 rows Default (2 pages)",
+        name: "2 cols x 35 rows Default (page 2 continues at 71)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 35, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -47,7 +47,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "3 cols x 20 rows Default (2 pages)",
+        name: "3 cols x 20 rows Default (page 2 continues at 61)",
         builtin: true,
         pages: [
             { format: '3col', rowCount: 20, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -55,7 +55,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "3 cols x 25 rows Default (2 pages)",
+        name: "3 cols x 25 rows Default (page 2 continues at 76)",
         builtin: true,
         pages: [
             { format: '3col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -64,7 +64,7 @@ var DEFAULT_PROFILES = [
     },
     // --- Club-specific profiles (alphabetical) ---
     {
-        name: "Annex Chess Club Carbon Copy (2 cols x 25 rows, 1 page)",
+        name: "Annex Chess Club Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)",
         builtin: true,
         city: "Toronto", country: "CAN",
         pages: [
@@ -73,7 +73,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Aurora Chess Club Carbon Copy (2 cols x 25 rows, 1 page)",
+        name: "Aurora Chess Club Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)",
         builtin: true,
         city: "Aurora", country: "CAN",
         pages: [
@@ -82,7 +82,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Bob & Gord's Milton Rapid (2 cols x 20 rows x 2 pages)",
+        name: "Bob & Gord's Milton Rapid (2 cols x 20 rows, page 2 continues at 41)",
         builtin: true,
         city: "Milton", country: "CAN",
         pages: [
@@ -91,7 +91,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Carbon Copy (2 cols x 25 rows x 2 pages)",
+        name: "Carbon Copy (2 cols x 25 rows, page 2 continues at 51)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 25, headerRows: 1, footerRows: 1, startingMove: 1 },
@@ -99,7 +99,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, 2 pages)",
+        name: "Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, page 2 continues at 51)",
         builtin: true,
         country: "CAN",
         pages: [
@@ -108,7 +108,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Chess'n Math Association Carbon Copy (3 cols x 25 rows, 1 page)",
+        name: "Chess'n Math Association Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)",
         builtin: true,
         country: "CAN",
         pages: [
@@ -117,7 +117,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, 1 page)",
+        name: "Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)",
         builtin: true,
         city: "Collingwood", country: "CAN",
         pages: [
@@ -126,7 +126,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Excelsior Chess Club Carbon Copy (2 cols x 24 rows, 1 page)",
+        name: "Excelsior Chess Club Carbon Copy (2 cols x 24 rows, page 2 repeats page 1)",
         builtin: true,
         country: "CAN",
         pages: [
@@ -135,7 +135,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, 1 page)",
+        name: "Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)",
         builtin: true,
         country: "CAN",
         pages: [
@@ -144,7 +144,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Forcing Moves First (2 cols x 25 rows x 2 pages)",
+        name: "Forcing Moves First (2 cols x 25 rows, page 2 continues at 51)",
         builtin: true,
         pages: [
             { format: '2col', rowCount: 25, headerRows: 0, footerRows: 0, startingMove: 1 },
@@ -152,7 +152,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Hart House Chess Club Carbon Copy (3 cols x 25 rows, 1 page)",
+        name: "Hart House Chess Club Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)",
         builtin: true,
         city: "Toronto", country: "CAN",
         pages: [
@@ -161,7 +161,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Kitchener Waterloo Chess Club (2 cols x 30 rows x 2 pages)",
+        name: "Kitchener Waterloo Chess Club (2 cols x 30 rows, page 2 continues at 61)",
         builtin: true,
         city: "Kitchener", country: "CAN",
         pages: [
@@ -170,7 +170,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, 2 pages)",
+        name: "Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, page 2 continues at 41)",
         builtin: true,
         city: "Mississauga", country: "CAN",
         pages: [
@@ -179,7 +179,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Mississauga Chess Club Carbon Copy Old (2 cols x 20 rows, 1 page)",
+        name: "Mississauga Chess Club Carbon Copy, old (2 cols x 20 rows, page 2 repeats page 1)",
         builtin: true,
         city: "Mississauga", country: "CAN",
         pages: [
@@ -188,7 +188,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Mississauga Chess Club Carbon Copy (3 cols x 20 rows, 1 page)",
+        name: "Mississauga Chess Club Carbon Copy (3 cols x 20 rows, page 2 repeats page 1)",
         builtin: true,
         city: "Mississauga", country: "CAN",
         pages: [
@@ -197,7 +197,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Niagara Chess Carbon Copy (2 cols x 25 rows, 1 page)",
+        name: "Niagara Chess Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)",
         builtin: true,
         country: "CAN",
         pages: [
@@ -206,7 +206,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Scarborough Chess Club Carbon Copy (3 cols x 26 rows, 1 page)",
+        name: "Scarborough Chess Club Carbon Copy (3 cols x 26 rows, page 2 repeats page 1)",
         builtin: true,
         city: "Scarborough", country: "CAN",
         pages: [
@@ -215,7 +215,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, 1 page)",
+        name: "Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, page 2 repeats page 1)",
         builtin: true,
         city: "Brampton", country: "CAN",
         pages: [
@@ -224,7 +224,7 @@ var DEFAULT_PROFILES = [
         ]
     },
     {
-        name: "Vancity Chess Carbon Copy (2 cols x 30 rows, 1 page)",
+        name: "Vancity Chess Carbon Copy (2 cols x 30 rows, page 2 repeats page 1)",
         builtin: true,
         city: "Vancouver", country: "CAN",
         pages: [
@@ -241,7 +241,7 @@ var STORAGE_KEY_ACTIVE = 'zugwise_active_profile';
 // saved active-profile selection survive each rename so they don't get
 // silently bumped back to the first entry on next load.
 //
-// Three waves so far:
+// Four waves so far:
 //   1) Generic defaults: rows-first → cols-first
 //   2) Club templates: pre-existing names → "<Club> [Carbon Copy] N-Move (<P> page[s])"
 //   3) Club templates: move count → explicit "<C> cols x <R> rows" per page.
@@ -252,92 +252,144 @@ var STORAGE_KEY_ACTIVE = 'zugwise_active_profile';
 // on the current canonical name.
 var LEGACY_PROFILE_NAME_MAP = {
     // Wave 1 — generic defaults rename
-    '20 rows x 2 cols Default (2 pages)': '2 cols x 20 rows Default (2 pages)',
-    '20 rows x 3 cols Default (2 pages)': '3 cols x 20 rows Default (2 pages)',
-    '25 rows x 2 cols Default (2 pages)': '2 cols x 25 rows Default (2 pages)',
-    '25 rows x 3 cols Default (2 pages)': '3 cols x 25 rows Default (2 pages)',
-    '30 rows x 2 cols Default (2 pages)': '2 cols x 30 rows Default (2 pages)',
-    '35 rows x 2 cols Default (2 pages)': '2 cols x 35 rows Default (2 pages)',
+    '20 rows x 2 cols Default (2 pages)': '2 cols x 20 rows Default (page 2 continues at 41)',
+    '20 rows x 3 cols Default (2 pages)': '3 cols x 20 rows Default (page 2 continues at 61)',
+    '25 rows x 2 cols Default (2 pages)': '2 cols x 25 rows Default (page 2 continues at 51)',
+    '25 rows x 3 cols Default (2 pages)': '3 cols x 25 rows Default (page 2 continues at 76)',
+    '30 rows x 2 cols Default (2 pages)': '2 cols x 30 rows Default (page 2 continues at 61)',
+    '35 rows x 2 cols Default (2 pages)': '2 cols x 35 rows Default (page 2 continues at 71)',
 
     // Wave 1 club names (pre-rename) → wave 3 (current cols x rows)
     'Annex Chess Club 50-Move Carbon Copy (1 page)':
-        'Annex Chess Club Carbon Copy (2 cols x 25 rows, 1 page)',
+        'Annex Chess Club Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
     'Aurora Chess Club 50-Move (1 page)':
-        'Aurora Chess Club Carbon Copy (2 cols x 25 rows, 1 page)',
+        'Aurora Chess Club Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
     "Bob & Gord's Milton Rapid (2 pages)":
-        "Bob & Gord's Milton Rapid (2 cols x 20 rows x 2 pages)",
+        "Bob & Gord's Milton Rapid (2 cols x 20 rows, page 2 continues at 41)",
     'Carbon Copy 50-Move (2 pages)':
-        'Carbon Copy (2 cols x 25 rows x 2 pages)',
+        'Carbon Copy (2 cols x 25 rows, page 2 continues at 51)',
     'Chess Federation of Canada (2 pages)':
-        'Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, 2 pages)',
+        'Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, page 2 continues at 51)',
     "Chess'n Math Association 75-Move Carbon Copy (1 page)":
-        "Chess'n Math Association Carbon Copy (3 cols x 25 rows, 1 page)",
+        "Chess'n Math Association Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)",
     'Collingwood-Somborac Chess Festival 50-Move Carbon Copy (1 page)':
-        'Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, 1 page)',
+        'Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
     'Excelsior Chess Club (1 page)':
-        'Excelsior Chess Club Carbon Copy (2 cols x 24 rows, 1 page)',
+        'Excelsior Chess Club Carbon Copy (2 cols x 24 rows, page 2 repeats page 1)',
     'Federation Quebecoise Des Echecs 75-Move Carbon Copy (1 page)':
-        'Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, 1 page)',
+        'Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)',
     'Forcing Moves First (2 pages)':
-        'Forcing Moves First (2 cols x 25 rows x 2 pages)',
+        'Forcing Moves First (2 cols x 25 rows, page 2 continues at 51)',
     'Hart House Chess Club 75-Move Carbon Copy (1 page)':
-        'Hart House Chess Club Carbon Copy (3 cols x 25 rows, 1 page)',
+        'Hart House Chess Club Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)',
     'Kitchener Waterloo Chess Club (2 pages)':
-        'Kitchener Waterloo Chess Club (2 cols x 30 rows x 2 pages)',
+        'Kitchener Waterloo Chess Club (2 cols x 30 rows, page 2 continues at 61)',
     'Mississauga Chess Club (2 pages)':
-        'Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, 2 pages)',
+        'Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, page 2 continues at 41)',
     'Mississauga Chess Club 40-Move Carbon Copy Old (1 page)':
-        'Mississauga Chess Club Carbon Copy Old (2 cols x 20 rows, 1 page)',
+        'Mississauga Chess Club Carbon Copy, old (2 cols x 20 rows, page 2 repeats page 1)',
     'Mississauga Chess Club 60-Move Carbon Copy (1 page)':
-        'Mississauga Chess Club Carbon Copy (3 cols x 20 rows, 1 page)',
+        'Mississauga Chess Club Carbon Copy (3 cols x 20 rows, page 2 repeats page 1)',
     'Niagara Chess (1 page)':
-        'Niagara Chess Carbon Copy (2 cols x 25 rows, 1 page)',
+        'Niagara Chess Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
     'Scarborough Chess Club (1 page)':
-        'Scarborough Chess Club Carbon Copy (3 cols x 26 rows, 1 page)',
+        'Scarborough Chess Club Carbon Copy (3 cols x 26 rows, page 2 repeats page 1)',
     'Silent Storm Chess Academy Brampton Carbon Copy (1 page)':
-        'Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, 1 page)',
+        'Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, page 2 repeats page 1)',
     'Vancity Chess Carbon Copy (1 page)':
-        'Vancity Chess Carbon Copy (2 cols x 30 rows, 1 page)',
+        'Vancity Chess Carbon Copy (2 cols x 30 rows, page 2 repeats page 1)',
 
     // Wave 2 club names (move-count generation) → wave 3 (current cols x rows)
     'Annex Chess Club Carbon Copy 50-Move (1 page)':
-        'Annex Chess Club Carbon Copy (2 cols x 25 rows, 1 page)',
+        'Annex Chess Club Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
     'Aurora Chess Club Carbon Copy 50-Move (1 page)':
-        'Aurora Chess Club Carbon Copy (2 cols x 25 rows, 1 page)',
+        'Aurora Chess Club Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
     "Bob & Gord's Milton Rapid 80-Move (2 pages)":
-        "Bob & Gord's Milton Rapid (2 cols x 20 rows x 2 pages)",
+        "Bob & Gord's Milton Rapid (2 cols x 20 rows, page 2 continues at 41)",
     'Carbon Copy 100-Move (2 pages)':
-        'Carbon Copy (2 cols x 25 rows x 2 pages)',
+        'Carbon Copy (2 cols x 25 rows, page 2 continues at 51)',
     'Chess Federation of Canada 80-Move (2 pages)':
-        'Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, 2 pages)',
+        'Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, page 2 continues at 51)',
     "Chess'n Math Association Carbon Copy 75-Move (1 page)":
-        "Chess'n Math Association Carbon Copy (3 cols x 25 rows, 1 page)",
+        "Chess'n Math Association Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)",
     'Collingwood-Somborac Chess Festival Carbon Copy 50-Move (1 page)':
-        'Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, 1 page)',
+        'Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
     'Excelsior Chess Club Carbon Copy 48-Move (1 page)':
-        'Excelsior Chess Club Carbon Copy (2 cols x 24 rows, 1 page)',
+        'Excelsior Chess Club Carbon Copy (2 cols x 24 rows, page 2 repeats page 1)',
     'Federation Quebecoise Des Echecs Carbon Copy 75-Move (1 page)':
-        'Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, 1 page)',
+        'Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)',
     'Forcing Moves First 100-Move (2 pages)':
-        'Forcing Moves First (2 cols x 25 rows x 2 pages)',
+        'Forcing Moves First (2 cols x 25 rows, page 2 continues at 51)',
     'Hart House Chess Club Carbon Copy 75-Move (1 page)':
-        'Hart House Chess Club Carbon Copy (3 cols x 25 rows, 1 page)',
+        'Hart House Chess Club Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)',
     'Kitchener Waterloo Chess Club 120-Move (2 pages)':
-        'Kitchener Waterloo Chess Club (2 cols x 30 rows x 2 pages)',
+        'Kitchener Waterloo Chess Club (2 cols x 30 rows, page 2 continues at 61)',
     'Mississauga Chess Club 90-Move (2 pages)':
-        'Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, 2 pages)',
+        'Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, page 2 continues at 41)',
     'Mississauga Chess Club Carbon Copy 40-Move Old (1 page)':
-        'Mississauga Chess Club Carbon Copy Old (2 cols x 20 rows, 1 page)',
+        'Mississauga Chess Club Carbon Copy, old (2 cols x 20 rows, page 2 repeats page 1)',
     'Mississauga Chess Club Carbon Copy 60-Move (1 page)':
-        'Mississauga Chess Club Carbon Copy (3 cols x 20 rows, 1 page)',
+        'Mississauga Chess Club Carbon Copy (3 cols x 20 rows, page 2 repeats page 1)',
     'Niagara Chess Carbon Copy 50-Move (1 page)':
-        'Niagara Chess Carbon Copy (2 cols x 25 rows, 1 page)',
+        'Niagara Chess Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
     'Scarborough Chess Club Carbon Copy 78-Move (1 page)':
-        'Scarborough Chess Club Carbon Copy (3 cols x 26 rows, 1 page)',
+        'Scarborough Chess Club Carbon Copy (3 cols x 26 rows, page 2 repeats page 1)',
     'Silent Storm Chess Academy Brampton Carbon Copy 70-Move (1 page)':
-        'Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, 1 page)',
+        'Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, page 2 repeats page 1)',
     'Vancity Chess Carbon Copy 60-Move (1 page)':
-        'Vancity Chess Carbon Copy (2 cols x 30 rows, 1 page)'
+        'Vancity Chess Carbon Copy (2 cols x 30 rows, page 2 repeats page 1)',
+
+    // Wave 3 club/default names (cols x rows generation) -> wave 4
+    '2 cols x 20 rows Default (2 pages)':
+        '2 cols x 20 rows Default (page 2 continues at 41)',
+    '2 cols x 25 rows Default (2 pages)':
+        '2 cols x 25 rows Default (page 2 continues at 51)',
+    '2 cols x 30 rows Default (2 pages)':
+        '2 cols x 30 rows Default (page 2 continues at 61)',
+    '2 cols x 35 rows Default (2 pages)':
+        '2 cols x 35 rows Default (page 2 continues at 71)',
+    '3 cols x 20 rows Default (2 pages)':
+        '3 cols x 20 rows Default (page 2 continues at 61)',
+    '3 cols x 25 rows Default (2 pages)':
+        '3 cols x 25 rows Default (page 2 continues at 76)',
+    'Annex Chess Club Carbon Copy (2 cols x 25 rows, 1 page)':
+        'Annex Chess Club Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
+    'Aurora Chess Club Carbon Copy (2 cols x 25 rows, 1 page)':
+        'Aurora Chess Club Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
+    "Bob & Gord's Milton Rapid (2 cols x 20 rows x 2 pages)":
+        "Bob & Gord's Milton Rapid (2 cols x 20 rows, page 2 continues at 41)",
+    'Carbon Copy (2 cols x 25 rows x 2 pages)':
+        'Carbon Copy (2 cols x 25 rows, page 2 continues at 51)',
+    'Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, 2 pages)':
+        'Chess Federation of Canada (2 cols x 25 rows + 2 cols x 15 rows, page 2 continues at 51)',
+    "Chess'n Math Association Carbon Copy (3 cols x 25 rows, 1 page)":
+        "Chess'n Math Association Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)",
+    'Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, 1 page)':
+        'Collingwood-Somborac Chess Festival Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
+    'Excelsior Chess Club Carbon Copy (2 cols x 24 rows, 1 page)':
+        'Excelsior Chess Club Carbon Copy (2 cols x 24 rows, page 2 repeats page 1)',
+    'Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, 1 page)':
+        'Federation Quebecoise Des Echecs Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)',
+    'Forcing Moves First (2 cols x 25 rows x 2 pages)':
+        'Forcing Moves First (2 cols x 25 rows, page 2 continues at 51)',
+    'Hart House Chess Club Carbon Copy (3 cols x 25 rows, 1 page)':
+        'Hart House Chess Club Carbon Copy (3 cols x 25 rows, page 2 repeats page 1)',
+    'Kitchener Waterloo Chess Club (2 cols x 30 rows x 2 pages)':
+        'Kitchener Waterloo Chess Club (2 cols x 30 rows, page 2 continues at 61)',
+    'Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, 2 pages)':
+        'Mississauga Chess Club (2 cols x 20 rows + 2 cols x 25 rows, page 2 continues at 41)',
+    'Mississauga Chess Club Carbon Copy Old (2 cols x 20 rows, 1 page)':
+        'Mississauga Chess Club Carbon Copy, old (2 cols x 20 rows, page 2 repeats page 1)',
+    'Mississauga Chess Club Carbon Copy (3 cols x 20 rows, 1 page)':
+        'Mississauga Chess Club Carbon Copy (3 cols x 20 rows, page 2 repeats page 1)',
+    'Niagara Chess Carbon Copy (2 cols x 25 rows, 1 page)':
+        'Niagara Chess Carbon Copy (2 cols x 25 rows, page 2 repeats page 1)',
+    'Scarborough Chess Club Carbon Copy (3 cols x 26 rows, 1 page)':
+        'Scarborough Chess Club Carbon Copy (3 cols x 26 rows, page 2 repeats page 1)',
+    'Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, 1 page)':
+        'Silent Storm Chess Academy Brampton Carbon Copy (2 cols x 35 rows, page 2 repeats page 1)',
+    'Vancity Chess Carbon Copy (2 cols x 30 rows, 1 page)':
+        'Vancity Chess Carbon Copy (2 cols x 30 rows, page 2 repeats page 1)'
 };
 
 // In-memory state
@@ -504,6 +556,15 @@ function getProfileGridConfig(pageNumber, overrides) {
     // cycleSize is the total moves represented by one full sweep of the
     // template, computed by summing movesPerPage across every template page.
     var templateStart = page.startingMove || 1;
+
+    // printedStartingMove is the number PRINTED in this page's first row —
+    // always the template's own value, never cycle-extrapolated. Grid detection
+    // matches detected row numbers against what the paper actually shows, so it
+    // needs this, not the logical startingMove below. The two differ whenever a
+    // page reuses a form: page 3 of a 2-page profile is physically page 1 again
+    // (printed 1..40) while its moves are 81+.
+    config.printedStartingMove = templateStart;
+
     if (completedCycles === 0) {
         config.startingMove = templateStart;
     } else {
@@ -639,25 +700,48 @@ function renderProfileDropdown() {
         var opt = document.createElement('option');
         opt.value = p.name;
         opt.textContent = p.name;
+        opt.title = p.name;
         if (p.name === _activeProfileName) opt.selected = true;
         select.appendChild(opt);
     });
+    select.title = _activeProfileName || '';
 }
 
-function renderProfileSummary() {
-    var span = document.getElementById('profile-summary');
-    if (!span) return;
-
-    var profile = getActiveProfile();
+/**
+ * One-line summary of a profile's pages, e.g.
+ *   "P1:2col 20r | P2:2col 25r @41"                 (page 2 continues)
+ *   "P1:2col 20r | P2:2col 20r (repeats P1)"        (page 2 is the same form)
+ *
+ * The "(repeats P1)" tail matters: a repeating page 2 has startingMove 1, and
+ * the old format only printed "@N" when N > 1 — so the two kinds of profile
+ * rendered identically apart from the row count. That is the distinction the
+ * whole profile got picked on.
+ *
+ * Shared by the Image tab and the Batch tab, which each used to carry their
+ * own copy of this loop.
+ */
+function formatProfileSummary(profile) {
+    if (!profile || !profile.pages) return '';
     var parts = [];
     profile.pages.forEach(function(pg, i) {
         var desc = pg.format + ' ' + pg.rowCount + 'r';
         if (pg.headerRows > 0) desc += ' +' + pg.headerRows + 'h';
         if (pg.footerRows > 0) desc += ' +' + pg.footerRows + 'f';
         if (pg.startingMove > 1) desc += ' @' + pg.startingMove;
+        else if (i > 0) desc += ' (repeats P1)';
         parts.push('P' + (i + 1) + ':' + desc);
     });
-    span.textContent = parts.join(' | ');
+    return parts.join(' | ');
+}
+
+function renderProfileSummary() {
+    var span = document.getElementById('profile-summary');
+    if (!span) return;
+    span.textContent = formatProfileSummary(getActiveProfile());
+
+    // Full name on hover — the select truncates on a narrow window.
+    var select = document.getElementById('profile-select');
+    if (select) select.title = select.value || '';
 }
 
 // =============================================================================
@@ -755,9 +839,14 @@ function renderProfilePageRows(pages) {
                            class="profile-pg-footer w-full bg-gray-600 text-white rounded px-2 py-1 mt-0.5">
                 </label>
                 <label class="text-gray-400 col-span-2">
-                    Starting move number
+                    First move number <span class="text-gray-500">printed on this page</span>
                     <input type="number" min="1" max="200" value="${pg.startingMove || 1}"
+                           title="The number PRINTED in this page's first row — grid detection matches the printed row numbers against it. If this page is a second copy of the same blank form, its numbers restart, so enter 1 (not 41)."
                            class="profile-pg-start w-full bg-gray-600 text-white rounded px-2 py-1 mt-0.5">
+                    <span class="block text-[10px] text-gray-500 mt-0.5 leading-snug">
+                        Continuation page printed 41,&nbsp;42,&nbsp;… → enter 41.
+                        Another copy of the same blank form (numbers restart) → enter 1.
+                    </span>
                 </label>
             </div>
         `;
@@ -912,6 +1001,7 @@ if (typeof window !== 'undefined') {
         getProfileGridConfig: getProfileGridConfig,
         renderProfileDropdown: renderProfileDropdown,
         renderProfileSummary: renderProfileSummary,
+        formatProfileSummary: formatProfileSummary,
         openProfileEditor: openProfileEditor,
         closeProfileEditor: closeProfileEditor,
         saveProfileFromEditor: saveProfileFromEditor,

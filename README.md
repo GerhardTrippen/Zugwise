@@ -98,7 +98,9 @@ These are experimental features. They can solve many games fully automatically â
 
 ## Privacy
 
-Zugwise runs entirely in your browser. Your scoresheet images are never uploaded to any server. The handwriting model and chess engine are downloaded once and cached locally. No account is needed, no data is collected.
+Zugwise runs entirely in your browser. Your scoresheet images are never uploaded to any server. The handwriting model and chess engine are downloaded once and cached locally. No account is needed.
+
+The one exception is a page counter: visits to the Zugwise page are counted anonymously with [GoatCounter](https://www.goatcounter.com), which sets no cookies and collects no personal data. It records that a page was opened, plus the referring site, country and browser â€” nothing about your scoresheets, your games or your files, which never leave your device. It also tells us nothing when you use Zugwise offline. To opt out, block `gc.zgo.at` in your browser or ad blocker; Zugwise works exactly the same either way.
 
 ## Reporting Bugs
 

@@ -1,0 +1,11 @@
+{
+  "planes": 17,
+  "moves": 4096,
+  "blocks": 8,
+  "filters": 128,
+  "epoch": 4,
+  "val_move_match": 0.4835513818841124,
+  "move_index": "from*64 + to, both squares in the side-to-move-flipped frame",
+  "output": "raw logits; renormalise over LEGAL moves only",
+  "source_checkpoint": "move_prior_b8f128_mb0.pt"
+}

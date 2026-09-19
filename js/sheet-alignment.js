@@ -2617,6 +2617,30 @@
     }
     state.alignmentPendingIssues = allPending;
 
+    // DETECTION vs SCORING split. enumerateAlignmentIssues now also returns
+    // gaps whose legality / piece-presence scoring could not be computed
+    // because _buildVerifiedFen couldn't reach the gap's pre-edge (i.e.
+    // reconstruction hasn't confirmed the plies before it yet). Those are
+    // REAL detected structural issues — they just can't be shown with
+    // trustworthy numbers, so they must never be picked for the banner.
+    //
+    // Before this split they were dropped on the floor entirely, which made
+    // NW report "0 total, 0 pending" for exactly the window in which the
+    // user is working through Greedy review — and Greedy, which only sees
+    // the merged ply grid (full length even when one sheet is short a
+    // cell), has no way to propose a sheet insert. So a one-cell omission
+    // on a sheet was invisible to BOTH systems until the user hand-fixed it.
+    //
+    // Keep them counted and logged so the issue is known; keep them out of
+    // the surfacing path so the "fully-scored banner only" policy holds.
+    var surfaceable = [];
+    var deferredPending = [];
+    for (var qi = 0; qi < allPending.length; qi++) {
+      if (allPending[qi] && allPending[qi].scoringDeferred) deferredPending.push(allPending[qi]);
+      else surfaceable.push(allPending[qi]);
+    }
+    state.alignmentDeferredIssues = deferredPending;
+
     // ANTI-FLAP — is the banner currently on screen showing an issue that is
     // STILL pending (i.e. not resolved and not dismissed)? If so,
     // the SOFT gates below (closest-pick switch, workflow proximity, gap
@@ -2652,8 +2676,26 @@
       var pendStr = pendBits.length ? ' [' + pendBits.join(' ') + (allPending.length > 6 ? ' …' : '') + ']' : '';
       var declinedN = Object.keys(state.dismissedNWKeys).length;
       var filteredStr = declinedN > 0 ? ' (' + declinedN + ' declined)' : '';
+      var deferredStr = deferredPending.length
+        ? (', ' + deferredPending.length + ' scoring-deferred')
+        : '';
       log('🧭 NW enumerate: ' + enumeratedTotal + ' total, ' +
-          allPending.length + ' pending' + filteredStr + pendStr);
+          allPending.length + ' pending' + filteredStr + deferredStr + pendStr);
+      // Name the deferred gaps explicitly. This is the line that would have
+      // told the user "White's sheet is short a cell at move N" BEFORE they
+      // walked Greedy review reconciling the shifted island one ply at a
+      // time. Detection is real here; only the scoring is pending.
+      deferredPending.forEach(function(d) {
+        var dPly = (d.action === 'insert') ? (d.afterPly + 1) : d.plies[0];
+        var dMv = Math.floor(dPly / 2) + 1 + '.' + (dPly % 2 === 0 ? 'W' : 'B');
+        var dSheetTag = (d.action === 'insert') ? d.onSheet : d.fromSheet;
+        var dSheet = (dSheetTag === 's1') ? "White's" : (dSheetTag === 's2') ? "Black's" : '?';
+        log('   ⏳ Structural gap DETECTED at ' + dMv + ' — ' + d.action + ' ' +
+            (d.nPlies || 1) + ' ply on ' + dSheet + ' sheet. Banner held back: ' +
+            'scoring needs reconstruction to confirm the position before the gap (' +
+            (d.cleanFenSrc || 'deferred') + '). ' +
+            'Structure first — resolve this before accepting per-move fixes across it.');
+      });
     }
 
     // Pick the suggestion to surface from the enumerated pending list,
@@ -2663,18 +2705,22 @@
     // — e.g. searchFrom=122 after several applies, but the user is now
     // at ply 107 with pending issues at plies 100-115 — using searchFrom
     // hides all of them. Pick by proximity to currentPly instead.
+    // Pick from `surfaceable`, NOT allPending: a scoring-deferred issue must
+    // never be chosen, or it would occupy the pick and then be suppressed by
+    // the gap-proximity gate's scoringDeferred branch — starving a genuinely
+    // surfaceable issue further along.
     var sug = null;
-    if (allPending.length > 0) {
+    if (surfaceable.length > 0) {
       var refPlyForPick = (typeof state.currentPly === 'number') ? state.currentPly :
                           (typeof state.stuckPly === 'number') ? state.stuckPly : 0;
       // Auto-surface mode uses the first issue (initial fresh-OCR flow).
       // Otherwise pick the pending issue closest to where the user is.
       if (state.alignmentAutoSurfaceMode) {
-        sug = allPending[0];
+        sug = surfaceable[0];
       } else {
         var bestDist = Infinity;
-        for (var pi = 0; pi < allPending.length; pi++) {
-          var p = allPending[pi];
+        for (var pi = 0; pi < surfaceable.length; pi++) {
+          var p = surfaceable[pi];
           var pPly = (p.action === 'insert') ? p.afterPly : p.plies[0];
           var d = Math.abs(pPly - refPlyForPick);
           if (d < bestDist) { bestDist = d; sug = p; }
@@ -2810,7 +2856,16 @@
               ' anchors ' + (sug.beforeScore || 0).toFixed(2) + '/' + (sug.afterScore || 0).toFixed(2);
         log('🧭 NW alignment: surfacing → ' + lab);
       } else {
-        log('🧭 NW alignment: nothing to surface (no pending issues after dismissals)');
+        // Distinguish "structurally clean" from "detected but not yet
+        // scoreable". Reading the old wording as the former is what let a
+        // one-cell sheet omission pass unnoticed through Greedy review.
+        if (deferredPending.length) {
+          log('🧭 NW alignment: nothing SURFACEABLE yet — but ' + deferredPending.length +
+              ' structural gap(s) are already detected and waiting on scoring ' +
+              '(see the ⏳ line(s) above). The sheets are NOT clean.');
+        } else {
+          log('🧭 NW alignment: nothing to surface (no pending issues after dismissals)');
+        }
         // Diagnostic dump: why did each layer come up empty?
         var d = window.SheetNWAlignment.detectNextAlignmentIssue.lastDiag || {};
         var dup1 = d.dup1 || {};

@@ -136,7 +136,7 @@ class SearchProgress:
 #
 # Canonical semantics here match the prior worker behavior (Phase 1 + Phase 2
 # via find_fixes_two_phase, EAD approved = range(confirmed_ply) only, lock-
-# aware backtrack filter, verify_top_n=15, score_floor=0). The prefix caches
+# aware backtrack filter, verify_top_n=15; the score floor is gone). The prefix caches
 # from full_game_search.py are layered on top — the worker gets them for free
 # as a side-effect of using this function.
 #
@@ -492,6 +492,13 @@ def resolve_forced_stop_choice(moves, ply, ocr_lookup, forced_stop_plies=None,
     return best
 
 
+# Whether an ambiguous forced stop that KEEPS the current move spends one of the
+# max_fixes slots. True = today's behaviour, and `iteration` is a true loop
+# bound. See the note at the ambiguity branch in greedy_step, and
+# experiment_keep_budget.py for the corpus A/B.
+KEEPS_COUNT_TOWARD_MAX_FIXES = True
+
+
 def greedy_init(
     moves: List[str],
     ocr_lookup: Dict[int, OCRMove],
@@ -502,8 +509,15 @@ def greedy_init(
     max_backtrack: int = 5,
     max_fixes: int = 15,
     forced_stop_plies: Optional[Set[int]] = None,
+    time_budget_s: float = 0,
 ) -> dict:
     """Build a greedy search state dict. See greedy_step for the iteration.
+
+    ``time_budget_s``: wall-clock ceiling in seconds, checked at iteration
+    boundaries. 0 (the default) means unlimited, which is the existing
+    behaviour for the CLI, the tests, and interactive single-game runs. Batch
+    mode sets it because its reconstruct queue is sequential: an unbounded run
+    on one game blocks review of the next. See the note in greedy_step.
 
     ``forced_stop_plies``: plies the dual-sheet merge flagged as ambiguous
     (near-tie disagreement) or very-low-confidence. Greedy stops (PARTIAL) at
@@ -536,6 +550,7 @@ def greedy_init(
         'forced_stop_plies': set(forced_stop_plies) if forced_stop_plies else set(),
         'max_backtrack': int(max_backtrack),
         'max_fixes': int(max_fixes),
+        'time_budget_s': float(time_budget_s or 0),
         # Seed fixed_plies with user-locked plies so greedy never overwrites
         # them. Own fixes are added as they get applied.
         'fixed_plies': set(locked_set),
@@ -664,7 +679,21 @@ def greedy_step(state: dict) -> dict:
         cur = moves[stuck] if stuck < len(moves) else ''
         state['fixed_plies'].add(stuck)
         state['confirmed_ply'] = max(state['confirmed_ply'], stuck + 1)
-        state['iteration'] += 1
+        # An ambiguous stop costs an iteration whether or not the move CHANGES.
+        # That is deliberate, not an oversight: `iteration` is the only
+        # universal loop bound greedy has, and a ply that re-stops forever is a
+        # failure mode this project has actually hit (the SAN-ambiguity
+        # forced-stop spin). Counting keeps is what makes max_fixes a backstop
+        # rather than a fix budget.
+        #
+        # The cost is that a KEEP — a review step where scoring confirms the
+        # move already on the board — spends one of the 15 slots. Set
+        # KEEPS_COUNT_TOWARD_MAX_FIXES = False to charge only real changes;
+        # experiment_keep_budget.py measures that arm on the corpus. Default
+        # stays True: do not flip it without the numbers.
+        if KEEPS_COUNT_TOWARD_MAX_FIXES or (
+                marker and marker.get('san') and marker['san'] != cur):
+            state['iteration'] += 1
         if marker and marker.get('san') and marker['san'] != cur:
             # Proper scoring favours a DIFFERENT reading — apply it as a fix.
             moves[stuck] = marker['san']
@@ -696,6 +725,13 @@ def greedy_step(state: dict) -> dict:
                 'fix_ply': ply_to_str(stuck),
                 'fix_from': marker.get('ocr', ''), 'fix_to': marker.get('san', ''),
                 'fix_score': 0,
+                # This is a KEEP, not a change. Without the flag the UI cannot
+                # tell: it branches on fix_to, so it rendered a green
+                # "[fix] 32.W: Kd3 -> Kd3" and suppressed the message below.
+                # Comparing fix_from to fix_to is not enough — a keep whose OCR
+                # text differs only in a check symbol ("Qc4" kept as "Qc4+")
+                # reads as a real fix.
+                'fix_kept': True,
                 'fixes_so_far': len(state['all_fixes']),
                 'elapsed': round(elapsed, 1),
                 'message': (f"[ambiguity] {ply_to_str(stuck)} kept as-is "
@@ -835,8 +871,27 @@ def greedy_step(state: dict) -> dict:
             or (f['san'] != f.get('ocr', '') and f.get('original_was_legal') is False)
         ]
         _funnel.append(('cosmetic_noop', len(_fixes)))
-        # Score floor — reject deeply-negative cascading fixes.
-        _fixes = [f for f in _fixes if f.get('unified_score', 0) >= 0]
+        # Score floor — REMOVED (was: keep only unified_score >= 0).
+        #
+        # Measured over the recorded corpora, the floor fired on 61 of 1163
+        # Crown decisions and blocked the CORRECT top candidate 38 times while
+        # preventing a wrong one 23 times — a 0.61:1 trade against itself. On
+        # Premier, 6 blocked vs 5 prevented. Greedy surfaces suggestions and
+        # never applies anything the user has not confirmed, so a wrong pick
+        # costs a worse proposed solution, not a corrupted game; a blocked
+        # correct pick costs the run.
+        #
+        # It had also drifted. A fixed >= 0 was calibrated before the
+        # relative, negative-only signals existed: CTC alone moved the median
+        # top-fix score from 80.1 to 61.9 and the below-zero rate from 3.8% to
+        # 6.1% (Premier, which has no CTC anywhere, sat at 1.0%). Anchoring CTC
+        # and the prior at their global constants moves the scale again. A
+        # constant threshold against a moving scale is not a safety net, it is
+        # a coin flip that happens to be recorded in a funnel stage.
+        #
+        # The funnel stage is KEPT so the diagnostic shape and its message
+        # mapping survive; it is now a no-op that reports what it would have
+        # dropped.
         _funnel.append(('score_floor>=0', len(_fixes)))
         # Lock-aware backtrack: when stuck is user-locked, a backtrack candidate
         # that doesn't advance past it can't unstick anything (the lock prevents
@@ -987,13 +1042,66 @@ def greedy_step(state: dict) -> dict:
             'message': msg,
         }
 
-    # Anti-regression: once Greedy has applied fixes up to max_fixed_ply, any
-    # new candidate at ply <= max_fixed_ply is a backward jump (often
-    # "fixing" a perfectly legal move that only looks illegal because an
-    # earlier Greedy fix subtly shifted the position). Seed max_fixed_ply
-    # from own fixes only (worker-canonical: don't seed from locked_plies).
+    # Anti-regression. Two policies, switchable so the pair can be A/B'd (the
+    # recorder is oracle-driven and never runs Greedy, so this needs its own
+    # harness — scratchpad/greedy_ab).
+    #
+    #   'stop'  — the original. Any candidate at ply <= max fixed ply ends the
+    #             RUN. Guards the real hazard: an earlier Greedy fix subtly
+    #             shifts the position, a later legal move now looks illegal,
+    #             and Greedy "fixes" a move that was always correct.
+    #
+    #   'skip'  — reject candidates at plies THIS RUN has already fixed, allow
+    #             backward candidates at untouched plies, and stop only when
+    #             nothing survives.
+    #
+    # Why 'skip' is worth measuring: the hazard the comment names is REVISITING,
+    # and the rule as written bans all backward motion, including to plies
+    # Greedy has never touched. It is also blunt in two ways the user hit in one
+    # run — it compares against the MAXIMUM fixed ply, so 25.W was rejected for
+    # sitting one half-move behind 25.B; and it ends the whole run rather than
+    # taking candidate #2. Worst of all it is per-RUN state, so restarting
+    # Greedy resets max_fixed_ply and the very fix it refused is applied
+    # immediately — which is exactly what happened: the guard's only effect was
+    # to force a manual restart that Greedy then undid by itself.
+    GREEDY_BACKWARD_POLICY = globals().get('GREEDY_BACKWARD_POLICY', 'stop')
     own_fixed = [f['ply'] for f in state['all_fixes']]
     max_fixed_ply = max(own_fixed) if own_fixed else -1
+
+    if GREEDY_BACKWARD_POLICY == 'skip':
+        # Cycling is re-fixing the SAME ply; that is what gets forbidden.
+        # Keyed on fixed_plies (what is currently PROTECTED) rather than on
+        # all_fixes (the audit trail), because a backward jump unwinds the
+        # protection downstream of it and those plies must become revisitable
+        # again - their fixes were chosen to unstick a position that no longer
+        # exists.
+        _revisit = set(state['fixed_plies'])
+        _survivors = [f for f in fixes if f['ply'] not in _revisit]
+        if _survivors:
+            fixes = _survivors
+        else:
+            # Everything on offer revisits a ply this run already changed —
+            # that IS the cycle, so stop rather than spin.
+            max_fixed_ply = max(own_fixed) if own_fixed else -1
+            fixes = fixes[:1]
+            best = dict(fixes[0])
+            msg = (f"All candidates revisit an already-fixed ply "
+                   f"(best {ply_to_str(best['ply'])}) — stopping "
+                   f"({round(elapsed, 1)}s)")
+            state['done'] = True
+            state['result'] = {
+                'status': 'PARTIAL',
+                'moves': list(moves),
+                'fixes': list(state['all_fixes']),
+            }
+            return {
+                'done': True, 'status': 'PARTIAL',
+                'fixes_so_far': len(state['all_fixes']),
+                'elapsed': round(elapsed, 1),
+                'message': msg,
+            }
+        max_fixed_ply = -1          # backward motion is allowed under 'skip'
+
     best = dict(fixes[0])
     if max_fixed_ply >= 0 and best['ply'] <= max_fixed_ply:
         msg = (f"Backward regression (ply {ply_to_str(best['ply'])} <= max fixed "
@@ -1069,7 +1177,28 @@ def greedy_step(state: dict) -> dict:
     # accepting the fix, so the frontier should advance in both cases. The
     # _frontier=0 reset rule above still kicks in if a later stuck_at
     # retreats below this frontier (downstream change exposes upstream).
-    state['confirmed_ply'] = max(state['confirmed_ply'], best['ply'] + 1)
+    # `max` is right for a FORWARD fix and wrong for a backward one. If Greedy is
+    # confirmed through ply 38 and then changes ply 15, every position from 15 on
+    # is different, and holding the frontier at 38 makes iteration N+1 search a
+    # window anchored in a region it has not revalidated.
+    #
+    # The frontend already learned this exactly once: an edit behind
+    # confirmedPly must set confirmedPly = fixPly + 1, NOT Math.max, and must
+    # un-protect the downstream cells so revalidation can flag them. Greedy's
+    # `max` is the un-fixed twin of that bug, and it only becomes reachable once
+    # backward fixes are permitted - which is why this is scoped to 'skip'.
+    #
+    # STILL OPEN, and it is the real content of "what can go wrong jumping from
+    # 19.B back to 8.B": the downstream MOVES keep Greedy's earlier corrections
+    # even though the line that justified them is gone. Un-protecting lets them
+    # be re-examined; it does not revert them. Reverting to the OCR reads is the
+    # other candidate design and is NOT settled.
+    if (globals().get('GREEDY_BACKWARD_POLICY', 'stop') == 'skip'
+            and any(p > best['ply'] for p in state['fixed_plies'])):
+        state['confirmed_ply'] = best['ply'] + 1
+        state['fixed_plies'] = {p for p in state['fixed_plies'] if p <= best['ply']}
+    else:
+        state['confirmed_ply'] = max(state['confirmed_ply'], best['ply'] + 1)
     state['iteration'] += 1
     # Re-evaluate auto-locks now that current_moves changed at best['ply'].
     # Mirrors the frontend's classifyTiers re-run that happens after every
@@ -1104,6 +1233,46 @@ def greedy_step(state: dict) -> dict:
                 'elapsed': round(elapsed, 1),
                 'message': msg,
             }
+
+    # Wall-clock budget. OFF by default (0), so nothing changes for the CLI, the
+    # tests, or interactive single-game use where nobody is queued behind you.
+    #
+    # Batch mode is different: the reconstruction queue is sequential, so the
+    # game you want to review cannot start until the current one lets go. The
+    # score floor removed in dd4f85e used to end runs early, and losing it made
+    # that wait visible. Re-adding the floor is the wrong answer - it cut runs
+    # off by SCORE, which is why it discarded 38 correct picks to save 23 wrong
+    # ones. A deadline cuts by TIME, so it only truncates runs that are actually
+    # slow, and by the max_fixes evidence (binds on 24% of games, buys nothing) a
+    # run still grinding at the budget is usually thrashing rather than closing.
+    #
+    # Sizing, from the Crown corpus: one stop costs p50 5.6s / p75 8.2s / p90
+    # 12.9s / max 25.6s, so a full 15-fix run is ~84s on a median game but ~193s
+    # at p90 and ~385s worst case. A budget in the 90-120s range therefore lets a
+    # typical game finish and clips only the tail. Treat that as a starting
+    # point, not a measurement: it is projected from the ORACLE harness, whose
+    # per-game elapsed walks every stop with the answer in hand. `stop_reason`
+    # below is what lets a real batch run report its own distribution.
+    budget = state.get('time_budget_s') or 0
+    if budget and elapsed >= budget:
+        msg = (f"Hit time budget ({budget:.0f}s) after "
+               f"{state['iteration']} fix(es) — stuck at {ply_to_str(stuck)}")
+        state['done'] = True
+        state['result'] = {
+            'status': 'PARTIAL',
+            'moves': list(moves),
+            'fixes': list(state['all_fixes']),
+            'reached_ply': stuck,
+            'stop_reason': 'time_budget',
+            'stop_message': msg,
+        }
+        return {
+            'done': True, 'status': 'PARTIAL',
+            'stuck_at': ply_to_str(stuck),
+            'fixes_so_far': len(state['all_fixes']),
+            'elapsed': round(elapsed, 1),
+            'message': msg,
+        }
 
     # Max-fixes safety net (Python had this as `for ... range(max_fixes)`;
     # worker had no explicit cap, just stopped via regression/drift checks).
@@ -1160,6 +1329,7 @@ def run_greedy_search(
     confirmed_ply: int = 0,
     locked_plies: Set[int] = None,
     max_backtrack: int = 5,
+    time_budget_s: float = 0,
 ) -> ReconstructionResult:
     """
     Greedy reconstruction: iteratively fix one error at a time.
@@ -1202,6 +1372,7 @@ def run_greedy_search(
         locked_plies=locked_plies,
         max_backtrack=max_backtrack,
         max_fixes=max_fixes,
+        time_budget_s=time_budget_s,
     )
 
     def _emit_progress(step_result: dict):

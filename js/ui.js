@@ -1217,11 +1217,16 @@ function deleteMovesFromPly(ply){
   // Truncate state.sans
   state.sans = state.sans.slice(0, ply);
 
-  // Truncate OCR cell arrays so remerge doesn't resurrect deleted moves
-  if(state.ocrCells && state.ocrCells.length > ply){
-    state.ocrCells = state.ocrCells.slice(0, ply);
-  }
-  // Also truncate per-sheet arrays (dual mode) by (moveNum, color) boundary
+  // Truncate OCR cell arrays so remerge doesn't resurrect deleted moves.
+  // Everything below is cut on the (moveNum, color) boundary, never on the
+  // array index: in dual-sheet mode state.ocrCells is mergeSheets' output,
+  // which emits one cell per (num, color) key PRESENT in either sheet — so
+  // it is gappy whenever both sheets missed the same half-move. On a gappy
+  // array `slice(0, ply)` cuts too late and leaves cells with num beyond the
+  // truncation point sitting in state.ocrCells while the per-sheet arrays
+  // (filtered by num) are clean — the two then disagree about where the game
+  // ends, and any later rebuildFromOcrCells() re-pairs the leftovers back
+  // into the move list.
   var truncMoveNum = Math.floor(ply / 2) + 1;
   var truncIsBlack = ply % 2 === 1;
   function _truncateSheet(cells){
@@ -1232,8 +1237,27 @@ function deleteMovesFromPly(ply){
       return false;
     });
   }
+  if(state.ocrCells) state.ocrCells = _truncateSheet(state.ocrCells);
   if(state.ocrCellsSheet1) state.ocrCellsSheet1 = _truncateSheet(state.ocrCellsSheet1);
   if(state.ocrCellsSheet2) state.ocrCellsSheet2 = _truncateSheet(state.ocrCellsSheet2);
+
+  // Drop tracking-array entries for plies that no longer exist. These are
+  // positional, and _doRequeueNow unions state.lockedPlies into the locked
+  // set it hands the algorithms — stale out-of-range plies would be shipped
+  // to the worker on every requeue. confirmedPly is clamped for the same
+  // reason: revalidate passes it as startPly.
+  function _dropPastTruncation(arr){
+    if(!Array.isArray(arr)) return arr;
+    return arr.filter(function(p){ return p < ply; });
+  }
+  state.fixedPlies       = _dropPastTruncation(state.fixedPlies);
+  state.lockedPlies      = _dropPastTruncation(state.lockedPlies);
+  state.approvedPlies    = _dropPastTruncation(state.approvedPlies);
+  state.ambiguousPlies   = _dropPastTruncation(state.ambiguousPlies);
+  state.mergeLockedPlies = _dropPastTruncation(state.mergeLockedPlies);
+  if(typeof state.confirmedPly === 'number' && state.confirmedPly > ply){
+    state.confirmedPly = ply;
+  }
 
   // Clear stuck info if it was after the truncation point
   if(state.stuckPly !== null && state.stuckPly >= ply){

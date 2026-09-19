@@ -395,7 +395,12 @@ async function validateAndDisplay(paired,filename,opts){
         color:val.stuck_at%2===0?'w':'b',
         move:val.stuck_move,
         reason:val.stuck_reason||'illegal',
-        explanation:val.stuck_explanation||null
+        explanation:val.stuck_explanation||null,
+        // Diagnostic note from validation.py::describe_standing_free_capture.
+        // Never a ranking signal — it only tells the operator that a major
+        // piece has been sitting en prise across moves, which a one-line
+        // "is illegal" message cannot show. See the Python block for why.
+        hangingWarning:val.hanging_warning||null
       };
       // Always clear old arrow before setting new one (prevents stale arrows when from_square is null)
       state.errorArrow=null;
@@ -526,7 +531,16 @@ async function fetchFixes(){
     // Forced stop: dual-sheet near-tie disagreement or very-low-confidence
     // read. The move is LEGAL — we stopped so the user picks among the
     // candidates below. Must NOT fall into the "is illegal" default.
-    var explanation=state.stuckInfo.explanation||'the two sheets disagree or this reading is low-confidence — choose the correct move below';
+    // The default text must match the MODE. In single-sheet mode there is no
+    // second sheet to disagree, so naming one sends the user looking for a
+    // conflict that cannot exist — the stop is purely a low-confidence read.
+    // (User-reported: "the text that the 2 sheets disagree is wrong here
+    // because I'm in single sheet mode".) A backend-supplied explanation still
+    // wins; this only fixes the fallback.
+    var _dual = (state.inputMode === 'dual-sheets');
+    var explanation=state.stuckInfo.explanation||(_dual
+      ? 'the two sheets disagree or this reading is low-confidence — choose the correct move below'
+      : 'this reading is low-confidence — choose the correct move below');
     stuckHtml='<div class="text-amber-400">🔍 '+lbl+' '+state.stuckInfo.move+' <span class="text-amber-300/70 text-xs">— needs review</span></div>'+
       '<div class="text-xs text-gray-400 mt-1">'+explanation+'</div>';
   }else{
@@ -539,6 +553,14 @@ async function fetchFixes(){
       stuckHtml='<span class="text-red-400">❌ '+lbl+' '+state.stuckInfo.move+' is illegal</span>';
     }
   }
+  // Standing free capture: appended to EVERY stop reason, because the reason
+  // the operator is looking at ("Be5 is illegal") can be perfectly correct and
+  // still hide the fact that decides what to do about it.
+  if(state.stuckInfo.hangingWarning){
+    stuckHtml+='<div class="text-xs text-amber-300/90 mt-2 border-l-2 border-amber-500/50 pl-2">'
+      +'⚠️ '+state.stuckInfo.hangingWarning+'</div>';
+  }
+
   document.getElementById('stuck-info').innerHTML=stuckHtml;
   // Hide OCR preview - move is already shown in stuck-info above
   document.getElementById('source-preview').classList.add('hidden');

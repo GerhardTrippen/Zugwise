@@ -228,6 +228,8 @@ var BatchGameList = (function() {
     }
 
     renderGameList();
+    // Resume anything this folder already has a finished PGN for.
+    _restoreSavedPgns();
   }
 
   // =========================================================================
@@ -294,6 +296,8 @@ var BatchGameList = (function() {
       batchState.games = new Map();
       batchState.selectedPlayerName = null;
       renderGameList();
+    // Resume anything this folder already has a finished PGN for.
+    _restoreSavedPgns();
       return;
     }
 
@@ -397,6 +401,18 @@ var BatchGameList = (function() {
   function _persistVerifiedGame(gameId, reasonTag, opts) {
     opts = opts || {};
     var tag = reasonTag || 'Auto-save';
+    // Record the move list being written, so a later completion event can tell
+    // whether anything actually CHANGED since the last save. Without this the
+    // only test available was game.status, which is a one-way latch: a game
+    // edited after it was already VERIFIED had its correction silently dropped.
+    // See onCurrentGameFunctionallyComplete.
+    try {
+      var _pg = gameId && batchState.games.get(gameId);
+      if (_pg && gameId === batchState.currentGameId &&
+          typeof state !== 'undefined' && Array.isArray(state.sans)) {
+        _pg._persistedSans = state.sans.join(' ');
+      }
+    } catch (e) { /* bookkeeping only - never block the write */ }
     if (gameId && window.BatchExport &&
         typeof window.BatchExport.exportAndSaveGamePgn === 'function' &&
         batchState.folderHandle) {
@@ -409,9 +425,24 @@ var BatchGameList = (function() {
               log('[' + tag + '] ' + gameId + ' → ' + fileName +
                   (savedTo === 'folder' ? ' (folder)' : ' (downloaded)'));
             }
+            if (game._saveFailed) { delete game._saveFailed; renderGameList(); }
           })
           .catch(function(e) {
+            // A FAILED WRITE MUST BECOME STATE, not just a console line. The
+            // row otherwise stays green and VERIFIED while nothing reached the
+            // disk — the same "the UI is authoritative about work the disk
+            // never received" shape as the one-shot latch. _persistedSans is
+            // cleared so the next completion event retries instead of
+            // concluding nothing changed.
+            game._saveFailed = (e && e.message) || 'write failed';
+            delete game._persistedSans;
             console.warn('[Batch] Individual PGN auto-save failed for', gameId, e);
+            if (typeof log === 'function') {
+              log('⚠ [' + tag + '] ' + gameId + ' was NOT saved to ' + fileName +
+                  ': ' + game._saveFailed + ' — the game is verified in this ' +
+                  'session but nothing reached the disk.');
+            }
+            renderGameList();
           });
       }
     }
@@ -442,6 +473,10 @@ var BatchGameList = (function() {
     // queues themselves are fresh (created below), but batchState.games
     // entries persist with whatever the last run left on them.
     batchState.games.forEach(function(game) {
+      // A game resumed from a saved PGN is finished work, not pending work.
+      // It still goes through OCR (a fast cache hit, so its sheet is available
+      // for review), but it must not be re-queued as if it were untouched.
+      if (game.savedPgn) return;
       game.status = GAME_STATUS.QUEUED;
       game.hasTrailingNoise = false;
       game.noiseResolved = false;
@@ -845,6 +880,14 @@ var BatchGameList = (function() {
           return;
         }
       }
+      if (game && game.savedPgn) {
+        // Already finished in a previous session: OCR has just been restored
+        // from cache so the sheet is reviewable, but re-running the algorithms
+        // would throw away the verification the saved PGN represents.
+        game.status = GAME_STATUS.VERIFIED;
+        renderGameList();
+        return;
+      }
       if (reconstructQueue) {
         reconstructQueue.enqueue(gameId, result);
       }
@@ -924,6 +967,142 @@ var BatchGameList = (function() {
    * via hadPriorResult → reconstruction re-runs). Every other game is left
    * untouched — the safe answer to a mixed 2col/3col round.
    */
+  /**
+   * Reset one game's row state for a re-OCR pass: thaw the badge freeze and
+   * clear the prior pass's per-method / tier / picked badges so the row shows
+   * fresh OCR progress (mirrors startBatchOcr's per-game reset + the re-run
+   * thaw). Shared by the single-game badge and the bulk re-OCR so the two can
+   * never drift apart.
+   */
+  function _resetGameForReOcr(game, gameId) {
+    delete _completedRowGameIds[gameId];
+    game.methodStatus = null;
+    game.tier = null;
+    game.triageDetails = null;
+    game.reconstructPicked = null;
+    game.cachedLayout = null;
+    game.ocrProgress = null;
+    game.status = GAME_STATUS.QUEUED;
+  }
+
+  /**
+   * Game ids whose cached OCR layout differs from the active sheet profile AND
+   * that are eligible to be redone.
+   *
+   * SINGLE SOURCE OF TRUTH for "this game was OCR'd under the wrong profile":
+   * the per-game ↻ badge, the bulk re-OCR banner and its confirm count all read
+   * this, so the badge on a row and the number in the banner can never disagree.
+   *
+   * VERIFIED/EXPORTED are excluded deliberately — in a mixed round a finished
+   * 2col game legitimately differs from a 3col active profile, and re-OCR would
+   * discard its verification. Queued/running games have nothing to compare yet.
+   */
+  function _layoutMismatchedGameIds(curLayoutSig) {
+    var out = [];
+    if (!curLayoutSig || !batchState.games) return out;
+    batchState.games.forEach(function(game, gameId) {
+      if (!game || !game.cachedLayout) return;
+      if (game.status === GAME_STATUS.QUEUED ||
+          game.status === GAME_STATUS.OCR_RUNNING ||
+          game.status === GAME_STATUS.VERIFIED ||
+          game.status === GAME_STATUS.EXPORTED) return;
+      var matches = (window.BatchOcrQueue && window.BatchOcrQueue.layoutSignaturesMatch)
+        ? window.BatchOcrQueue.layoutSignaturesMatch(game.cachedLayout, curLayoutSig)
+        : game.cachedLayout === curLayoutSig;
+      if (!matches) out.push(gameId);
+    });
+    return out;
+  }
+
+  // =========================================================================
+  // Resume: recognise games this folder already has a finished PGN for
+  // =========================================================================
+  // Batch mode reads its OCR cache back from disk (batch-ocr-queue.js), which
+  // is why reopening a tournament does not re-OCR. It never read the PGNs back,
+  // so the VERIFICATION was forgotten: a game the user had finished and saved
+  // reopened looking like untouched work. The artifact was on disk and correct;
+  // nothing looked at it. (User: "it didn't remember any of my previous work.")
+  //
+  // A plain "<stem>.pgn" is written only when a game completes — partial saves
+  // are named "_incomplete" — so its presence is the signal. BatchPaths routes
+  // the read into Zugwise/PGN/ with a flat-root fallback, so pre-layout
+  // tournaments resume too.
+
+  function _parsePgnSans(text) {
+    if (!text) return [];
+    var body = text.split('\n').filter(function(ln) {
+      return ln.lastIndexOf('[', 0) !== 0;
+    }).join('\n');
+    body = body.replace(/\{[^}]*\}/g, ' ').replace(/\$\d+/g, ' ')
+               .replace(/\d+\.(\.\.)?/g, ' ');
+    return body.split(/\s+/).filter(function(t) {
+      return t && t !== '*' && t !== '1-0' && t !== '0-1' && t !== '1/2-1/2';
+    });
+  }
+
+  async function _loadSavedPgnForGame(gameId, game) {
+    var folder = batchState.folderHandle;
+    if (!folder || !window.BatchPaths) return null;
+    // Try the export name first, then the bare gameId — older saves and the
+    // _buildPgnFilename fallback both use the latter.
+    var names = [];
+    var built = _buildPgnFilename(gameId, game);
+    if (built) names.push(built);
+    if (names.indexOf(gameId + '.pgn') < 0) names.push(gameId + '.pgn');
+    for (var i = 0; i < names.length; i++) {
+      var text = null;
+      try {
+        text = await window.BatchPaths.readText(folder, names[i]);
+      } catch (e) { text = null; }
+      if (!text) continue;
+      var sans = _parsePgnSans(text);
+      if (!sans.length) continue;
+      return { fileName: names[i], sans: sans, plyCount: sans.length };
+    }
+    return null;
+  }
+
+  /**
+   * Enrichment pass over the current game set. Async and fire-and-forget by
+   * necessity (selectRound/selectPlayer are synchronous), so it guards against
+   * the set changing underneath it — a rapid round switch must not stamp the
+   * previous round's results onto the new list. Read-only: a failure means no
+   * resume, never lost work, and it says so in the log rather than silently.
+   */
+  async function _restoreSavedPgns() {
+    if (!batchState.folderHandle || !batchState.games) return;
+    var token = batchState.games;              // identity IS the guard
+    var found = 0;
+    var entries = [];
+    batchState.games.forEach(function(game, gameId) { entries.push([gameId, game]); });
+    for (var i = 0; i < entries.length; i++) {
+      if (batchState.games !== token) return;  // round/player changed — abandon
+      var gameId = entries[i][0], game = entries[i][1];
+      if (!game || game.savedPgn) continue;
+      var saved = null;
+      try {
+        saved = await _loadSavedPgnForGame(gameId, game);
+      } catch (e) {
+        if (typeof log === 'function') {
+          log('[Batch] could not read a saved PGN for ' + gameId + ': ' + e.message);
+        }
+        continue;
+      }
+      if (!saved) continue;
+      if (batchState.games !== token) return;
+      game.savedPgn = saved;
+      game.status = GAME_STATUS.VERIFIED;
+      found++;
+    }
+    if (found && batchState.games === token) {
+      if (typeof log === 'function') {
+        log('[Batch] resumed ' + found + ' game(s) already saved in this folder — ' +
+            'shown as complete; they will not be reconstructed again.');
+      }
+      renderGameList();
+    }
+  }
+
   async function reOcrGameAtCurrentLayout(gameId) {
     var game = batchState.games.get(gameId);
     if (!game) return;
@@ -940,17 +1119,7 @@ var BatchGameList = (function() {
     // Drop this game's cache so _processGame re-runs OCR rather than cache-hits.
     await _deleteGameCacheFiles(batchState.folderHandle, gameId);
 
-    // Reset only this game's row state: thaw the badge freeze and clear the
-    // prior pass's per-method / tier / picked badges so the row shows fresh
-    // OCR progress (mirrors startBatchOcr's per-game reset + the re-run thaw).
-    delete _completedRowGameIds[gameId];
-    game.methodStatus = null;
-    game.tier = null;
-    game.triageDetails = null;
-    game.reconstructPicked = null;
-    game.cachedLayout = null;
-    game.ocrProgress = null;
-    game.status = GAME_STATUS.QUEUED;
+    _resetGameForReOcr(game, gameId);
 
     if (typeof log === 'function') {
       log('[Batch] Re-OCR ' + gameId + (sig ? ' at ' + sig : '') + ' (this game only)');
@@ -963,6 +1132,81 @@ var BatchGameList = (function() {
     var one = new Map();
     one.set(gameId, game);
     queue.enqueueGames(one);
+    renderGameList();
+  }
+
+  /**
+   * Re-OCR EVERY game whose cached layout differs from the active profile.
+   *
+   * Why this exists: a whole section can be OCR'd under the wrong profile in
+   * one go (Mississauga is 3col/20row/60-move; under the 2col default, column 3
+   * — moves 41-60 — is never read and the sheets ceiling at 40 moves). The cache
+   * is deliberately NOT auto-invalidated, because in a MIXED round that would
+   * clobber correct work the moment the profile is switched for the other games.
+   * That safety argument holds; the cost was that fixing a whole mis-profiled
+   * section meant clicking one ↻ badge per game.
+   *
+   * So this stays a deliberate, user-initiated action: it names the count and
+   * both layouts, asks first, and skips VERIFIED/EXPORTED work exactly as the
+   * per-game badge does. It is the same operation, in bulk — not an automatic one.
+   */
+  async function reOcrMismatchedGames() {
+    var sig = (window.BatchOcrQueue && window.BatchOcrQueue.currentLayoutSignature)
+      ? window.BatchOcrQueue.currentLayoutSignature() : null;
+    var ids = _layoutMismatchedGameIds(sig);
+    if (!ids.length) return;
+
+    var queue = batchState.ocrQueue;
+    if (!queue) {
+      if (typeof log === 'function') {
+        log('[Batch] Re-OCR needs an active OCR queue — click "Start Batch Processing" first.');
+      }
+      return;
+    }
+
+    // Every mismatched game shares a cached layout in the common case (a whole
+    // section done under one wrong profile); list them all if it is mixed, so
+    // the prompt never understates what is about to be redone.
+    var was = {};
+    ids.forEach(function(gid) {
+      var g = batchState.games.get(gid);
+      if (g && g.cachedLayout) was[g.cachedLayout] = true;
+    });
+    var wasList = Object.keys(was).join(', ');
+    var verifiedSkipped = 0;
+    batchState.games.forEach(function(game) {
+      if (game && game.cachedLayout &&
+          (game.status === GAME_STATUS.VERIFIED || game.status === GAME_STATUS.EXPORTED)) {
+        verifiedSkipped++;
+      }
+    });
+
+    var msg = 'Re-OCR ' + ids.length + ' game(s) at ' + sig + '?\n\n' +
+              'They were OCR\'d as ' + wasList + '. Their cached OCR, grid and ' +
+              'logits files will be deleted and the sheets read again.\n' +
+              (verifiedSkipped ? '\n' + verifiedSkipped + ' verified/exported game(s) ' +
+                                 'will NOT be touched.\n' : '');
+    if (typeof confirm === 'function' && !confirm(msg)) return;
+
+    var batch = new Map();
+    for (var i = 0; i < ids.length; i++) {
+      var gid = ids[i];
+      var game = batchState.games.get(gid);
+      if (!game) continue;
+      await _deleteGameCacheFiles(batchState.folderHandle, gid);
+      _resetGameForReOcr(game, gid);
+      batch.set(gid, game);
+    }
+
+    if (typeof log === 'function') {
+      log('[Batch] Re-OCR ' + batch.size + ' game(s) at ' + sig +
+          ' (was ' + wasList + ')' +
+          (verifiedSkipped ? '; skipped ' + verifiedSkipped + ' verified/exported' : ''));
+    }
+
+    // A prior cancelled batch would make _processNext bail immediately.
+    queue.cancelled = false;
+    queue.enqueueGames(batch);
     renderGameList();
   }
 
@@ -1127,30 +1371,52 @@ var BatchGameList = (function() {
       }
       return true;
     }
+    // Promotion and persistence are SEPARATE questions here, for the same
+    // reason they were separated in onCurrentGameFunctionallyComplete (7af2af3):
+    // `status` is a one-way latch, so guarding the SAVE with it makes the save a
+    // one-shot. Leaving a game VERIFIED, correcting a move, and switching away
+    // hit exactly that — the promotion was already done, so this whole block was
+    // skipped and the correction never reached disk. The user saw a verified
+    // game and a green row; the .pgn on disk was the pre-edit one.
+    //
+    // Promote once; save whenever the confirmed move list actually changed.
+    var _done = (game.status === GAME_STATUS.VERIFIED ||
+                 game.status === GAME_STATUS.EXPORTED);
     if (state.stuckPly === null && !state.stuckInfo &&
         !state.pendingNoiseReview &&
         (!game.hasTrailingNoise || game.noiseResolved) &&
         state.sans && state.sans.length > 0 &&
-        _isAllMovesValidated(state.moves) &&
-        game.status !== GAME_STATUS.VERIFIED &&
-        game.status !== GAME_STATUS.EXPORTED) {
-      game.status = GAME_STATUS.VERIFIED;
+        _isAllMovesValidated(state.moves)) {
+      if (!_done) {
+        game.status = GAME_STATUS.VERIFIED;
+        // Same staleness clear + orchestrator abort as markVerified() — keep
+        // the sidebar from showing the pre-review G/B/D failure glyphs and
+        // Tier badge on a game that's now hand-verified, and stop in-flight
+        // searches so they can't re-seed methodStatus afterwards.
+        _clearStalenessAndAbort(game);
+        if (typeof log === 'function') {
+          log('✅ Auto-marked ' + gameId + ' as VERIFIED (' +
+              state.sans.length + ' moves validated, no stuck point)');
+        }
+      }
       // Stamp the verified ply count for the round report's TotalMoves,
       // same as markVerified() — auto-promoted games otherwise export 0.
+      // Re-stamped on a re-save so an edited game does not export the old count.
       game.finalPlyCount = state.sans.length;
-      // Same staleness clear + orchestrator abort as markVerified() — keep
-      // the sidebar from showing the pre-review G/B/D failure glyphs and
-      // Tier badge on a game that's now hand-verified, and stop in-flight
-      // searches so they can't re-seed methodStatus afterwards.
-      _clearStalenessAndAbort(game);
-      if (typeof log === 'function') {
-        log('✅ Auto-marked ' + gameId + ' as VERIFIED (' +
-            state.sans.length + ' moves validated, no stuck point)');
+
+      // Signature test, identical to onCurrentGameFunctionallyComplete's:
+      // _persistVerifiedGame stamps _persistedSans with what it wrote, so this
+      // fires only when the move list differs. Unreadable signature falls back
+      // to once-only rather than risking a write loop.
+      var _sig = null;
+      try { _sig = state.sans.join(' '); } catch (e) { /* conservative path */ }
+      var _changed = (_sig === null) ? !_done : (game._persistedSans !== _sig);
+      if (_changed) {
+        // gameId === currentGameId here (ownership guard above) and state still
+        // mirrors this game, so the .pgn is built from the just-snapshotted
+        // confirmed moves.
+        _persistVerifiedGame(gameId, _done ? 'Re-save' : 'Verify');
       }
-      // Persist on the game-switch auto-verify too. gameId === currentGameId
-      // here (ownership guard above), and state still mirrors this game, so the
-      // individual .pgn is built from the just-snapshotted confirmed moves.
-      _persistVerifiedGame(gameId, 'Verify');
     }
   }
 
@@ -1556,6 +1822,13 @@ var BatchGameList = (function() {
       }
     }
     batchState.currentGameId = gameId;
+    // Scope the CTC re-score to the game being REVIEWED. Distinct from the
+    // OCR tag because the OCR queue runs ahead: without this, a fix panel for
+    // this game could be scored against a later game's cells, which share the
+    // same "<moveNum>_<color>" storedLogits keys.
+    if (window.zugwise && window.zugwise.setReviewGameTag) {
+      window.zugwise.setReviewGameTag(gameId);
+    }
     var game = batchState.games.get(gameId);
     if (game && game.status !== GAME_STATUS.VERIFIED &&
         game.status !== GAME_STATUS.EXPORTED) {
@@ -2018,6 +2291,35 @@ var BatchGameList = (function() {
     return trimmed;
   }
 
+  /**
+   * Hand the post-truncation OCR to the orchestrator's own retained copy.
+   *
+   * batchState.ocrResults[gameId] is OUR cache; the orchestrator keeps a
+   * separate `_ocrByGame[gameId]` captured at enqueue() time, and that is
+   * what its no-override paths fall back to — escalation to Beam/Dijkstra
+   * and the speculative Beam feeder. Updating only our cache left those two
+   * paths running on the PRE-truncation cells, so a method that escalated
+   * (or got speculatively fed) after the user chopped the noise tail came
+   * back with a result whose result.moves still carried the deleted moves.
+   * Applying that picked solution on Review (_applyPickedToState does
+   * `state.moves = paired`) put the noise straight back in the move list —
+   * user-reported: "I delete from here onward, then fix some other move,
+   * and sometimes one of those stray moves comes back."
+   *
+   * updateOcr also drops the orchestrator's stale per-game override, whose
+   * ply positions refer to the pre-truncation sequence. Both callers
+   * (onTruncationComplete, syncAfterTruncation) abort + re-enqueue or
+   * requeue right afterwards, so dropping it costs nothing.
+   */
+  function _pushOcrToOrchestrator(gameId, cleaned) {
+    if (!gameId || !cleaned) return;
+    var rq = batchState.reconstructQueue;
+    if (!rq || typeof rq.updateOcr !== 'function') return;
+    try { rq.updateOcr(gameId, cleaned); } catch (e) {
+      console.warn('[Batch] updateOcr after truncation failed:', e);
+    }
+  }
+
   function _rebuildOcrResultFromState(gameId) {
     if (typeof state === 'undefined') return null;
     var orig = batchState.ocrResults[gameId] || {};
@@ -2063,6 +2365,7 @@ var BatchGameList = (function() {
 
     var cleaned = _rebuildOcrResultFromState(gameId);
     if (cleaned) batchState.ocrResults[gameId] = cleaned;
+    _pushOcrToOrchestrator(gameId, cleaned);
 
     game.hasTrailingNoise = false;
     game.noiseResolved = true;
@@ -2181,6 +2484,7 @@ var BatchGameList = (function() {
 
     var cleaned = _rebuildOcrResultFromState(gameId);
     if (cleaned) batchState.ocrResults[gameId] = cleaned;
+    _pushOcrToOrchestrator(gameId, cleaned);
 
     if (batchState.reconstructResults) {
       delete batchState.reconstructResults[gameId];
@@ -2300,11 +2604,19 @@ var BatchGameList = (function() {
       _requeuePendingForGame = null;
     }
 
-    if (game.status !== GAME_STATUS.VERIFIED &&
-        game.status !== GAME_STATUS.EXPORTED &&
-        (!game.hasTrailingNoise || game.noiseResolved) &&
+    // Promotion and persistence are SEPARATE questions, and conflating them
+    // lost user corrections. status is a one-way latch, so gating the save on
+    // "not yet VERIFIED" made the autosave a one-shot: cut trailing noise ->
+    // game completes -> VERIFIED -> saved; then fix a move and cut noise again
+    // -> completes again -> status is already VERIFIED -> NOTHING is written,
+    // and the corrected move exists only on screen. Reported on Crown R3 B3,
+    // where 39.W was corrected to Qxf5+ and the exported PGN kept Greedy's Rb1.
+    // Promote once; save whenever the confirmed move list actually changed.
+    var _alreadyDone = (game.status === GAME_STATUS.VERIFIED ||
+                        game.status === GAME_STATUS.EXPORTED);
+    if ((!game.hasTrailingNoise || game.noiseResolved) &&
         _isCurrentGameReadyToSave()) {
-      game.status = GAME_STATUS.VERIFIED;
+      if (!_alreadyDone) game.status = GAME_STATUS.VERIFIED;
       // Stamp the verified ply count for the round report's TotalMoves,
       // same as markVerified() — functionally-complete games (edit-only
       // finishes) otherwise export 0 (Premier R7 B7/B8/B10).
@@ -2313,7 +2625,7 @@ var BatchGameList = (function() {
           game.finalPlyCount = state.sans.length;
         }
       } catch (e) { /* stats only */ }
-      if (typeof log === 'function') {
+      if (!_alreadyDone && typeof log === 'function') {
         log('✅ Auto-marked ' + batchState.currentGameId + ' as VERIFIED (' +
             (state.sans ? state.sans.length : 0) + ' moves validated, no stuck point)');
       }
@@ -2321,7 +2633,23 @@ var BatchGameList = (function() {
       // (live edit/fix completion without an explicit Save) previously wrote
       // neither file — one of the gaps that left hand-finished games without
       // an individual PGN on disk.
-      _persistVerifiedGame(batchState.currentGameId, 'Complete');
+      //
+      // The signature test is what makes a RE-save possible without writing on
+      // every completion event: _persistVerifiedGame stamps _persistedSans with
+      // what it wrote, so this fires only when the move list differs. When the
+      // signature cannot be read, fall back to the old once-only behaviour
+      // rather than risk a write loop.
+      var _sig = null;
+      try {
+        if (typeof state !== 'undefined' && Array.isArray(state.sans)) {
+          _sig = state.sans.join(' ');
+        }
+      } catch (e) { /* fall through to the conservative path */ }
+      var _changed = (_sig === null) ? !_alreadyDone : (game._persistedSans !== _sig);
+      if (_changed) {
+        _persistVerifiedGame(batchState.currentGameId,
+                             _alreadyDone ? 'Re-save' : 'Complete');
+      }
     }
 
     renderGameList();
@@ -3456,6 +3784,38 @@ var BatchGameList = (function() {
     // 2col/3col rounds). Computed once per render.
     var curLayoutSig = (window.BatchOcrQueue && window.BatchOcrQueue.currentLayoutSignature)
       ? window.BatchOcrQueue.currentLayoutSignature() : null;
+    // One source of truth for "OCR'd under the wrong profile" — the row badges
+    // below read this same set, so a row can never show ↻ while the banner
+    // counts something different.
+    var mismatchedIds = _layoutMismatchedGameIds(curLayoutSig);
+    var mismatchedSet = {};
+    mismatchedIds.forEach(function(gid) { mismatchedSet[gid] = true; });
+
+    // Whole-section banner. A single stray game is already served by its own
+    // row badge; a banner there would just be noise. Two or more means a
+    // profile was wrong for a batch of work — the Mississauga case, where the
+    // 2col default leaves moves 41-60 unread on every 3col sheet.
+    if (mismatchedIds.length >= 2) {
+      var _wasSigs = {};
+      mismatchedIds.forEach(function(gid) {
+        var g = batchState.games.get(gid);
+        if (g && g.cachedLayout) _wasSigs[_shortLayout(g.cachedLayout)] = true;
+      });
+      var _wasLabel = Object.keys(_wasSigs).join(', ');
+      html += '<div class="px-3 py-2 bg-amber-950/50 border-b border-amber-800/60 ' +
+              'text-[11px] text-amber-200 flex items-center gap-2">' +
+              '<span class="flex-1">' + mismatchedIds.length + ' games were OCR\'d as ' +
+              _esc(_wasLabel) + ', but the active profile is ' +
+              _esc(_shortLayout(curLayoutSig)) + '. Their cached OCR is still being ' +
+              'used as-is.</span>' +
+              '<button data-reocr-all="1" ' +
+              'class="shrink-0 px-2 py-0.5 rounded bg-amber-800 hover:bg-amber-700 ' +
+              'text-amber-100 cursor-pointer" ' +
+              'title="' + _esc('Delete the cached OCR for those ' + mismatchedIds.length +
+                               ' games and read them again at ' + curLayoutSig +
+                               '. Verified/exported games are not touched.') + '">' +
+              'Re-OCR all ' + mismatchedIds.length + '</button></div>';
+    }
 
     // Game entries
     sortedGames.forEach(function(game) {
@@ -3587,12 +3947,12 @@ var BatchGameList = (function() {
       // game legitimately differs from a 3col active profile, and re-OCR would
       // discard its verification — don't nag (or risk) completed work. Also
       // suppressed mid-OCR / pre-OCR (nothing to compare yet).
-      var _reocrEligible = game.status !== GAME_STATUS.QUEUED &&
-                           game.status !== GAME_STATUS.OCR_RUNNING &&
-                           game.status !== GAME_STATUS.VERIFIED &&
-                           game.status !== GAME_STATUS.EXPORTED;
-      if (curLayoutSig && game.cachedLayout && game.cachedLayout !== curLayoutSig &&
-          _reocrEligible) {
+      // Eligibility AND the layout comparison both come from
+      // _layoutMismatchedGameIds (computed once above), which uses the same
+      // comparison as the cache-hit path — so the badge, the banner count and
+      // the log never disagree, and a pre-"@start" stamp is not flagged
+      // wholesale.
+      if (mismatchedSet[game.gameId]) {
         var reocrTitle = 'OCR\'d as ' + game.cachedLayout + '; active profile is ' +
           curLayoutSig + ' — click to re-OCR this game at ' + curLayoutSig +
           ' (other games untouched)';
@@ -3601,6 +3961,25 @@ var BatchGameList = (function() {
                 'title="' + _esc(reocrTitle) + '">↻ ' +
                 _esc(_shortLayout(game.cachedLayout)) + '→' +
                 _esc(_shortLayout(curLayoutSig)) + '</button>';
+      }
+      // Resumed from a saved PGN in this folder — distinguish "finished in an
+      // earlier session" from "verified just now", so a complete-looking row is
+      // never mysterious.
+      if (game._saveFailed) {
+        html += '<span class="text-[10px] px-1.5 py-0.5 rounded bg-red-900/70 ' +
+                'text-red-200" title="' +
+                _esc('The PGN could not be written: ' + game._saveFailed +
+                     '. This game is verified in this session only — nothing ' +
+                     'reached the disk. Re-verify or use Save PGN to retry.') +
+                '">unsaved</span>';
+      }
+      if (game.savedPgn) {
+        html += '<span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-900/60 ' +
+                'text-emerald-200" title="' +
+                _esc('Restored from ' + game.savedPgn.fileName + ' (' +
+                     game.savedPgn.plyCount + ' ply). Saved in an earlier session; ' +
+                     'the algorithms will not re-run. Use Reset to redo it.') +
+                '">saved</span>';
       }
       var lenLabel = _gameLengthIndicator(game);
       if (lenLabel) {
@@ -3707,6 +4086,14 @@ var BatchGameList = (function() {
         e.stopPropagation();
         var gid = btn.getAttribute('data-reocr-layout');
         if (gid) reOcrGameAtCurrentLayout(gid);
+      });
+    });
+
+    // Whole-section re-OCR (same operation as the per-game badge, in bulk).
+    container.querySelectorAll('button[data-reocr-all]').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        reOcrMismatchedGames();
       });
     });
 
@@ -4231,6 +4618,16 @@ var BatchGameList = (function() {
   function resetCurrentGame() {
     if (!batchState.active || !batchState.currentGameId) return false;
     var gameId = batchState.currentGameId;
+    // Reset means "redo this game", so it must also drop the resume marker —
+    // otherwise the row snaps straight back to VERIFIED and reconstruction is
+    // skipped again, and the button looks broken.
+    var _rg = batchState.games.get(gameId);
+    if (_rg && _rg.savedPgn) {
+      delete _rg.savedPgn;
+      if (typeof log === 'function') {
+        log('[Batch] ' + gameId + ': reset — no longer treated as already saved.');
+      }
+    }
     var ocrResult = batchState.ocrResults[gameId];
     if (!ocrResult) {
       if (typeof log === 'function') {
@@ -4404,7 +4801,10 @@ var BatchGameList = (function() {
     renderSectionSelector: renderSectionSelector,
     requeueAfterFix: requeueAfterFix,
     rerunCurrentGame: rerunCurrentGame,
-    resetCurrentGame: resetCurrentGame
+    resetCurrentGame: resetCurrentGame,
+    // Wrong-profile recovery: the banner's action, and the set it counts.
+    reOcrMismatchedGames: reOcrMismatchedGames,
+    layoutMismatchedGameIds: _layoutMismatchedGameIds
   };
 })();
 

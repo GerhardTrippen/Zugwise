@@ -1894,6 +1894,11 @@ async function processScoresheet(file, gridConfig, corners, method, options) {
         var useMethod = method || 'slide';
 
         var gridResult, cells, gridOverlayUrl = null;
+        // Slide-path "this template does not match this page" signal. Must be
+        // returned to the caller: batch mode has no other channel for it, and
+        // burying it in the verbose grid log is how a whole round gets OCR'd
+        // against the wrong profile without anyone noticing.
+        var templateWarning = null;
 
         if (useMethod === 'anchor' || useMethod === 'manual-anchor') {
             // === ANCHOR-BASED DETECTION ===
@@ -1993,11 +1998,28 @@ async function processScoresheet(file, gridConfig, corners, method, options) {
             }
 
             if (typeof window !== 'undefined' && window.GRID_VERBOSE_LOG) console.log('[OpenCV] Extracting grid (slide)...');
+            // startingMove MUST be forwarded: the slide pipeline scores each
+            // detected row number against the number it expects there, so a
+            // wrong first number makes every row mismatch and slides the grid.
+            // Without it the back page falls back to frontCols*rowCount+1,
+            // which is wrong on any profile whose pages differ in row count
+            // (Mississauga CC: 2x20 front then 2x25 back → 51, not 41).
             var slideConfigBase = {
                 format: gridConfig ? gridConfig.format : '2col',
                 rowCount: gridConfig ? gridConfig.rowCount : 20,
                 maxColWidthPct: 7,
-                pageType: (gridConfig && gridConfig.pageType) || 'front'
+                pageType: (gridConfig && gridConfig.pageType) || 'front',
+                // Forward as-is (not defaulted to 1): a back page with no
+                // startingMove must still reach the legacy frontRows fallback.
+                // Prefer printedStartingMove — grid detection matches what the
+                // paper shows, which diverges from the logical move number on
+                // any page that reuses an earlier page's form.
+                startingMove: gridConfig
+                    ? (gridConfig.printedStartingMove != null
+                        ? gridConfig.printedStartingMove
+                        : gridConfig.startingMove)
+                    : undefined,
+                frontRows: gridConfig ? gridConfig.frontRows : undefined
             };
             // Slide-pipeline per-step trace. Gated behind window.SLIDE_VERBOSE_LOG
             // (default off) — every page of grid detection emits ~80 of these
@@ -2062,6 +2084,7 @@ async function processScoresheet(file, gridConfig, corners, method, options) {
             }
 
             console.log('[Slide] Success: ' + slideResult.cells.length + ' cells');
+            templateWarning = slideResult.templateWarning || null;
 
             // Build gridResult-compatible structure
             gridResult = {
@@ -2198,6 +2221,7 @@ async function processScoresheet(file, gridConfig, corners, method, options) {
             gridDetected: true,
             detectionResult: gridResult.detectionResult,
             warnings: moveNumWarnings,
+            templateWarning: templateWarning,
             gridOverlayUrl: gridOverlayUrl,
             rowsPerColumn: gridResult.config ? gridResult.config.rowCount : null
         };

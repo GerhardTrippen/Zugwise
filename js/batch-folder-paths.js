@@ -12,10 +12,25 @@
  *       PGN/    .pgn, _incomplete.pgn, error .csv
  *       OCR/    .txt, .p1.txt, .p2.txt
  *       grid/   .grid.json, .p1.grid.json, .p2.grid.json
+ *       logits/ .logits.bin — raw per-cell CTC logits (see below)
  *
  * Routing is by filename extension so the ~15 existing call sites need no
  * per-site changes — they keep passing the base scan-folder handle, and the
  * read/write helpers resolve the correct subfolder internally.
+ *
+ * The logits sidecar carries what the decoded text throws away: the model's
+ * full per-timestep distribution. It lets the scorer ask "how likely is this
+ * cell to read bxc4?" by CTC alignment (backend/ctc_align.py) instead of
+ * comparing strings, which is the only evidence available where char_sim is
+ * uninformative. Layout is deliberately trivial so both the browser and numpy
+ * can read it without a library:
+ *
+ *     uint32 LE nCells, uint32 LE seqLen, uint32 LE vocab, then
+ *     nCells * seqLen * vocab float16 LE log-probabilities,
+ *     cells in the same order as the .txt and .grid.json sidecars.
+ *
+ * A missing sidecar simply means the signal is unavailable and contributes
+ * nothing — the same graceful degradation as a missing .grid.json.
  *
  * Backward compatibility: tournaments processed before this layout existed
  * have their files flat in the scan-folder root. Reads therefore try the
@@ -31,9 +46,10 @@ var BatchPaths = (function() {
    * Map a filename to its Zugwise subfolder by extension.
    * Returns null for filenames with no mapped kind (write to base as-is).
    * @param {string} filename
-   * @returns {string|null} - 'PGN' | 'OCR' | 'grid' | null
+   * @returns {string|null} - 'PGN' | 'OCR' | 'grid' | 'logits' | null
    */
   function subdirFor(filename) {
+    if (/\.logits\.(bin|npz)$/i.test(filename)) return 'logits';
     if (/\.grid\.json$/i.test(filename)) return 'grid';
     if (/\.txt$/i.test(filename)) return 'OCR';
     if (/\.(pgn|csv)$/i.test(filename)) return 'PGN';
@@ -103,12 +119,57 @@ var BatchPaths = (function() {
     return await _readFrom(baseHandle, filename);
   }
 
+  /**
+   * Write binary content (the .logits.bin sidecar) into its Zugwise subfolder.
+   * Separate from writeText only because the read side must not decode as
+   * UTF-8; the write path itself is identical.
+   * @param {FileSystemDirectoryHandle} baseHandle
+   * @param {string} filename
+   * @param {ArrayBuffer|Uint8Array|Blob} content
+   * @returns {Promise<FileSystemDirectoryHandle>} the directory written to
+   */
+  async function writeBinary(baseHandle, filename, content) {
+    var dir = (await resolveDir(baseHandle, filename, true)) || baseHandle;
+    var fh = await dir.getFileHandle(filename, { create: true });
+    var w = await fh.createWritable();
+    await w.write(content);
+    await w.close();
+    return dir;
+  }
+
+  async function _readBinFrom(dirHandle, filename) {
+    try {
+      var fh = await dirHandle.getFileHandle(filename);
+      var file = await fh.getFile();
+      return await file.arrayBuffer();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Read a binary file, preferring its Zugwise subfolder and falling back to
+   * the flat scan-folder root, exactly as readText does.
+   * @returns {Promise<ArrayBuffer|null>} null when absent — for the logits
+   *          sidecar that simply means the CTC signal is unavailable.
+   */
+  async function readBinary(baseHandle, filename) {
+    var dir = await resolveDir(baseHandle, filename, false);
+    if (dir && dir !== baseHandle) {
+      var hit = await _readBinFrom(dir, filename);
+      if (hit !== null) return hit;
+    }
+    return await _readBinFrom(baseHandle, filename);
+  }
+
   return {
     ROOT_DIR: ROOT_DIR,
     subdirFor: subdirFor,
     resolveDir: resolveDir,
     writeText: writeText,
-    readText: readText
+    readText: readText,
+    writeBinary: writeBinary,
+    readBinary: readBinary
   };
 })();
 

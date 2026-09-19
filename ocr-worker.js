@@ -84,6 +84,10 @@ onmessage = async function(e) {
                 result = constrainedReOCR(data.ply, data.legalMoves, data.ocrMoves);
                 break;
 
+            case 'export-logits':
+                result = exportLogits(data && data.keys, data && data.pass);
+                break;
+
             case 'constrained-reocr-dual':
                 result = constrainedReOCRDual(data.ply, data.legalMoves);
                 break;
@@ -106,6 +110,48 @@ onmessage = async function(e) {
 // =============================================================================
 // OCR WITH BEAM DECODER  (lifted verbatim from zugwise-worker.js)
 // =============================================================================
+
+// -----------------------------------------------------------------------------
+// LOGITS EXPORT (for the .logits.bin sidecar)
+// -----------------------------------------------------------------------------
+
+/**
+ * Return the stored logits for a REQUESTED set of cell keys.
+ *
+ * Deliberately key-driven rather than "give me everything": storedLogits is
+ * never cleared (constrained re-OCR reads it back at any time), so across a
+ * batch run it accumulates every cell of every game processed by this worker.
+ * Dumping all of it per sheet would grow without bound. Asking for one sheet's
+ * keys bounds the response to that sheet.
+ *
+ * The Float32Arrays are COPIED by structured clone, not transferred — the
+ * worker must keep its own copy for constrained re-OCR, and transferring would
+ * neuter it.
+ *
+ * Keys this worker does not hold are simply absent from the result; with the
+ * pool, each key lives in exactly one worker and the caller merges.
+ *
+ * @param {string[]} keys - cell keys ("<moveNum>_<color>", optionally
+ *        "..._sheet<N>" in dual-sheet mode)
+ * @returns {{seqLen: number|null, vocabSize: number|null, cells: Object}}
+ */
+function exportLogits(keys, pass) {
+    const cells = {};
+    let seqLen = null, vocabSize = null, stale = 0;
+    (keys || []).forEach(function(k) {
+        const entry = storedLogits.get(k);
+        if (!entry) return;
+        // A key that has since been rewritten by a LATER pass (the next page,
+        // or the next game in a batch) is not this pass's cell. Skipping it
+        // makes the caller's cell count come up short, which refuses the whole
+        // sidecar — the loud, correct outcome. Returning it would attach one
+        // game's evidence to another game's moves, silently.
+        if (pass && entry.pass && entry.pass !== pass) { stale++; return; }
+        cells[k] = entry.data;
+        if (seqLen === null) { seqLen = entry.seqLen; vocabSize = entry.vocabSize; }
+    });
+    return { seqLen: seqLen, vocabSize: vocabSize, cells: cells, stale: stale };
+}
 
 // Storage for per-ply logits (populated during OCR, keyed by "moveNum_color")
 const storedLogits = new Map();
@@ -194,12 +240,22 @@ async function runOCR(imageData, width, height, cellBelow = null, moveInfo = nul
     // Get color from moveInfo for grammar-aware decoding
     const color = moveInfo?.color || null;
 
-    // Store logits for potential constrained re-OCR later
-    storedLogits.set(moveLabel, { data: logProbs, seqLen, vocabSize });
+    // Store logits for potential constrained re-OCR later.
+    //
+    // `pass` stamps WHICH OCR pass produced this cell. The key is only
+    // "<moveNum>_<color>", which is NOT unique across a batch run: page 2 of a
+    // sheet restarts move numbering, and every game has a 1_w. Entries are
+    // never evicted (constrained re-OCR reads them back at any time), so a key
+    // always holds the MOST RECENT writer. Order alone keeps the sidecar
+    // export honest today, and the stamp is what stops that from being a
+    // silent correctness dependency — see exportLogits.
+    const _pass = (moveInfo && moveInfo.pass) || null;
+    const _game = (moveInfo && moveInfo.game) || null;
+    storedLogits.set(moveLabel, { data: logProbs, seqLen, vocabSize, pass: _pass, game: _game });
     // If sheet ID provided (dual-sheet mode), also store under sheet-specific key
     if (moveInfo?.sheet) {
         const sheetKey = `${moveLabel}_sheet${moveInfo.sheet}`;
-        storedLogits.set(sheetKey, { data: logProbs, seqLen, vocabSize });
+        storedLogits.set(sheetKey, { data: logProbs, seqLen, vocabSize, pass: _pass, game: _game });
     }
 
     const _tAfterSoftmax = OCR_TIMING ? performance.now() : 0;

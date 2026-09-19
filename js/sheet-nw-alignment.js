@@ -243,6 +243,93 @@
   }
 
   // ---------------------------------------------------------------------------
+  // LAYER 1b — isolated dropout (a short shifted island bracketed by agreement)
+  // ---------------------------------------------------------------------------
+  // findOverlapDrop tests the MEAN of an 8-ply window against 0.30. That is the
+  // right instrument for "the sheets came apart and stayed apart", but it is
+  // structurally blind to the most common real-world sheet error: a player
+  // omits one move, notices a move or two later, and re-writes a cell to
+  // resync. That leaves a SHORT island of zero overlap with near-perfect
+  // agreement on both sides — and two zeros among six ~2.0 values average to
+  // ~1.2, nowhere near 0.30. Worse, the omission and the compensating
+  // duplication cancel, so the two sheets come out the SAME LENGTH and every
+  // cell-count parity check is blind as well.
+  //
+  // Canonical case — CrownRegrid R3 B3 (Karami Behdani vs Hemphrey). White's
+  // sheet omits 32.W Rce1, writes Kf8/Bb1 into the 32.W/32.B cells, writes Bb1
+  // AGAIN at 33.W, and is back in sync at 33.B. Measured pool overlap:
+  //
+  //   ply 60 31.W 1.005 | 61 31.B 1.239 | 62 32.W 0.000 | 63 32.B 0.000
+  //     | 64 33.W 1.937 | 65 33.B 1.995 | 66 34.W 1.970 | 67 34.B 1.999
+  //
+  // Both sheets: 80 cells. Layer 1 reported ply 72 (the genuinely noisy tail),
+  // so Layers 2 and 3 were never pointed at ply 62 — and Layer 3 nails it when
+  // it is, returning gap_s1@62 (the omission) plus gap_s2@64 (the duplicate).
+  // The whole cascade worked; only the thing that aims it was wrong.
+  //
+  // Shrinking the window is NOT the fix. Measured on this same data:
+  //   windowSize 8 -> ply 72   windowSize 6 -> ply 74
+  //   windowSize 4 -> ply 74   windowSize 2 -> ply 22  (false positive)
+  // The discriminating signal isn't the mean, it's the SHAPE: a short run of
+  // near-zero overlap bracketed by sustained agreement on BOTH sides.
+  //
+  // The two bracket requirements are what keep this specific:
+  //   - the bracket on the RIGHT separates an island from a noisy tail, which
+  //     never recovers (plies 73+ in this same game).
+  //   - MIN_RUN separates it from a single mutually-misread cell (ply 68 here:
+  //     35.W "h5" vs "Qb5", one zero between two 2.0s — an OCR miss on one
+  //     cell, not a structural shift).
+  // ---------------------------------------------------------------------------
+
+  // "these two cells are not reading the same move"
+  var DROPOUT_LOW = 0.25;
+  // "these two cells clearly ARE reading the same move" — bracket evidence
+  var DROPOUT_HIGH = 0.90;
+  // 1 zero is a misread; a shift-and-resync island is always >= 2 plies
+  var DROPOUT_MIN_RUN = 2;
+  // longer than this is a collapse (or a real multi-move divergence), which
+  // the 8-ply mean in Layer 1 catches on its own
+  var DROPOUT_MAX_RUN = 6;
+  // plies of sustained agreement required on EACH side of the run
+  var DROPOUT_BRACKET = 4;
+
+  function findIsolatedDropout(s1, s2, startFrom, diag) {
+    startFrom = startFrom || 0;
+    var limit = Math.min(s1.length, s2.length);
+    if (limit < DROPOUT_BRACKET * 2 + DROPOUT_MIN_RUN) return null;
+    var ov = [];
+    for (var p = 0; p < limit; p++) {
+      ov[p] = (s1[p] && s2[p]) ? poolOverlap(_fullAlts(s1[p]), _fullAlts(s2[p])).score : 0;
+    }
+    // every ply in [from, to) reads as the same move on both sheets
+    function bracketOk(from, to) {
+      if (from < 0 || to > limit || to - from < DROPOUT_BRACKET) return false;
+      for (var i = from; i < to; i++) if (ov[i] < DROPOUT_HIGH) return false;
+      return true;
+    }
+    for (var start = Math.max(startFrom, DROPOUT_BRACKET); start < limit; start++) {
+      if (ov[start] >= DROPOUT_LOW) continue;
+      var end = start;
+      while (end < limit && ov[end] < DROPOUT_LOW) end++;
+      var runLen = end - start;
+      if (runLen >= DROPOUT_MIN_RUN && runLen <= DROPOUT_MAX_RUN &&
+          bracketOk(start - DROPOUT_BRACKET, start) &&
+          bracketOk(end, end + DROPOUT_BRACKET)) {
+        if (diag) {
+          diag.isolatedDropout = {
+            start: start, end: end, runLen: runLen,
+            preMin: Math.min.apply(null, ov.slice(start - DROPOUT_BRACKET, start)),
+            postMin: Math.min.apply(null, ov.slice(end, end + DROPOUT_BRACKET))
+          };
+        }
+        return start;
+      }
+      start = end;  // nothing more to learn inside a run we already rejected
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
   // LAYER 2 — consecutive-row duplicate detection on a single sheet
   // ---------------------------------------------------------------------------
   // A real player CANNOT make the same move twice in a row (the position
@@ -782,6 +869,56 @@
           suppressReason = 'score_not_improved';
         }
       }
+      // LEGALITY VETO on both suppression reasons.
+      //
+      // Both tests above are structural: `reverse_proposal` asks "is the
+      // follow-up an undo?" (same sheet, within 3 plies, same size) and
+      // `score_not_improved` asks "did the raw NW alignment score go up?".
+      // Neither can distinguish two genuinely different situations:
+      //
+      //   (a) THRASH — insert here, delete it straight back. What the guards
+      //       exist for, and legality-neutral: shuffling cells around does not
+      //       make the game more playable.
+      //   (b) A GENUINE TWO-PART REPAIR — the player omitted a move and
+      //       re-synced a ply or two later by re-writing a cell, so the sheet
+      //       needs an insert at the omission AND a delete at the duplicate.
+      //       Those two edits are necessarily on the same sheet, 1 ply each,
+      //       and a couple of plies apart — identical in SHAPE to thrash.
+      //
+      // Chess tells them apart, exactly. A real repair makes illegal moves go
+      // away; thrash does not. So a strict drop in the illegal-move count
+      // vetoes suppression under either reason.
+      //
+      // Canonical case — CrownRegrid R3 B3, White's sheet omits 32.W Rce1 and
+      // duplicates Bb1 at 33.W. insert 1p @ply 62 measures:
+      //     preIllegals 2 -> postIllegals 0,  rawScoreDelta 0.00
+      //     followUp "delete @ply 65"  (that is the DUPLICATE, not an undo)
+      // so it was suppressed first as reverse_proposal and then, once that was
+      // carved out, as score_not_improved on rawScoreDelta 0 < 0.1. Enumerate
+      // returned 0 issues and nothing in the app ever knew a cell was missing.
+      // The raw NW delta is ~0 here because the bare '???' placeholder costs a
+      // gap penalty that cancels the alignment it buys — structural scoring
+      // simply has no opinion, while legality has a decisive one.
+      //
+      // Deliberately conservative: preIllegals/postIllegals are non-null ONLY
+      // when the legality walk ran from a reconstruction-VERIFIED FEN. With no
+      // verified position they are null, and both guards behave exactly as
+      // they did before. Measured evidence or nothing — never a guess.
+      if (suppressReason &&
+          typeof simResult.preIllegals === 'number' &&
+          typeof simResult.postIllegals === 'number' &&
+          simResult.postIllegals < simResult.preIllegals) {
+        if (typeof console !== 'undefined' && console.log) {
+          var vetoPly = (sug.action === 'insert') ? sug.afterPly + 1 : sug.plies[0];
+          console.log('🧭 NW suppression VETOED by legality (' + suppressReason + '): ' +
+            sug.action + ' ' + sug.nPlies + 'p ' + (sug.fromSheet || sug.onSheet) +
+            ' @ply ' + vetoPly + ' — illegals ' + simResult.preIllegals + ' -> ' +
+            simResult.postIllegals + (simResult.followUp ? ', followUp=' + simResult.followUp : '') +
+            '. A legality-improving edit is a real repair, not thrash.');
+        }
+        simResult.suppressionVetoedByLegality = suppressReason;
+        suppressReason = null;
+      }
       if (suppressReason) {
         simResult.suppressReason = suppressReason;
         diag.simulation = simResult;
@@ -1009,6 +1146,19 @@
 
     // LAYER 1 — find first window where overlap drops below threshold.
     var dropPly = findOverlapDrop(sheet1Cells, sheet2Cells, searchFrom);
+    diag.dropPlyFromWindow = dropPly;
+    diag.dropSource = 'overlap-window';
+
+    // LAYER 1b — a short shifted island the 8-ply mean averages away. Prefer
+    // it when it sits EARLIER than the window drop (or when there is no window
+    // drop at all): the island is a localized structural fault, whereas a later
+    // window drop is usually the noisy tail. Aiming Layers 2/3 at the island is
+    // the whole point — they resolve it correctly once pointed there.
+    var isoDrop = findIsolatedDropout(sheet1Cells, sheet2Cells, searchFrom, diag);
+    if (isoDrop !== null && (dropPly === null || isoDrop < dropPly)) {
+      dropPly = isoDrop;
+      diag.dropSource = 'isolated-dropout';
+    }
     diag.dropPly = dropPly;
 
     if (dropPly === null) {
@@ -2389,18 +2539,56 @@
           continue;
         }
         // Deferred (scoring not yet possible because reconstruction
-        // hasn't confirmed the position before the gap) — advance past
-        // and keep looking. The deferred gap itself is invisible to the
-        // user until verifiable, but downstream gaps in already-verified
-        // territory can still surface.
+        // hasn't confirmed the position before the gap). DETECTION is not
+        // deferred — only SCORING is. The structural gap is already known
+        // here; what's missing are the legality / piece-presence numbers
+        // that need a verified pre-edge FEN.
+        //
+        // Emit it anyway, flagged. detectNextAlignmentIssue still returns
+        // null for these (so no caller can accidentally surface a banner
+        // with fake numbers), but the ENUMERATION must include them or the
+        // rest of the app believes the sheets are structurally clean.
+        //
+        // Why this matters (user report, Aug 2026): a move omitted on one
+        // sheet leaves the MERGED ply grid full length — mergeSheets takes
+        // the union of (num,color) keys, so the other sheet supplies the
+        // ply. Greedy only ever sees that merged list, so it cannot express
+        // an insert; it reconciles the whole shifted island as a run of
+        // individual OCR fixes. Meanwhile scoring stayed deferred precisely
+        // BECAUSE the plies before the gap weren't verified yet — which is
+        // the state the user is in during Greedy review. Net effect: NW was
+        // silent for exactly as long as it was needed, and only woke up
+        // after the user had hand-inserted the cell. Counting the deferred
+        // gap here is what breaks that one-way wait.
+        //
+        // Consumers must filter on `scoringDeferred` before surfacing:
+        // sheet-alignment.js _runNWAlignmentCheck picks the banner from the
+        // surfaceable subset and only logs the deferred ones.
         if (diag && diag.deferred && diag.deferred.sug) {
           var defSug = diag.deferred.sug;
+          defSug.scoringDeferred = true;
+          var defKey = _sugKey(defSug);
+          if (!seen[defKey]) { seen[defKey] = true; out.push(defSug); }
           var defPly = (defSug.action === 'insert')
             ? (defSug.afterPly + (defSug.nPlies || 1))
             : (defSug.plies[defSug.plies.length - 1]);
           var nextSfDef = Math.max(sf + 2, defPly + 2);
           if (nextSfDef <= sf) break;
           sf = nextSfDef;
+          continue;
+        }
+        // LAYER 1b dead end — the isolated-dropout scan aimed the cascade at a
+        // short island, but Layers 2/3 made nothing of it (no suggestion, no
+        // suppression, no deferral). Without this branch we'd `break` here and
+        // abandon the rest of the game — losing REAL issues further along that
+        // the old window-drop would have found, because Layer 1b moved the
+        // aim earlier. Observed on Crown_R9_B4: the island at 13.W yields
+        // nothing, and the genuine del2p@25.W / del3p@26.W pair downstream was
+        // silently dropped. Advance past the island and keep looking.
+        if (diag && diag.dropSource === 'isolated-dropout' && diag.isolatedDropout) {
+          var nextSfIso = Math.max(sf + 2, diag.isolatedDropout.end + 2);
+          if (nextSfIso <= sf) break;
+          sf = nextSfIso;
           continue;
         }
         break;
@@ -2424,6 +2612,7 @@
     detectNextAlignmentIssue: detectNextAlignmentIssue,
     enumerateAlignmentIssues: enumerateAlignmentIssues,
     findOverlapDrop: findOverlapDrop,
+    findIsolatedDropout: findIsolatedDropout,
     findDuplicateNear: findDuplicateNear,
     localNeedlemanWunsch: localNeedlemanWunsch,
     extractFirstSuggestion: extractFirstSuggestion,

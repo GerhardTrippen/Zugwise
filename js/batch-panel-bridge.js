@@ -41,6 +41,38 @@ var BatchPanelBridge = (function() {
   var _completedGameIds = {};
   var METHODS = ['greedy', 'beam', 'dijkstra'];
 
+  // Per-game step history, so a search that runs while you are looking at a
+  // DIFFERENT game is not lost.
+  //
+  // onStep used to drop every step whose gameId wasn't bound. Nothing else
+  // keeps them: the orchestrator retains only the final result, so returning
+  // to a background-run game replayed the completion summary alone — the
+  // yellow [partial] list with no green [fix] lines and no [Ns] timings. The
+  // work happened; the record of it was discarded. (Reported by the user:
+  // "If I stay in the game while Greedy runs, I get much more info and much
+  // better output.")
+  //
+  // We buffer the step OBJECTS, not rendered HTML, and replay them through the
+  // same handleSearchStep on rebind — one renderer, so a background game's log
+  // cannot drift from a foreground one's.
+  var _stepLog = {};                 // gameId -> { method -> [step, ...] }
+  var STEP_LOG_CAP = 600;            // per game per method; ~10x a long run
+
+  function _recordStep(gameId, method, step) {
+    if (!gameId || !step || step.done) return;   // 'done' is replayed from the result
+    var byMethod = _stepLog[gameId] || (_stepLog[gameId] = {});
+    var arr = byMethod[method] || (byMethod[method] = []);
+    // Keep the TAIL on overflow: the end of a run is where the stop reason and
+    // the last fixes are, and that is what the user came back to read.
+    if (arr.length >= STEP_LOG_CAP) arr.shift();
+    arr.push(step);
+  }
+
+  function clearStepLog(gameId) {
+    if (gameId) delete _stepLog[gameId];
+    else _stepLog = {};
+  }
+
   // Show/hide a method panel's Cancel (✕) button. In single mode beam.js's
   // handleSearchStatusChange toggles this on the 'running' status; the batch
   // bridge renders progress via updateSearchPanel (which doesn't touch the
@@ -115,6 +147,27 @@ var BatchPanelBridge = (function() {
       return;
     }
 
+    // Replay this game's step history BEFORE the per-method final state, so
+    // the panel reads in the same order a foreground run produced it: the
+    // running commentary ([fix] … score=N [Ns], [ambiguity] …), then the
+    // completion summary. Without this a game reconstructed in the background
+    // came back with the summary only.
+    var _hist = _stepLog[gameId];
+    if (_hist) {
+      METHODS.forEach(function(m) {
+        var steps = _hist[m];
+        if (!steps || !steps.length) return;
+        if (steps.length >= STEP_LOG_CAP && typeof appendPanelLogHtml === 'function') {
+          appendPanelLogHtml(m, '<span class="text-gray-500">… earlier steps trimmed …</span>');
+        }
+        for (var i = 0; i < steps.length; i++) {
+          if (typeof handleSearchStep === 'function') {
+            try { handleSearchStep(m, steps[i]); } catch (e) {}
+          }
+        }
+      });
+    }
+
     METHODS.forEach(function(m) {
       var status = (agg.methodStatus && agg.methodStatus[m]) || 'idle';
       var result = agg.results && agg.results[m];
@@ -159,6 +212,10 @@ var BatchPanelBridge = (function() {
   // batch-game-list.js. We filter by the bound game so background progress
   // on other games doesn't leak into the visible panels.
   function onStep(gameId, method, step) {
+    // Record FIRST, and for every game — including the one on screen, so that
+    // re-binding to it later shows the same history rather than a blank panel.
+    // A completed game is frozen (see below) and gets no further history.
+    if (!_completedGameIds[gameId]) _recordStep(gameId, method, step);
     if (gameId !== _boundGameId) return;
     // Once a game is marked complete, freeze the panel headers at "✓ Game
     // complete". The orchestrator's queues check their cancel flag at the
@@ -192,6 +249,10 @@ var BatchPanelBridge = (function() {
   function clearComplete(gameId) {
     if (!gameId) return;
     delete _completedGameIds[gameId];
+    // A requeue re-runs the algorithms from the override point, so the old
+    // commentary describes a run that no longer exists. Drop it rather than
+    // replaying a stale history above the new one.
+    clearStepLog(gameId);
   }
 
   // Called from the orchestrator's onGameComplete forwarder. Fires once per
@@ -254,7 +315,8 @@ var BatchPanelBridge = (function() {
     onGameComplete: onGameComplete,
     onProgress: onProgress,
     markComplete: markComplete,
-    clearComplete: clearComplete
+    clearComplete: clearComplete,
+    clearStepLog: clearStepLog
   };
 })();
 

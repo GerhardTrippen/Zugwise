@@ -133,9 +133,18 @@ var BatchOcrQueue = (function() {
   // when it no longer matches the active profile.
 
   /**
-   * Signature of the active sheet profile's page layout — "<format><rows>"
-   * per page, e.g. "2col20|2col20" or "3col20|3col20". Null when profiles are
-   * unavailable (invalidation is then skipped — fail open, keep the cache).
+   * Signature of the active sheet profile's page layout —
+   * "<format><rows>@<printed start>" per page, e.g. "2col20@1|2col25@41".
+   * Null when profiles are unavailable (invalidation is then skipped — fail
+   * open, keep the cache).
+   *
+   * The "@<start>" part is NOT cosmetic. Grid detection scores each detected
+   * row number against the number it expects printed there, so two profiles
+   * with the same format and row count but different starting moves cut
+   * DIFFERENT grids — "2col20|2col20" covered both a page 2 that continues at
+   * 41 and a page 2 that repeats page 1 at move 1, which is precisely the
+   * distinction that mis-cut Crown Round 3. Without it the cache serves a
+   * grid built for the wrong page numbering and no mismatch badge appears.
    */
   function currentLayoutSignature() {
     try {
@@ -143,11 +152,30 @@ var BatchOcrQueue = (function() {
       var profile = window.SheetProfiles.getActiveProfile();
       if (!profile || !profile.pages || !profile.pages.length) return null;
       return profile.pages.map(function(p) {
-        return (p.format || '2col') + String(p.rowCount || 0);
+        return (p.format || '2col') + String(p.rowCount || 0)
+             + '@' + String(p.startingMove || 1);
       }).join('|');
     } catch (e) {
       return null;
     }
+  }
+
+  /**
+   * Compare a cached layout stamp against the active one.
+   *
+   * Stamps written before the "@<start>" component carry no "@", and every
+   * cached tournament on disk is of that generation (MCC/Crown, MCC/Premier).
+   * Comparing those strictly would flag every cached game as mismatched and
+   * bury the real signal in false badges, so a legacy stamp is compared on the
+   * format+rows part alone — exactly the old behaviour. Only stamps that
+   * actually record a start number get the stricter check.
+   */
+  function layoutSignaturesMatch(cached, current) {
+    if (!cached || !current) return true;          // fail open, keep the cache
+    if (cached.indexOf('@') < 0) {
+      return cached === current.replace(/@\d+/g, '');
+    }
+    return cached === current;
   }
 
   /**
@@ -203,10 +231,12 @@ var BatchOcrQueue = (function() {
     var cached = readLayoutHeader(text);
     if (!cached) return null;
     var current = currentLayoutSignature();
-    if (!current || cached === current) return cached;
-    var msg = '[BatchOCR] ' + gameId + ': cached layout "' + cached +
-              '" differs from active profile "' + current +
-              '" — keeping cached OCR (delete its .txt to re-OCR at ' + current + ')';
+    if (layoutSignaturesMatch(cached, current)) return cached;
+    var msg = '⚠ [BatchOCR] ' + gameId + ': cached OCR was made with layout "' + cached +
+              '" but the active profile is "' + current +
+              '" — the cache is being KEPT, so this game is NOT being re-checked ' +
+              'against your current profile. Use the ↻ badge on its row to re-OCR it ' +
+              '(that game only).';
     console.warn(msg);
     if (typeof log === 'function') log(msg);
     return cached;
@@ -297,6 +327,118 @@ var BatchOcrQueue = (function() {
    * @param {string} filename
    * @param {string} content
    */
+  /**
+   * Encode accumulated per-cell logits into .logits.bin bytes, or null.
+   *
+   * Refuses in three cases, all of which mean "no sidecar" rather than a
+   * partial one:
+   *   - any page of this sheet failed to produce logits (ok === false)
+   *   - nothing was collected at all
+   *   - the cell count disagrees with the move count that will be written to
+   *     the .txt
+   * That last check is the important one and it is cheap. The reader pairs
+   * cell i with OCR move i, so a count mismatch guarantees misattributed
+   * evidence — and the Python side would refuse the file anyway. Catching it
+   * here means we never write a file that can only be rejected later.
+   *
+   * @param {Float32Array[]} cells
+   * @param {boolean} ok - false if any page of this sheet was missing logits
+   * @param {{seqLen:number, vocabSize:number}|null} shape
+   * @param {number} moveCount - moves that will be written to the .txt
+   * @param {string} tag - for the log line only
+   * @returns {ArrayBuffer|null}
+   */
+  function encodeLogits(cells, ok, shape, moveCount, tag) {
+    if (typeof LogitsIO === 'undefined') return null;
+    if (!ok || !shape || !cells || cells.length === 0) return null;
+    if (cells.length !== moveCount) {
+      console.warn('[Logits] ' + tag + ': ' + cells.length + ' logit cell(s) but ' +
+                   moveCount + ' move(s) — sidecar skipped (would misalign)');
+      return null;
+    }
+    try {
+      return LogitsIO.encode(cells.map(function(d) {
+        return { data: d, seqLen: shape.seqLen, vocabSize: shape.vocabSize };
+      }));
+    } catch (e) {
+      console.warn('[Logits] ' + tag + ': encode failed — ' + e.message);
+      return null;
+    }
+  }
+
+  /**
+   * Write binary content through BatchPaths (routes into Zugwise/logits/).
+   */
+  async function writeBinaryFile(dirHandle, filename, buffer) {
+    if (window.BatchPaths) {
+      await window.BatchPaths.writeBinary(dirHandle, filename, buffer);
+      return;
+    }
+    var fh = await dirHandle.getFileHandle(filename, { create: true });
+    var w = await fh.createWritable();
+    await w.write(buffer);
+    await w.close();
+  }
+
+  /**
+   * Read binary content through BatchPaths (Zugwise/logits/, flat-root
+   * fallback). Null when absent — a tournament OCR'd before the sidecar
+   * existed simply has no CTC to restore.
+   */
+  async function readBinaryFile(dirHandle, filename) {
+    if (window.BatchPaths && window.BatchPaths.readBinary) {
+      try { return await window.BatchPaths.readBinary(dirHandle, filename); }
+      catch (e) { return null; }
+    }
+    try {
+      var fh = await dirHandle.getFileHandle(filename);
+      var f = await fh.getFile();
+      return await f.arrayBuffer();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Ply indices for a parsed .txt sheet, in the sheet's own cell order.
+   * The sidecar was written from the SAME order the .txt was written in, so
+   * position i of one lines up with position i of the other. Mirrors the
+   * fresh-OCR expression in worker-api (moveNumber/color there, num/color in
+   * the parsed cache).
+   */
+  function _pliesForCells(cells) {
+    return (cells || []).map(function(c) {
+      return (c.num - 1) * 2 + (c.color === 'w' ? 0 : 1);
+    });
+  }
+
+  /**
+   * Restore a cached game's CTC logits from disk. Best-effort by construction:
+   * any failure means this game ranks without CTC, exactly as it did before
+   * this existed — it must never fail a cache hit that otherwise succeeded.
+   */
+  async function restoreCachedCtcLogits(dirHandle, gameId, sheetSpecs) {
+    if (!window.zugwise || !window.zugwise.addCachedCtcSheet) return 0;
+    var restored = 0;
+    for (var i = 0; i < sheetSpecs.length; i++) {
+      var spec = sheetSpecs[i];
+      if (!spec.cells || !spec.cells.length) continue;
+      try {
+        var buf = await readBinaryFile(dirHandle, spec.file);
+        if (!buf) continue;
+        var res = await window.zugwise.addCachedCtcSheet(buf, _pliesForCells(spec.cells));
+        if (res && res.plies) restored++;
+      } catch (e) {
+        console.warn('[CTC] could not restore ' + spec.file + ': ' + e.message);
+      }
+    }
+    if (restored) {
+      console.log('[CTC] restored logits for ' + gameId + ' from ' + restored +
+                  ' cached sidecar(s) — the CTC signal survives the cache hit');
+    }
+    return restored;
+  }
+
   async function writeTextFile(dirHandle, filename, content) {
     // Route into the Zugwise/<kind> subfolder (BatchPaths). dirHandle is the
     // scan-folder base; the resolver picks PGN/OCR/grid by extension.
@@ -403,6 +545,60 @@ var BatchOcrQueue = (function() {
   };
 
   /**
+   * Report a grid-detection template mismatch for one page/half.
+   *
+   * Runs at the batch level on purpose. grid-slide already logs the signal,
+   * but only into the verbose Grid Detection Report — ~80 lines per half, so
+   * in practice nobody sees it. A mismatch means the page is being cut against
+   * the wrong sheet profile, which corrupts EVERY cell on it, so it belongs in
+   * the batch log next to the per-game progress.
+   *
+   * A single warning can be one bad scan. The same warning on two different
+   * games is the profile, not the paper — that gets a louder, once-per-run
+   * message naming the selected profile and what to do about it.
+   */
+  Queue.prototype._noteTemplateWarning = function(game, ocrInput, warning) {
+    var gameId = (game && game.gameId) || '?';
+    var where = gameId
+      + (ocrInput && ocrInput.label ? ' ' + ocrInput.label : '')
+      + (ocrInput && ocrInput.name ? ' (' + ocrInput.name + ')' : '');
+    var msg = '⚠ TEMPLATE MISMATCH — ' + where + ': ' + warning;
+    console.warn('[BatchOCR] ' + msg);
+    if (typeof log === 'function') log(msg);
+    if (window.GridDebugPanel) window.GridDebugPanel.line(msg, 'warn');
+
+    if (game) {
+      game.templateWarnings = game.templateWarnings || [];
+      game.templateWarnings.push(warning);
+    }
+    if (this.onProgress) {
+      this.onProgress(gameId, 'ocr_running', 'Template mismatch — check the sheet profile');
+    }
+
+    this._tplWarnGames = this._tplWarnGames || {};
+    this._tplWarnGames[gameId] = true;
+    var nGames = Object.keys(this._tplWarnGames).length;
+    if (nGames >= 2 && !this._tplWarnEscalated) {
+      this._tplWarnEscalated = true;
+      var profileName = '(unknown)';
+      try {
+        var ap = window.SheetProfiles && window.SheetProfiles.getActiveProfile
+          ? window.SheetProfiles.getActiveProfile() : null;
+        if (ap && ap.name) profileName = ap.name;
+      } catch (e) { /* keep the fallback */ }
+      var stop = '⛔ STOP — ' + nGames + ' games have now failed the grid template '
+        + 'check with profile "' + profileName + '". That is the SHEET PROFILE, not '
+        + 'the scans. Cancel the batch, pick the profile matching these sheets, delete '
+        + 'the cached Zugwise/OCR and Zugwise/grid files for this round, and re-run. '
+        + 'Tip: if page 2 is another copy of the FRONT form (numbers restarting at 1), '
+        + 'you need a "page 2 repeats page 1" profile, not a "page 2 continues at N" one.';
+      console.warn('[BatchOCR] ' + stop);
+      if (typeof log === 'function') log(stop);
+      if (window.GridDebugPanel) window.GridDebugPanel.line(stop, 'warn');
+    }
+  };
+
+  /**
    * Cancel processing after current game completes.
    */
   Queue.prototype.cancel = function() {
@@ -440,6 +636,11 @@ var BatchOcrQueue = (function() {
     this.processing = true;
     var item = this.queue.shift();
     this._currentGameId = item.gameId;
+    // Tag every cell this game OCRs, so a later CTC re-score can tell this
+    // game's stored logits from those of games the queue runs ahead onto.
+    if (window.zugwise && window.zugwise.setOcrGameTag) {
+      window.zugwise.setOcrGameTag(item.gameId);
+    }
 
     if (this.onProgress) {
       this.onProgress(item.gameId, 'ocr_running', 'Starting OCR...');
@@ -534,6 +735,12 @@ var BatchOcrQueue = (function() {
                     (cachedSheet1Pages ? cachedSheet1Pages.length + ' pages' : '1 page') +
                     '), sheet2=' + cachedSheet2.length + ', skipping OCR');
         noteLayoutMismatch(cachedP1Text, game.gameId);
+        // The sidecars written on the first pass — without this the game
+        // reconstructs with no CTC evidence at all (see addCachedCtcSheet).
+        await restoreCachedCtcLogits(this.outputDirHandle, game.gameId, [
+          { file: game.gameId + '.p1.logits.bin', cells: cachedSheet1 },
+          { file: game.gameId + '.p2.logits.bin', cells: cachedSheet2 }
+        ]);
         // Restore per-cell images from .p1.grid.json / .p2.grid.json sidecars.
         // Auto-refresh if sidecars predate image storage (one-time grid-only pass).
         var p1GridText = await readTextFile(this.outputDirHandle, game.gameId + '.p1.grid.json');
@@ -621,6 +828,9 @@ var BatchOcrQueue = (function() {
           console.log('[BatchOCR] Cache hit for ' + game.gameId +
                       ' — ' + cachedCells.length + ' cells, skipping OCR');
           noteLayoutMismatch(cachedText, game.gameId);
+          await restoreCachedCtcLogits(this.outputDirHandle, game.gameId, [
+            { file: game.gameId + '.logits.bin', cells: cachedCells }
+          ]);
           // Restore per-cell images from .grid.json sidecar — no OCR or OpenCV needed.
           // If the sidecar predates image storage, auto-refresh it once (grid detection
           // only, no ONNX) so subsequent hits are instant.
@@ -687,6 +897,14 @@ var BatchOcrQueue = (function() {
     // cells carry the correct _pageIdx and the resulting Map keys are unique
     // (page_num_color instead of just num_color).
     var sheet1SidecarCells = [], sheet2SidecarCells = [], singleSidecarCells = [];
+    // Logit cells accumulate ACROSS PAGES, because one .p1.txt can span several
+    // page images and the sidecar must match it cell for cell. `...LogitsOk`
+    // goes false the moment any page fails to yield logits: a sheet's sidecar
+    // is all-or-nothing, since a gap would shift every later cell against the
+    // .txt and mis-attribute the evidence.
+    var sheet1LogitCells = [], sheet2LogitCells = [], singleLogitCells = [];
+    var sheet1LogitsOk = true, sheet2LogitsOk = true, singleLogitsOk = true;
+    var logitShape = null;
     var sheet1SidecarName = '', sheet2SidecarName = '', singleSidecarName = '';
     var sheet1SidecarW = 0, sheet1SidecarH = 0;
     var sheet2SidecarW = 0, sheet2SidecarH = 0;
@@ -887,6 +1105,15 @@ var BatchOcrQueue = (function() {
               _nMoves > 0 ? 'good' : 'warn');
           }
 
+          // Template mismatch: the page's printed row numbers / column count /
+          // row count disagree with the active profile. This must reach the
+          // BATCH log, not just the grid dump — it means the whole round is
+          // being OCR'd against the wrong sheet profile, and the operator has
+          // to see it while there is still time to stop and re-pick.
+          if (result && result.templateWarning) {
+            this._noteTemplateWarning(game, ocrInput, result.templateWarning);
+          }
+
           // --- Grid-template rescue (auto-consensus, fallback only) ---------
           // When detection collapses on a noisy sheet (signature across the
           // table, scribbled numbers) it returns far fewer cells than the
@@ -983,6 +1210,24 @@ var BatchOcrQueue = (function() {
               singleSidecarCells = singleSidecarCells.concat(_tagged);
               if (!singleSidecarName) { singleSidecarName = fileEntry.name; singleSidecarW = result.imageWidth || 0; singleSidecarH = result.imageHeight || 0; }
             }
+
+            // Same routing for the raw logits. The cell ORDER here is
+            // result.moves order, which is also the order formatOcrText writes
+            // — that correspondence is what makes the sidecar readable.
+            var _lg = result.logitsCells;
+            if (_lg && !logitShape) logitShape = { seqLen: _lg.seqLen, vocabSize: _lg.vocabSize };
+            if (hasDualSheet) {
+              if (ocrInput.label === 'left') {
+                if (_lg) { sheet1LogitCells = sheet1LogitCells.concat(_lg.data); }
+                else { sheet1LogitsOk = false; }
+              } else if (ocrInput.label === 'right') {
+                if (_lg) { sheet2LogitCells = sheet2LogitCells.concat(_lg.data); }
+                else { sheet2LogitsOk = false; }
+              }
+            } else {
+              if (_lg) { singleLogitCells = singleLogitCells.concat(_lg.data); }
+              else { singleLogitsOk = false; }
+            }
           }
         } catch (ocrErr) {
           if (window.GridDebugPanel && window.GridDebugPanel.capturing) {
@@ -1040,13 +1285,19 @@ var BatchOcrQueue = (function() {
         isDualSheet: true,
         gridSidecar: sheet1Sidecar,   // compat: verification-ui uses this for player1 overlay
         sheet1Sidecar: sheet1Sidecar,
-        sheet2Sidecar: sheet2Sidecar
+        sheet2Sidecar: sheet2Sidecar,
+        sheet1Logits: encodeLogits(sheet1LogitCells, sheet1LogitsOk, logitShape,
+                                   dualSheetLeft.length, 'p1'),
+        sheet2Logits: encodeLogits(sheet2LogitCells, sheet2LogitsOk, logitShape,
+                                   dualSheetRight.length, 'p2')
       };
     }
 
     return {
       ocrCells: allMoves,
-      gridSidecar: gridSidecar
+      gridSidecar: gridSidecar,
+      logits: encodeLogits(singleLogitCells, singleLogitsOk, logitShape,
+                           allMoves.length, 'single')
     };
   };
 
@@ -1228,7 +1479,20 @@ var BatchOcrQueue = (function() {
    * @param {Object} result - {ocrCells, gridSidecar}
    */
   Queue.prototype._saveOcrFiles = async function(gameId, result) {
-    if (!this.outputDirHandle) return;
+    // No output folder = no OCR cache. Say so ONCE per run rather than
+    // returning silently: the round still completes normally, so the only
+    // symptom is that the next run re-OCRs everything from scratch.
+    if (!this.outputDirHandle) {
+      if (!this._warnedNoOutputDir) {
+        this._warnedNoOutputDir = true;
+        var noDirMsg = '[BatchOCR] No writable scan folder — OCR text and grid ' +
+                       'sidecars will NOT be cached, so this round will be ' +
+                       're-OCR\'d next time.';
+        console.warn(noDirMsg);
+        if (typeof log === 'function') log(noDirMsg);
+      }
+      return;
+    }
 
     try {
       if (result.isDualSheet) {
@@ -1265,8 +1529,29 @@ var BatchOcrQueue = (function() {
         await writeTextFile(this.outputDirHandle, gameId + '.grid.json',
           JSON.stringify(result.gridSidecar, null, 2));
       }
+
+      // Logits sidecars. Always optional: absent simply means the CTC ranking
+      // signal is unavailable for this game (see W_CTC in fix_finding.py), the
+      // same graceful degradation as a missing .grid.json.
+      if (result.isDualSheet) {
+        if (result.sheet1Logits) {
+          await writeBinaryFile(this.outputDirHandle, gameId + '.p1.logits.bin',
+                                result.sheet1Logits);
+        }
+        if (result.sheet2Logits) {
+          await writeBinaryFile(this.outputDirHandle, gameId + '.p2.logits.bin',
+                                result.sheet2Logits);
+        }
+      } else if (result.logits) {
+        await writeBinaryFile(this.outputDirHandle, gameId + '.logits.bin', result.logits);
+      }
     } catch (e) {
-      console.warn('[BatchOCR] Failed to save files for ' + gameId + ':', e);
+      // Surface in the batch log too — a write failure here (read-only folder
+      // being the usual cause) silently costs the whole OCR cache.
+      var failMsg = '[BatchOCR] ' + gameId + ': could NOT write OCR cache files (' +
+                    (e && e.name ? e.name : e) + ') — this game will be re-OCR\'d next run.';
+      console.warn(failMsg, e);
+      if (typeof log === 'function') log(failMsg);
     }
   };
 
@@ -1327,7 +1612,8 @@ var BatchOcrQueue = (function() {
     loadGridFromFile: loadGridFromFile,
     loadSavedOcr: loadSavedOcr,
     downloadAsFile: downloadAsFile,
-    currentLayoutSignature: currentLayoutSignature
+    currentLayoutSignature: currentLayoutSignature,
+    layoutSignaturesMatch: layoutSignaturesMatch
   };
 })();
 

@@ -12,6 +12,7 @@ Combines multiple strategies:
 - Hanging piece penalty (scaled by piece value)
 """
 
+import math
 import chess
 from typing import List, Dict, Optional, Set, Tuple
 from data_structures import OCRMove, Absurdity
@@ -23,11 +24,458 @@ from absurdity import (find_all_absurdities, find_check_symbol_mismatches,
                        find_free_captures, find_free_captures_with_check,
                        find_hanging_pieces)
 from lenient_normalize import normalize_lenient_move
+# NOTE: a plain `import ctc_align` would NOT work in the browser. The Pyodide
+# loader (frontend/python-loader.js) strips `from <local module> import ...`
+# lines and executes every backend module into ONE flat namespace, so the
+# from-import is what is required - and `viterbi` must be referenced by its
+# bare name, since an `as` alias would be stripped with the line and never
+# bound. ctc_align.py loads before fix_finding.py in that loader's order.
+from ctc_align import viterbi
 from constraints import find_piece_constraint_cluster, find_development_blocker, scan_ocr_for_piece_clusters
 from collections import Counter
 # === EARLY STOPPING (January 2026) ===
 from play import play_until_absurd_or_stuck
 USE_EARLY_STOPPING = True
+
+# === SIGNAL WEIGHTS DISABLED BY THE JUNE 2026 SIGNAL AUDIT ===
+# Zeroed, NOT deleted - restoring is a one-line change to the constant, which is
+# the whole point. Same pattern CLAUDE.md already uses for the forbidden quality
+# signals: the computation and the score_components key survive as labelled
+# placeholders so the evidence stays visible at the point of temptation.
+#
+# Audit corpus: 10 recorded baselines = 8 DISTINCT games (christine_game and
+# william_game_dual_test each appear twice with different OCR), ~2 handwritings,
+# 83 stops of which 81 are 'illegal'. It is thin, and it under-tests both of
+# these. Read the numbers below as "never observed to help here", NOT as proof.
+#
+# W_CHECK_FORCING (chk_fc, was 35/15, added 19fabf9 2026-02-02)
+#   Fires at 20/83 stops. Changes the rank-1 answer 0 times. At 17 of those 20
+#   the rank-1 answer was ALREADY correct without it - it rides along with
+#   decisions other signals win, and never has to break a tie.
+#   CAVEAT: its motivating case (a correct checking move LOSING on reach:
+#   Qxb7+ reach+1 beaten by Qb5 reach+2) does not occur in this corpus, so the
+#   corpus fails to test it rather than disproving it. 0 flips in 20 firings
+#   bounds its true decisive rate at only ~15% (rule of three, 95%).
+#
+# W_FUTURE_MOVES (future, was 2, present since the initial commit e3434b7)
+#   Fires at 13/83 stops. Never had a recorded motivating case in 8 months of
+#   history. Its single measurable rank-1 flip goes TO the correct answer when
+#   removed; live ablation over 8 games measured no net change either way.
+#
+# NOT disabled, deliberately: reach_tb / reach10 also looked removable
+# (+1 top1) but interact - dropping both costs a top-3 placement, and +1 on 68
+# decision points is inside the noise of an 8-game corpus.
+W_CHECK_FORCING = 0
+W_FUTURE_MOVES = 0
+
+# W_HI_SIM (hi_sim, +25 step at char_sim >= 0.90, capped jointly with ocr_pat)
+# W_REACH10 (reach10, +30 step at reach_improvement >= 10 when reach-eligible)
+#   Both are STEP functions layered on signals already counted SMOOTHLY by
+#   sim (char_sim * 40) and reach (min(reach_improvement * 10, 50)). They are
+#   duplicates, and the cliff lands at the worst moment: at a stop the OCR text
+#   is corrupt BY DEFINITION - that is why we stopped - so a bonus for closely
+#   matching it is least earned exactly where it fires hardest.
+#
+#   Mechanism, over the 45-game MCC Crown corpus:
+#     reach10  all 15 decisions it decides have the IDENTICAL shape - the
+#              losing candidate carries the full +30, the correct one carries
+#              0, at near-equal similarity (0.821 vs 0.783). The step is the
+#              sole deciding factor and it picks wrong 15 times against 1.
+#     hi_sim   the losers average char_sim 0.942 against the correct fixes'
+#              0.744; in 20 of 22 the correct fix got no hi_sim at all.
+#
+#   Measured (1080 ranked decisions, 44 clean games):
+#     offline   hi_sim x0 +16, reach10 x0 +14, together +33; game-clustered
+#               bootstrap 95% CI [+19, +47], no round negative for either
+#     LIVE      full 45-game re-record: 52.7% -> 55.4% rank-1, +33 exactly as
+#               predicted. mean accuracy 0.9792 -> 0.9789, perfect 25 -> 25:
+#               ranking improves, accuracy does not (the recorder is an ORACLE
+#               and applies the correct fix whatever its rank, so accuracy
+#               cannot see a re-weighting).
+#
+#   CAVEAT worth knowing before touching this: zeroing hi_sim costs Christine's
+#   root-cause fix 5 points, and test_phase2_carveout's margin drops from 5.2
+#   to 0.2. It still passes. If that test ever fails, look here FIRST.
+#
+#   Zeroing removes a duplicate; it does NOT remove similarity or reach, both
+#   of which survive in their smooth form. Restoring is one character.
+W_HI_SIM = 0
+W_REACH10 = 0
+
+# W_OCR_PAT (ocr_pat, +25/+15/... when the candidate appears in the OCR's own
+# alternative list; capped jointly with hi_sim at 35)
+#   STAYS AT 1. SETTLED Aug 2026 by the live paired A/B this comment used to
+#   ask for - and the answer inverted the conclusion it was expecting.
+#
+#   The hypothesis was "CTC has made ocr_pat redundant": both read the same
+#   logits, ocr_pat through beam decoding (did this SAN survive into the
+#   top-k?) and ctc by scoring the SAN against the raw frames directly, which
+#   is strictly more information.
+#
+#   Offline over the CTC-enabled 45-game re-record (862 ranked decisions):
+#
+#       baseline                        573   66.5%
+#       without ocr_pat                 576   66.8%    +3
+#       without ctc                     485   56.3%   -88
+#       without ocr_pat AND ctc         467   54.2%  -106
+#
+#   LIVE, all 45 games re-recorded in both arms, paired on
+#   (game, stuck ply, correct SAN) per the A/B lesson:
+#
+#       UNPAIRED   W=1 573/1163 (49.3%)   W=0 575/1160 (49.6%)   +2
+#       PAIRED     1160 decisions both arms faced
+#                  both correct 558, both wrong 570
+#                  W=0 wins 17, loses 15, net +2
+#                  sign test on 32 discordant pairs: p = 0.86, NOT significant
+#
+#   So the redundancy claim is CONFIRMED where CTC is present: +2 at p=0.86 is
+#   indistinguishable from zero, and the live run agrees with the offline screen
+#   (-3) to within noise. Both of this project's usual worries - that offline
+#   over-predicts, and that dropping a signal changes which candidates make the
+#   top-50 cut - turned out not to bite here.
+#
+#   WHY IT STAYS AT 1 ANYWAY, which is the part the "redundant -> remove it"
+#   framing missed: ocr_pat is worth +18 when CTC is ABSENT, and CTC is absent
+#   far more often than the CTC-enabled corpus suggests -
+#
+#       test_cases_crown     45 games,  40 carry ctc,   5 do NOT
+#       test_cases_premier   44 games,   0 carry ctc,  44 do NOT
+#
+#   49 of 89 corpus games, all of Premier, every sheet whose sidecar
+#   load_by_ply legitimately refuses, and any deployment not producing logits.
+#   That is not a redundant signal, it is graceful degradation: inert where the
+#   better signal exists, load-bearing where it does not. Zeroing it would have
+#   been a regression invisible on the very games the A/B measured.
+#
+#   Do not re-open this without a corpus where CTC is present EVERYWHERE.
+W_OCR_PAT = 1
+
+
+# =============================================================================
+# NOTATION-CLASS SIMILARITY ABSTENTION
+# =============================================================================
+# Castling notation is orthographically DISJOINT from every piece and pawn
+# move: there is no character overlap available between 'Qc2' and 'O-O'. So
+# char_sim between them measures nothing, and scoring it near zero is not
+# neutrality - it is a ~30-point penalty for being a castle.
+#
+# Measured over 55 games with ground truth: every game castles (82% both
+# sides, median move 10) and OCR reads 98 of 100 castles correctly - but on
+# the two misses the correct fix ranked 36 and 35. The panel shows 10
+# (frontend/js/fixes.js: fixes.slice(0, 10)) and verify_top_n is 15, so those
+# candidates were neither visible nor tactically verified. Games carrying a
+# castling error average 0.9390 final accuracy against 0.9868 for the rest:
+# a wrong castle relocates TWO pieces, so it poisons more of the future than
+# any other single error.
+#
+# This is reconstruction, not move quality: it says nothing about whether
+# castling is a good move, only that the OCR channel cannot be compared to it
+# character by character. Abstain to the UNCONDITIONAL prior - the mean
+# char_sim over all 23,070 recorded corpus candidates - so abstaining neither
+# advantages nor disadvantages the castle. Deliberately NOT the correct-fix
+# mean (0.661), which would bake in "assume the castle is right".
+#
+# The target is the panel, not rank 1. A bonus large enough to force rank 1
+# would flood the list - the failure mode that sank the full p2_pen waiver
+# in 26b26ee.
+NOTATION_ABSTAIN_SIM = 0.474
+W_NOTATION_ABSTAIN = 1   # audit switch; 0 restores the raw char_sim
+
+
+def notation_is_incomparable(ocr_text: str, san: str) -> bool:
+    """True when exactly one of the two is castling notation."""
+    if not W_NOTATION_ABSTAIN:
+        return False
+    a = str(san or '').startswith(('O-O', '0-0'))
+    b = str(ocr_text or '').strip().startswith(('O-O', '0-0'))
+    return a != b
+
+
+def effective_sim(ocr_text: str, san: str, char_sim: float) -> float:
+    """char_sim, or the neutral prior when the notations cannot be compared.
+
+    Only the `sim` term uses this. hi_sim keeps the RAW char_sim so that
+    abstention can never manufacture a high-similarity bonus (0.474 is below
+    the 0.90 threshold anyway, but the intent should not depend on that).
+    """
+    if notation_is_incomparable(ocr_text, san):
+        return NOTATION_ABSTAIN_SIM
+    return char_sim
+
+
+# =============================================================================
+# MFC PRESERVATION GATE
+# =============================================================================
+# mfc penalises a candidate for "ignoring a genuinely free major piece". The
+# test it actually applies is destination equality:
+#
+#     takes_free = any(candidate.to_square == fc.to_square for fc in free_caps)
+#
+# which reads "did this move capture the free piece THIS ply?" - not "did this
+# move give the free piece up?". For a quiet move the two coincide: the
+# opponent gets a free tempo and will usually defend or move the piece. For a
+# CHECK they do not. A check forces a reply from a restricted set, and the free
+# capture is normally still sitting there afterwards, which makes the penalty a
+# pure false positive against a zwischenzug.
+#
+# Reported case, 37.W in q3rk2/7b/5b2/1p1p1p2/1PpP1Pp1/2P3P1/1B5Q/4R1KB w - - 0 37:
+#
+#     free capture at the ply   Rxe8+  (net +3; Rxe8+ Kxe8 Qxh7 wins the bishop,
+#                                       and Rxe8+ Qxe8 Qxh7 the same)
+#     candidate                 Qh6+   (char_sim 100%, the OCR reading)
+#         after Qh6+ Kg8   ->   Rxe8+ still free, now worth +10
+#         after Qh6+ Kf7   ->   Rxe8 still free (+3), plus Qxh7+ (+8)
+#         after Qh6+ Bg7   ->   Rxe8+ still free (+3)
+#
+# Qh6+ forgoes nothing - in the main line it IMPROVES the capture - yet took
+# mfc -30 and lost rank 1 (149) to a char_sim 16% candidate (151). Removing a
+# 100%-similarity reading in favour of a 16% one is the exact failure shape
+# that got win_cap banned; here it is not the signal that is wrong, it is the
+# question it asks.
+#
+# So ask the right question: suppress mfc when the candidate is FORCING and the
+# free capture SURVIVES it. Deliberately narrow:
+#   - checks only. A quiet move really does hand over a tempo; only a check
+#     constrains the reply set enough to say the capture is still there.
+#   - EVERY legal reply must preserve it. One escape that defends or moves the
+#     piece means the candidate did give it up, and mfc should fire.
+#   - same destination square. A different free capture appearing elsewhere is
+#     a new opportunity, not evidence this one was kept.
+# All three keep the gate on the measurement side of the CLAUDE.md line: it is
+# still quiescence-verified reconstruction plausibility (find_free_captures is
+# unchanged and does all the tactical work), with the "ignored it" test
+# corrected. It states no opinion about whether the check is a good move.
+W_MFC_PRESERVE = 1   # audit switch; 0 restores the destination-only test
+
+
+def mfc_capture_preserved(board, candidate_move, free_caps) -> bool:
+    """True when `candidate_move` is a check that keeps one of `free_caps` free.
+
+    board          position BEFORE the candidate, side to move = capturer
+    candidate_move chess.Move already known not to land on a free-capture square
+    free_caps      find_free_captures(board, board.turn) output
+
+    Cost is gated hard: the quiescence-backed find_free_captures runs only for
+    candidates that give check in a ply that already has a free capture, and
+    then only over the (few) legal replies to that check.
+    """
+    if not W_MFC_PRESERVE or not free_caps or candidate_move is None:
+        return False
+    try:
+        if not board.gives_check(candidate_move):
+            return False
+        free_squares = {fc.to_square for fc, _, _ in free_caps}
+        board.push(candidate_move)
+        try:
+            replies = list(board.legal_moves)
+            # Mate or stalemate: the game ends, the capture is moot - never a
+            # reason to penalise the move that ended it.
+            if not replies:
+                return True
+            for reply in replies:
+                board.push(reply)
+                try:
+                    still = find_free_captures(board, board.turn)
+                    kept = any(fc.to_square in free_squares for fc, _, _ in still)
+                finally:
+                    board.pop()
+                if not kept:
+                    return False
+            return True
+        finally:
+            board.pop()
+    except Exception:
+        # Never let the gate suppress a penalty it could not actually verify.
+        return False
+
+
+# =============================================================================
+# CTC CONSTRAINED RE-OCR  (likelihood side)
+# =============================================================================
+# char_sim compares a candidate against the DECODED text, which has already
+# thrown the model's uncertainty away. Where the decode is wrong - which at a
+# stop is BY DEFINITION - the string comparison is uninformative. Scoring the
+# candidate directly against the raw per-cell CTC logits asks the OCR model
+# "how likely is this cell to read bxc4?" and never compares strings at all.
+#
+# This is OCR confidence, a core PERMITTED signal (CLAUDE.md ranking rule). It
+# carries no chess opinion whatsoever - it cannot, it has never seen a board.
+#
+# Measured, 45-game MCC Crown corpus, 947 decisions that have logits, against
+# the CURRENT baseline (hi_sim/reach10 already zeroed - emulated by subtracting
+# those two additive score_components, an emulation that reproduces the live
+# re-record's +33 exactly):
+#     baseline 516 (54.5%)  ->  in-sample W=3: 614 (64.8%, +98)
+#                               LORO-CV:       605 (63.9%, +89)
+# W=3 is chosen by 8 of the 9 rounds independently. The signal is almost
+# undiminished by the hi_sim/reach10 change (+99 -> +98 in sample): it is
+# near-independent of what tuning already claimed.
+#
+# WHERE IT IS APPLIED, and why that is not arbitrary: as the LAST step of
+# _postprocess_phase2_fixes, after every other adjustment. Three reasons:
+#   1. Fixes reach the ranked list from FOUR construction sites (the main
+#      scorer, Phase 3, and two piece-confusion paths) and are sorted together.
+#      A term added inside the main formula would leave the other three with an
+#      implicit 0 - which, for a negative log-probability, is a large REWARD
+#      for having come from a path that does not compute it.
+#   2. It keeps every absolute constant upstream (the KEEP-AS-IS cap of 40, the
+#      reach and distance penalties) on the scale they were tuned against.
+#   3. It is what was measured: the corpus recording holds POST-processed
+#      scores, so "+89 CV" means "added at the end, then re-sorted".
+# Moving it earlier would also change which candidates the top-N quiescence
+# verify pass examines. That may well be better - it is simply UNMEASURED.
+#
+# INERT UNTIL LOGITS ARE SUPPLIED. Nothing writes the `.logits.bin` sidecar yet
+# (batch-folder-paths.js routes the extension; no producer exists), and with no
+# logits the term is never computed. W_CTC holds its measured value so that
+# writing the producer is the only remaining step - not so that behaviour
+# changes today.
+W_CTC = 3
+
+# What an UNSCORABLE candidate receives: no logits for its ply (a fix upstream
+# of the scanned sheet, a partial dual-sheet), or a SAN outside the charset.
+#
+# NOT a floor - an ABSTENTION, the same construction as NOTATION_ABSTAIN_SIM
+# above and for the same reason. Absence of evidence must not become evidence
+# of absence, so an unscorable candidate gets the score a typical candidate
+# gets, advantaging and disadvantaging it equally.
+#
+# Set from the measured unconditional mean over all 15,195 scored corpus
+# candidates (-19.27; median -18.13, so the choice is insensitive to which).
+# Deliberately NOT the correct-fix mean of -9.50, which would bake in "assume
+# the unscorable candidate is right".
+#
+# BEWARE the tempting wrong constant: the move-prior harness floors at
+# log(1e-4), and log(1e-4) = -9.21 is essentially that correct-fix mean. On
+# this scale it is not a floor at all - it beats 83% of genuinely scored
+# candidates, so copying it across would silently reward being unscorable.
+#
+# UNTESTED BY MEASUREMENT: corpus coverage is 99.9% (14,205 of 14,220
+# candidates) and no decision has only SOME candidates scored, so abstention
+# never fires there and the +89 above is unaffected by this value.
+CTC_ABSTAIN = -19.27
+
+# Process-wide fallback logits, consulted when a caller passes no ctc_logits.
+#
+# A MODULE GLOBAL is the deliberate choice over threading the parameter through
+# every entry point. find_fixes_two_phase is called from greedy, beam, dijkstra,
+# the forced-stop rescorer, the interactive path and the recorder; threading it
+# means finding every one, and this project has already been bitten by exactly
+# that ("the handoff's ocr_c site list was one short"). A missed call site here
+# would be invisible — that algorithm would silently rank without the signal
+# while its neighbours ranked with it, which is the panel/algorithm divergence
+# this was introduced to remove.
+#
+# An explicit ctc_logits argument always wins, so tests and the recorder stay
+# hermetic. Set it once per game (the browser workers do this when the sheet's
+# logits arrive) and clear it on game switch — a stale game's logits would score
+# the right moves against the wrong handwriting.
+_DEFAULT_CTC_LOGITS = None
+
+
+# =============================================================================
+# HUMAN MOVE PRIOR ("our own Maia")
+# =============================================================================
+#
+# WHY THIS IS PERMITTED AT ALL. CLAUDE.md bans signals that evaluate move
+# QUALITY, and this one has to clear that bar explicitly. The forbidden signals
+# (win_cap, miss_c, ...) computed an OPINION about the position out of a piece
+# value table: "a free rook is worth +50". This computes nothing about the
+# position. It reports a MEASUREMENT over a population - what fraction of human
+# players actually played each legal move - which is the same species of object
+# as OCR confidence. It answers "what did the player write?", never "what should
+# they have played?". CLAUDE.md's August 2026 amendment states the test and the
+# four conditions; this wiring satisfies them:
+#
+#   1. RATING-MATCHED. The model is trained on club-level games, not strong
+#      play. A strong-play policy reintroduces the population mismatch that
+#      made the forbidden signals wrong.
+#   2. ADDITIVE, NEVER A REPLACEMENT. Measured, the prior ALONE ranks 45.4%,
+#      WORSE than the scorer's own 52.7%. It is complementary evidence.
+#   3. WEIGHT BY CROSS-VALIDATION. W=10 is leave-one-round-out CV over the
+#      Crown corpus for the SHIPPED model (move_prior_b8f128_mb0, 8x128, 48.4%
+#      move match; Sept 2026): fold weights [12,10,10,10,16,10,10,8,10], +83 CV
+#      (66.9% -> 74.5%). The curve is flat - W=8..16 score 825-828 of 1094 in
+#      sample - so the choice is not delicate. Premier is validation only and
+#      did NOT pick it (its folds say 8; W=10 costs it 9 of 990). The older
+#      W=12 was fitted for the 4x64 colab model. Every forbidden signal arrived
+#      instead with a compelling example.
+#   4. IT DOES NOT REPLACE abs_pen, which is still worth +21 rank-1 on top.
+#
+# MEASURED: +85 rank-1 cross-validated over 947 jointly-covered decisions
+# (516 -> 601, 54.5% -> 63.5%), against a re-weighting ceiling of +5.4 for all
+# existing signals combined. With CTC as well, 663 (70.0%) at W_prior=12,
+# W_ctc=2 - the two are ~84% additive.
+#
+# THE HONEST DOWNSIDE, unchanged from CLAUDE.md: the failure mode that killed
+# win_cap is not absent. The prior gains far more than it loses, but some of the
+# losses have the old shape - a move humans usually play displacing the one this
+# human actually wrote. The trade is accepted knowingly, and the damage is to
+# RANK-1, not to visibility.
+#
+# INERT UNTIL A PRIOR IS SUPPLIED, exactly like W_CTC: with no prior installed
+# the term is never computed. This constant holds its measured value so that
+# supplying the model is the only remaining step.
+W_PRIOR = 10
+
+# What an UNSCORABLE candidate receives: a SAN that will not parse at its ply, a
+# ply whose board cannot be reconstructed, or a position the prior declined.
+#
+# log(1e-4) = -9.21, and it is REPRODUCED FROM THE MEASUREMENT rather than
+# chosen - the CV harness that produced +85 used exactly this floor, so changing
+# it would invalidate the number the weight was fitted with.
+#
+# NOTE THE ASYMMETRY WITH CTC_ABSTAIN, which is deliberate and is the single
+# easiest thing to get wrong here. On the CTC scale -9.21 is not a floor at all:
+# it BEATS 83% of scored candidates, which is why CTC_ABSTAIN is the measured
+# unconditional mean (-19.27) instead. On the PRIOR scale, where log-probs are
+# renormalised over legal moves and a typical candidate sits around -3, the same
+# number really is a floor. Same constant, opposite meaning, because the scales
+# are different. Do not "unify" them.
+PRIOR_ABSTAIN = math.log(1e-4)
+
+# Process-wide fallback prior, consulted when a caller passes none. Same
+# reasoning as _DEFAULT_CTC_LOGITS: find_fixes_two_phase has six-plus callers
+# and a missed one would silently rank without the signal while its neighbours
+# ranked with it - the panel/algorithm divergence this project has already been
+# bitten by.
+#
+# TWO ACCEPTED FORMS, because the two runtimes cannot share one:
+#   - callable(board, sans) -> {san: log-prob}. The CLI, the recorder and the
+#     API use this, backed by torch: functools.partial(score.score_sans, model).
+#   - dict {position_key: {san: log-prob}}. The BROWSER uses this. Pyodide
+#     cannot call ONNX synchronously from Python, so the worker evaluates the
+#     positions it needs first and passes the table in - the same shape as the
+#     CTC sidecar, data rather than a live model.
+#
+#     Keyed by POSITION, never by ply. A ply names a position only relative to
+#     some move list, and every ranking path here runs against the CURRENT list
+#     of whichever search path it is on - so a ply-keyed table went stale the
+#     moment a search applied a fix, and a log-probability from the wrong
+#     position is meaningless rather than merely wrong. Use position_key() to
+#     build the key on both sides.
+_DEFAULT_MOVE_PRIOR = None
+
+
+
+def set_default_move_prior(prior):
+    """Install (or clear, with None) the process-wide fallback move prior."""
+    global _DEFAULT_MOVE_PRIOR
+    _DEFAULT_MOVE_PRIOR = prior
+
+
+def get_default_move_prior():
+    return _DEFAULT_MOVE_PRIOR
+
+
+def set_default_ctc_logits(logits):
+    """Install (or clear, with None) the process-wide fallback logits."""
+    global _DEFAULT_CTC_LOGITS
+    _DEFAULT_CTC_LOGITS = logits
+
+
+def get_default_ctc_logits():
+    return _DEFAULT_CTC_LOGITS
 
 # =============================================================================
 # OCR CANDIDATE PATTERN ANALYSIS
@@ -2080,11 +2528,11 @@ def find_check_blocking_fixes(
 
             # Unified score (simplified version of main scoring)
             unified_score = (
-                char_sim * 40 +
-                (25 if char_sim >= 0.90 else 0) +
+                effective_sim(original_ocr, candidate_san, char_sim) * 40 +
+                (25 * W_HI_SIM if char_sim >= 0.90 else 0) +
                 min(reach_improvement * 10, 50) +
                 max(reach_improvement - 5, 0) +
-                (30 if reach_improvement >= 10 and fix_ply >= stuck_ply else 0) +  # Only at stuck ply
+                (30 * W_REACH10 if reach_improvement >= 10 and fix_ply >= stuck_ply else 0) +  # Only at stuck ply
                 (5 if completes and absurdity_count <= 1 else 0) +
                 ocr_conf * 15 +
                 future_bonus
@@ -2138,11 +2586,11 @@ def find_check_blocking_fixes(
                 # Score breakdown for the fix-details panel. Phase-3 scoring
                 # is simpler than Phase 1/2 so the component list is a subset.
                 'score_components': {
-                    'sim': round(char_sim * 40, 1),
-                    'hi_sim': 25 if char_sim >= 0.90 else 0,
+                    'sim': round(effective_sim(original_ocr, candidate_san, char_sim) * 40, 1),
+                    'hi_sim': 25 * W_HI_SIM if char_sim >= 0.90 else 0,
                     'reach': min(reach_improvement * 10, 50),
                     'reach_tb': max(reach_improvement - 5, 0),
-                    'reach10': 30 if reach_improvement >= 10 and fix_ply >= stuck_ply else 0,
+                    'reach10': 30 * W_REACH10 if reach_improvement >= 10 and fix_ply >= stuck_ply else 0,
                     'complete': 5 if completes and absurdity_count <= 1 else 0,
                     'ocr_c': round(ocr_conf * 15, 1),
                     'fut_cap': future_bonus,
@@ -2677,6 +3125,26 @@ def _precompute_backtrack_context(
     ctx['stuck_move_has_check'] = stuck_move_has_check
     ctx['stuck_move_ocr'] = stuck_move_ocr
 
+    # CHECK-ENABLE ANCHOR: Phase 2 re-anchors stuck_ply to (frontier - 1), so the
+    # '+' on the REAL stuck move is invisible to the block above and the
+    # check-enabling bonus can never fire for a fix BEFORE the frontier - which is
+    # exactly the case that bonus exists for. Christine 25.W 'Rxe1'->'Kxe1' is only
+    # identifiable because it enables 26.B 'Qg3+'; once the frontier advanced past
+    # 25.W the fix survived but scored 51 points lower and sank out of the UI list.
+    # Anchor the check-enable evaluation on the ORIGINAL stuck ply in Phase 2.
+    # Phase 1 (including the EAD re-anchor) keeps the effective stuck ply, so its
+    # behaviour is bit-identical. Kept separate from stuck_move_ocr because the
+    # stuck-move check bonus (fix_ply == stuck_ply) must stay on the effective ply.
+    check_anchor_ply = original_stuck_ply if is_phase_2 else effective_stuck_ply
+    check_anchor_ocr = moves[check_anchor_ply] if check_anchor_ply < len(moves) else ""
+    check_anchor_has_check = '+' in check_anchor_ocr
+    ctx['check_anchor_ply'] = check_anchor_ply
+    ctx['check_anchor_ocr'] = check_anchor_ocr
+    ctx['check_anchor_has_check'] = check_anchor_has_check
+    if check_anchor_has_check and check_anchor_ply != effective_stuck_ply and verbose:
+        print(f"   [CHECK-ENABLE] Anchored on ORIGINAL stuck move "
+              f"'{check_anchor_ocr}' at {ply_to_str(check_anchor_ply)} (Phase 2)")
+
     # Parse stuck move destination square for "clears destination" bonus
     # Use the ORIGINAL stuck ply (before EAD adjustment) because the bonus is about
     # clearing the square that the original stuck move wants to reach (e.g., Qd4 → d4),
@@ -2810,10 +3278,10 @@ def _precompute_backtrack_context(
     # Only computed when the stuck move had a '+' OCR symbol, since the
     # check-enabling branch is otherwise unreachable.
     original_legal_checks: Set[str] = set()
-    if stuck_move_has_check:
+    if check_anchor_has_check:
         osb = cached_board.copy()
         osb_valid = True
-        for i in range(cached_board_ply, min(effective_stuck_ply, total_moves)):
+        for i in range(cached_board_ply, min(check_anchor_ply, total_moves)):
             m = try_move(osb, moves[i])
             if m:
                 osb.push(m)
@@ -2995,6 +3463,11 @@ def _search_single_ply_for_fixes(
     future_piece_moves = ctx['future_piece_moves']
     stuck_move_has_check = ctx['stuck_move_has_check']
     stuck_move_ocr = ctx['stuck_move_ocr']
+    # Check-enable anchor: == effective stuck ply in Phase 1, == the ORIGINAL
+    # stuck ply in Phase 2 (see _precompute_backtrack_context).
+    check_anchor_ply = ctx.get('check_anchor_ply', stuck_ply)
+    check_anchor_ocr = ctx.get('check_anchor_ocr', stuck_move_ocr)
+    check_anchor_has_check = ctx.get('check_anchor_has_check', stuck_move_has_check)
     stuck_dest_square = ctx.get('stuck_dest_square')
     min_ply = ctx.get('min_ply', 0)
 
@@ -3206,7 +3679,33 @@ def _search_single_ply_for_fixes(
         test_moves[fix_ply] = candidate_san
         test_reach, test_board = play_until_stuck(test_moves, board=test_board_start, start=fix_ply + 1)
 
-        reach_improvement = test_reach - stuck_ply
+        # Reach is measured against the ORIGINAL stuck ply, never the Phase 2
+        # search anchor.
+        #
+        # Phase 2 re-anchors stuck_ply to (frontier - 1) so its own search has a
+        # local target. Measuring reach against that anchor inflated every
+        # Phase 2 candidate: reaching one ply further than an anchor that sits
+        # one ply CLOSER scores as if it had gained an extra ply. Phase 1 and
+        # Phase 2 candidates are then merged and sorted together — so the list
+        # was being ordered on two different quantities.
+        #
+        # It was observable as the interactive panel and the algorithms
+        # disagreeing about the same candidate. The panel passes
+        # min_ply=confirmedPly (0 at the start), so nothing is Phase 2 and
+        # everything is measured against the real stuck ply; greedy passes
+        # min_ply=stuck, so every backtrack becomes Phase 2. Measured on
+        # Christine 7.W: identical scores for every at-ply fix, and +10 for
+        # EVERY backtrack under greedy's parameters — enough to flip the winner
+        # from the at-ply 7.W Bg5 to the backtrack 6.W h3->a3. The bias always
+        # runs toward backtracking, which is the direction users complain about.
+        #
+        # p2_pen does not cancel it: a Phase 2 fix that advances past the
+        # original stuck ply gets penalty 0 and keeps the inflation outright.
+        #
+        # Same principle the absurdity check below already follows ("use the
+        # ORIGINAL stuck ply, not the Phase 2 search limit"): a candidate's
+        # score must not depend on which phase happened to find it.
+        reach_improvement = test_reach - ctx.get('original_stuck_ply', stuck_ply)
 
         # DEBUG: Show what's happening for promising fixes (d6-like pawn moves)
         if verbose and fix_ply < stuck_ply and candidate_san in ['d6', 'd5', 'd4', 'd3']:
@@ -3368,7 +3867,8 @@ def _search_single_ply_for_fixes(
                             check_forcing_response_fix = k_variant
                             if verbose:
                                 print(f"      [CHECK-FORCE] {candidate_san} gives check, response '{next_ocr}' "
-                                      f"fixable as '{k_variant}' (bonus=+{check_forcing_bonus})")
+                                      f"fixable as '{k_variant}' (bonus=+{check_forcing_bonus * W_CHECK_FORCING}"
+                                      f"{' [DISABLED, raw=%d]' % check_forcing_bonus if not W_CHECK_FORCING else ''})")
                     except:
                         pass
 
@@ -3378,7 +3878,12 @@ def _search_single_ply_for_fixes(
                     check_forcing_bonus = 15
                     if verbose:
                         print(f"      [CHECK-FORCE] {candidate_san} gives check, response '{next_ocr}' "
-                              f"doesn't handle check (bonus=+{check_forcing_bonus})")
+                              f"doesn't handle check (bonus=+{check_forcing_bonus * W_CHECK_FORCING}"
+                              f"{' [DISABLED, raw=%d]' % check_forcing_bonus if not W_CHECK_FORCING else ''})")
+
+        # Audit-disabled weight, applied once so the unified_score sum and the
+        # score_components breakdown can never disagree. See W_CHECK_FORCING.
+        check_forcing_bonus = int(check_forcing_bonus * W_CHECK_FORCING)
 
         # === NEW: Check-Enabling Bonus ===
         # If the stuck move has a check symbol (+) but was illegal,
@@ -3387,12 +3892,12 @@ def _search_single_ply_for_fixes(
         check_enabling_bonus = 0
         check_enabling_move = None
 
-        if stuck_move_has_check and fix_ply < stuck_ply:
+        if check_anchor_has_check and fix_ply < check_anchor_ply:
             # This is an earlier fix - check if it enables a plausible check
             # We need to replay to the stuck position with this fix applied
 
-            # Only evaluate if we can reach the stuck_ply with this fix
-            if test_reach >= stuck_ply:
+            # Only evaluate if we can reach the anchor ply with this fix
+            if test_reach >= check_anchor_ply:
                 # Build board at stuck_ply with this candidate applied. `board`
                 # is already at fix_ply (built once per fix_ply by the caller
                 # from cached_board_at_min_ply), so copy + push the candidate +
@@ -3403,7 +3908,7 @@ def _search_single_ply_for_fixes(
                 check_test_board = board.copy()
                 check_test_board.push(legal_move)
                 check_test_valid = True
-                for i in range(fix_ply + 1, stuck_ply):
+                for i in range(fix_ply + 1, check_anchor_ply):
                     if i < len(test_moves):
                         m = try_move(check_test_board, test_moves[i])
                         if m:
@@ -3433,7 +3938,7 @@ def _search_single_ply_for_fixes(
                             if check_san in original_legal_checks:
                                 continue
                             # Compare to the stuck move OCR text
-                            check_sim = move_similarity(stuck_move_ocr, check_san)
+                            check_sim = move_similarity(check_anchor_ocr, check_san)
                             if check_sim > best_check_sim:
                                 best_check_sim = check_sim
                                 best_check_move = check_san
@@ -3613,7 +4118,7 @@ def _search_single_ply_for_fixes(
         ocr_analysis = None
         if ocr_m and ocr_m.candidates:
             ocr_analysis = analyze_ocr_candidates(ocr_m.candidates, verbose=False)
-            ocr_candidate_bonus = calculate_ocr_candidate_bonus(
+            ocr_candidate_bonus = W_OCR_PAT * calculate_ocr_candidate_bonus(
                 candidate_san, ocr_m.candidates, ocr_analysis=ocr_analysis, verbose=verbose
             )
 
@@ -3656,7 +4161,10 @@ def _search_single_ply_for_fixes(
                     candidate_move_obj.to_square == fc.to_square
                     for fc, _, _ in free_caps_at_ply
                 )
-                if not takes_free:
+                # A forcing check that keeps the capture available forgoes
+                # nothing - see the MFC PRESERVATION GATE block.
+                if not takes_free and not mfc_capture_preserved(
+                        board, candidate_move_obj, free_caps_at_ply):
                     best_free_val = max(val for _, _, val in free_caps_at_ply)
                     missed_free_cap_penalty = best_free_val * 10
 
@@ -3756,7 +4264,7 @@ def _search_single_ply_for_fixes(
                           f"ambiguous OCR '{original_ocr}' -> bonus=+{disamb_bonus}")
 
         # Cap hi_sim + ocr_pat at 35 to prevent double-counting
-        raw_hi_sim = 25 if char_sim >= 0.90 else 0
+        raw_hi_sim = 25 * W_HI_SIM if char_sim >= 0.90 else 0
         capped_hi_sim = min(raw_hi_sim, max(0, 35 - ocr_candidate_bonus))
 
         # Reach-bonus gating: by default reach_tb and reach10 only apply at/after
@@ -3772,9 +4280,9 @@ def _search_single_ply_for_fixes(
         # any candidate that completes — at the stuck_ply or upstream.
         _reach_bonus_eligible = (fix_ply >= stuck_ply) or completes
         reach_tb_value = max(reach_improvement - 5, 0) if _reach_bonus_eligible else 0
-        reach10_value = 30 if (reach_improvement >= 10 and _reach_bonus_eligible) else 0
+        reach10_value = 30 * W_REACH10 if (reach_improvement >= 10 and _reach_bonus_eligible) else 0
         unified_score = (
-            char_sim * 40 +                                      # Similarity is key!
+            effective_sim(original_ocr, candidate_san, char_sim) * 40 +   # Similarity is key! (abstains on castling)
             capped_hi_sim +                                      # Bonus for very high similarity (capped with ocr_pat)
             min(reach_improvement * 10, 50) +                    # Cap reach bonus at 50 (5 plies worth)
             reach_tb_value +                                     # Tiebreaker: +1 per ply beyond 5
@@ -3790,7 +4298,7 @@ def _search_single_ply_for_fixes(
             clears_dest_bonus +                                  # Bonus for clearing stuck move's destination
             disamb_bonus +                                       # +10 when OCR was ambiguous and candidate is a disambig variant
             (15 if is_duplicate_fix else 0) +                    # Bonus for fixing duplicate
-            future_moves_enabled * 2 +
+            future_moves_enabled * W_FUTURE_MOVES +   # audit-disabled, see W_FUTURE_MOVES
             nearest_ply_bonus +
             ocr_conf * 15 +
             ocr_candidate_bonus +                                # OCR candidate pattern bonus
@@ -3882,7 +4390,7 @@ def _search_single_ply_for_fixes(
 
         # Build score component breakdown for debugging
         score_components = {
-            'sim': round(char_sim * 40, 1),
+            'sim': round(effective_sim(original_ocr, candidate_san, char_sim) * 40, 1),
             'hi_sim': capped_hi_sim,
             'reach': min(reach_improvement * 10, 50),
             'reach_tb': reach_tb_value,
@@ -3899,7 +4407,7 @@ def _search_single_ply_for_fixes(
             'disamb': disamb_bonus,
             'dup_fix': 15 if is_duplicate_fix else 0,
             'dup_res': duplicate_resolution_bonus,
-            'future': future_moves_enabled * 2,
+            'future': future_moves_enabled * W_FUTURE_MOVES,
             'near': nearest_ply_bonus,
             'ocr_c': round(ocr_conf * 15, 1),
             'ocr_pat': ocr_candidate_bonus,
@@ -4219,7 +4727,7 @@ def find_deep_backtrack_fixes(
             reach_improvement = bf['plies_gained']
             completes = bf.get('new_stuck_ply') is None
             ocr_conf = bf['ocr_conf']
-            ocr_candidate_bonus = 25 if bf['in_candidates'] else 0
+            ocr_candidate_bonus = (25 * W_OCR_PAT) if bf['in_candidates'] else 0
 
             # === ABSURDITY DETECTION FOR PIECE CONFUSION FIXES ===
             # Build test_moves with the swap applied
@@ -4346,7 +4854,9 @@ def find_deep_backtrack_fixes(
                                 swap_move.to_square == fc.to_square
                                 for fc, _, _ in pc_free_caps
                             )
-                            if not takes_free:
+                            # Same preservation gate as the main path.
+                            if not takes_free and not mfc_capture_preserved(
+                                    board_for_hang, swap_move, pc_free_caps):
                                 best_free_val = max(val for _, _, val in pc_free_caps)
                                 missed_free_cap_penalty = best_free_val * 10
                 except:
@@ -4400,14 +4910,14 @@ def find_deep_backtrack_fixes(
                 pc_clears_dest_bonus = 25
 
             # Cap hi_sim + ocr_pat at 35 to prevent double-counting
-            pc_raw_hi_sim = 25 if char_sim >= 0.90 else 0
+            pc_raw_hi_sim = 25 * W_HI_SIM if char_sim >= 0.90 else 0
             pc_capped_hi_sim = min(pc_raw_hi_sim, max(0, 35 - ocr_candidate_bonus))
 
             unified_score = (
                 char_sim * 40 +                                      # Similarity
                 pc_capped_hi_sim +                                   # High similarity bonus (capped with ocr_pat)
                 min(reach_improvement * 10, 50) +                    # Reach (capped at 50)
-                (30 if reach_improvement >= 10 and fix_ply >= stuck_ply else 0) +  # Only at stuck ply
+                (30 * W_REACH10 if reach_improvement >= 10 and fix_ply >= stuck_ply else 0) +  # Only at stuck ply
                 (5 if completes and absurdity_count <= 1 else 0) +  # Completion bonus (reduced if absurd)
                 ocr_conf * 15 +                                      # OCR confidence
                 ocr_candidate_bonus +                                # In OCR candidates
@@ -4471,7 +4981,7 @@ def find_deep_backtrack_fixes(
                     'sim': round(char_sim * 40, 1),
                     'hi_sim': pc_capped_hi_sim,
                     'reach': min(reach_improvement * 10, 50),
-                    'reach10': (30 if reach_improvement >= 10 and fix_ply >= stuck_ply else 0),
+                    'reach10': (30 * W_REACH10 if reach_improvement >= 10 and fix_ply >= stuck_ply else 0),
                     'complete': 5 if completes and absurdity_count <= 1 else 0,
                     'ocr_c': round(ocr_conf * 15, 1),
                     'ocr_pat': ocr_candidate_bonus,
@@ -4549,7 +5059,273 @@ def find_deep_backtrack_fixes(
 # Called by BOTH BacktrackSearchState.finalize() AND find_fixes_two_phase()
 # to ensure identical post-processing after Phase 1+2 merge.
 
-def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: int, verbose: bool = False, verify_top_n: int = 15) -> List[dict]:
+
+def apply_ctc_rescore(fixes: List[dict], ctc_logits, verbose: bool = False) -> List[dict]:
+    """Add the CTC constrained-re-OCR term to every fix, then re-sort.
+
+    `ctc_logits` maps ply -> [seq_len][vocab] LOG probabilities for that cell
+    (already log-softmaxed), matching frontend/beam-decoder.js. Pass None to
+    disable; the whole signal is then absent rather than partially applied.
+
+    EVERY fix in the list is adjusted or none is - see the W_CTC comment block.
+    A candidate that cannot be scored gets CTC_ABSTAIN, which is the measured
+    typical score, NOT a floor.
+
+    Mutates the dicts in place (adding score_components['ctc']) and returns the
+    list re-sorted by the updated unified_score.
+    """
+    if ctc_logits is None:
+        ctc_logits = _DEFAULT_CTC_LOGITS
+    if not W_CTC or not ctc_logits or not fixes:
+        return fixes
+
+    scored = abstained = 0
+    logp = []
+    for f in fixes:
+        lp = ctc_logits.get(f.get('ply'))
+        v = None
+        if lp is not None:
+            # '0-0' is not in the CTC charset; the model emits 'O-O'.
+            v = viterbi(lp, str(f.get('san') or '').replace('0-0', 'O-O'))
+        if v is None:
+            v = CTC_ABSTAIN
+            abstained += 1
+        else:
+            scored += 1
+        logp.append(v)
+
+    # Applied RELATIVE to the best-supported candidate in this list, so the
+    # best one gets exactly 0 and the rest a penalty for how much less the raw
+    # logits support them.
+    #
+    # This cannot change the ranking: subtracting one constant from every
+    # candidate in the SAME list is an affine shift, so the order - and the
+    # measured +89 - is identical to adding the raw log-probability. What it
+    # buys is everything around the ranking:
+    #   - the score stays on its familiar scale, instead of every fix picking
+    #     up a -30..-150 offset that no absolute constant downstream expects;
+    #   - the UI pill reads as a penalty only where there IS one, rather than
+    #     painting a large red 'ctc' on every candidate including the winner;
+    #   - if every candidate abstains the term becomes exactly 0 for all of
+    #     them, so "no evidence" costs nothing rather than shifting the list.
+    #
+    # The one thing it discards is CROSS-list comparability: a raw score would
+    # carry "this whole cell is badly read" between two lists, which is real
+    # information when the dual-sheet merge in zugwise-worker.js picks between
+    # a primary and secondary fix by unified_score. That comparison is
+    # UNMEASURED either way (the corpus evidence is entirely within-list).
+    # Whoever wires the logits producer must at minimum pass the SAME logits to
+    # both searches, or the two lists are not comparable at all.
+    # ANCHORED AT CTC_ABSTAIN, a global constant - NOT at max(logp), which is a
+    # property of this particular list.
+    #
+    # Both anchors are affine shifts of W_CTC * v, so within any one list they
+    # order the candidates identically and the measured weight is untouched. The
+    # difference is entirely CROSS-list, which the paragraph above already
+    # flagged as the cost of the old anchor and which turned out to bite in
+    # practice: Greedy's post-funnel list and the Fix Suggestions panel's list
+    # are different lists, so the same candidate carried two different scores
+    # (user-reported: 20.W hxg4 as 70 in Greedy and 54 in the panel, and Greedy
+    # itself scoring 26.B Qd2+->Qg3+ as 21 in one run and 109 in the next).
+    # A constant anchor makes those numbers the same number again.
+    #
+    # It also flips the sign of the signal's presentation: a candidate BEATING
+    # the abstain reference now earns a bonus instead of every candidate being
+    # penalised relative to the list's best. An all-abstaining list still costs
+    # exactly zero, which is the property that mattered. Candidates genuinely
+    # worse than the abstain reference still read negative, and that is
+    # information rather than a display artefact - CTC_ABSTAIN is the measured
+    # TYPICAL score, not a floor.
+    for f, v in zip(fixes, logp):
+        term = W_CTC * (v - CTC_ABSTAIN)
+        f['unified_score'] = f.get('unified_score', 0) + term
+        sc = f.get('score_components')
+        if isinstance(sc, dict):
+            sc['ctc'] = round(term, 1)
+
+    fixes.sort(key=lambda x: -x['unified_score'])
+    if verbose:
+        print(f"   [CTC] Re-scored {scored} candidate(s) against raw logits, "
+              f"{abstained} abstained (W_CTC={W_CTC}, anchor {CTC_ABSTAIN:.2f})")
+    return fixes
+
+
+def _board_before_ply(moves: List[str], ply: int):
+    """Board as it stands just before `ply`, or None if the prefix is not legal.
+
+    A prefix that will not replay is normal here, not an error: the fix list is
+    built while the game is broken, and a candidate sitting behind an earlier
+    bad move has no reconstructable position. Those candidates abstain.
+    """
+    b = chess.Board()
+    for m in moves[:ply]:
+        try:
+            b.push_san(m)
+        except Exception:
+            return None
+    return b
+
+
+def _boards_before_plies(moves: List[str], plies):
+    """{ply: board} for several plies in ONE replay.
+
+    A fix list touches a median of 2 plies, and replaying from the start for
+    each of them is the obvious way to make a per-candidate signal cost more
+    than the search it informs. Walk once, snapshot as we pass.
+
+    A prefix that will not replay stops the walk: everything at or beyond it has
+    no reconstructable position and abstains, which is the same rule
+    _board_before_ply applies for the single-ply case.
+    """
+    want = sorted({p for p in plies if isinstance(p, int) and p >= 0})
+    out = {}
+    if not want:
+        return out
+    b = chess.Board()
+    i = 0
+    for ply in want:
+        while i < ply:
+            if i >= len(moves):
+                return out
+            try:
+                b.push_san(moves[i])
+            except Exception:
+                return out
+            i += 1
+        out[ply] = b.copy(stack=False)
+    return out
+
+
+# Prefix -> position key. The key depends ONLY on the moves replayed to reach it,
+# so an entry can never go stale; a hit is exact or absent. This exists because
+# the table lookup needs the KEY, not the board, and rebuilding a board costs
+# ~1.6 ms in CPython (several times that in Pyodide) while a search makes one
+# ranking call per node expansion. Bounded and simply cleared - a stampede of
+# distinct prefixes should cost memory nothing, and losing the cache costs only
+# speed.
+_POSITION_KEY_CACHE = {}
+_POSITION_KEY_CACHE_MAX = 4096
+
+
+def position_key_for_prefix(moves: List[str], ply: int):
+    """Key for the position before `ply`, or None if the prefix will not replay."""
+    k = tuple(moves[:ply])
+    hit = _POSITION_KEY_CACHE.get(k, _MISS)
+    if hit is not _MISS:
+        return hit
+    b = _board_before_ply(moves, ply)
+    val = position_key(b) if b is not None else None
+    if len(_POSITION_KEY_CACHE) >= _POSITION_KEY_CACHE_MAX:
+        _POSITION_KEY_CACHE.clear()
+    _POSITION_KEY_CACHE[k] = val
+    return val
+
+
+_MISS = object()
+
+
+def position_key(board) -> str:
+    """The four FEN fields the prior's encoder actually reads.
+
+    en_passant='fen' is REQUIRED, not stylistic. python-chess's fen() defaults
+    to en_passant='legal' and prints '-' when no capture is available; chess.js
+    prints the square after ANY double push; and encode.py trains on the raw
+    board.ep_square, so raw is the convention that matches the model. A default
+    fen() here would produce keys that silently fail to match the browser's for
+    every position after a double pawn push with no legal capture - the signal
+    would just quietly go missing there. Verified against both libraries.
+    """
+    return ' '.join(board.fen(en_passant='fen').split(' ')[:4])
+
+
+def apply_prior_rescore(fixes: List[dict], prior, moves: List[str],
+                        verbose: bool = False) -> List[dict]:
+    """Add the human-move-prior term to every fix, then re-sort.
+
+    `prior` is either a callable(board, sans) -> {san: log-prob} (torch, on the
+    CLI) or a dict {position_key: {san: log-prob}} (the browser, which must
+    evaluate ONNX outside Python). Pass None to disable; the signal is then wholly absent
+    rather than partially applied, for the same reason as the CTC term - a fix
+    list is merged from FOUR construction sites and a partially applied term
+    rewards whichever site failed to compute it.
+
+    Candidates are grouped by ply because each ply is a DIFFERENT position, and
+    a log-probability is only meaningful against the position it was computed
+    in. Grouping is also what makes the callable form affordable: one forward
+    pass per distinct ply, and a fix list touches a median of 2.
+
+    Mutates the dicts in place (adding score_components['prior']) and returns
+    the list re-sorted by the updated unified_score.
+    """
+    if prior is None:
+        prior = _DEFAULT_MOVE_PRIOR
+    if not W_PRIOR or prior is None or not fixes:
+        return fixes
+
+    is_table = isinstance(prior, dict)
+    by_ply = {}
+    for i, f in enumerate(fixes):
+        by_ply.setdefault(f.get('ply'), []).append(i)
+
+    # The callable form needs BOARDS (it evaluates the network on them); the
+    # table form needs only the KEY, which is cached per prefix. Build boards
+    # only for the form that actually uses them.
+    boards = {} if is_table else _boards_before_plies(moves, by_ply.keys())
+
+    logp = [None] * len(fixes)
+    for ply, idxs in by_ply.items():
+        sans = [str(fixes[i].get('san') or '') for i in idxs]
+        try:
+            if is_table:
+                # Keyed by POSITION. A ply names a position only relative to
+                # some move list, and Python ranks against `moves` - the current
+                # list of whichever path it is on - so a ply-keyed table silently
+                # described a different position as soon as a search applied a
+                # fix. A position key cannot go stale: it either matches what the
+                # browser scored or it is absent, and absent abstains.
+                _k = (position_key_for_prefix(moves, ply)
+                      if isinstance(ply, int) and ply >= 0 else None)
+                table = (prior.get(_k) or {}) if _k is not None else {}
+            else:
+                board = boards.get(ply)
+                table = prior(board, sans) if board is not None else {}
+        except Exception as e:
+            # A prior that raises must not take the whole fix list with it: the
+            # ranking is still correct without the signal, and losing the panel
+            # entirely is a much worse failure than losing one term.
+            if verbose:
+                print(f"   [PRIOR] scoring failed at ply {ply}: {type(e).__name__}: {e}")
+            table = {}
+        for i in idxs:
+            v = table.get(str(fixes[i].get('san') or ''))
+            if v is not None:
+                logp[i] = float(v)
+
+    scored = sum(1 for v in logp if v is not None)
+    logp = [PRIOR_ABSTAIN if v is None else v for v in logp]
+
+    # Anchored at PRIOR_ABSTAIN, exactly as the CTC term is anchored at
+    # CTC_ABSTAIN - see the long note there for why a list-relative anchor had
+    # to go. Both are affine shifts of W_PRIOR * v, so the ORDER, and therefore
+    # the measured +85 (which was fitted on the raw absolute form), is unchanged.
+    # An all-abstaining list still costs exactly zero: every term becomes
+    # W_PRIOR * (ABSTAIN - ABSTAIN).
+    for f, v in zip(fixes, logp):
+        term = W_PRIOR * (v - PRIOR_ABSTAIN)
+        f['unified_score'] = f.get('unified_score', 0) + term
+        sc = f.get('score_components')
+        if isinstance(sc, dict):
+            sc['prior'] = round(term, 1)
+
+    fixes.sort(key=lambda x: -x['unified_score'])
+    if verbose:
+        print(f"   [PRIOR] Re-scored {scored} of {len(fixes)} candidate(s) over "
+              f"{len(by_ply)} ply/plies, {len(fixes) - scored} abstained "
+              f"(W_PRIOR={W_PRIOR}, anchor {PRIOR_ABSTAIN:.2f})")
+    return fixes
+
+
+def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: int, verbose: bool = False, verify_top_n: int = 15, ctc_logits=None, move_prior=None) -> List[dict]:
     """
     Post-process fixes after Phase 1 + Phase 2 merge.
 
@@ -4560,13 +5336,17 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
     4. Re-sort after penalties
     5. Verify top candidates (re-check absurdities with full quiescence)
     6. General keep_as_is UI marking
-    7. Final summary table
+    7. CTC constrained re-OCR re-score (last, so every construction site's
+       fixes get the term - see the W_CTC comment block)
+    8. Final summary table
 
     Args:
         fixes: Merged list of Phase 1 + Phase 2 fix dicts (mutated in place)
         moves: The original move list
         stuck_ply: The ply where the game is stuck
         verbose: Print debug info
+        ctc_logits: Optional {ply: [seq_len][vocab] log-probs} for the CTC
+            re-score. None (the default) leaves the signal entirely absent.
 
     Returns:
         Processed and sorted list of fixes (top 50)
@@ -4645,17 +5425,64 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
     # - Reaches exactly the original stuck point: -70 (lateral move, no progress)
     # - Falls short of original stuck point: -70 + -10 per ply short (wrong fix)
     #
+    # reach == stuck_ply is the DO-NOTHING baseline: the unmodified game already
+    # plays legally that far by definition, so such a fix has produced no reach
+    # evidence at all and the flat -70 is the right default.
+    #
+    # EXCEPTION - direct stuck-anchored evidence (June 2026):
+    # reach is only a PROXY for "this fix explains the stuck point". The
+    # check-enabling bonus is DIRECT evidence of the same thing: the stuck move
+    # carries a '+', and this fix newly enables a checking move that resembles
+    # its OCR text. When we hold the direct evidence we do not need the proxy,
+    # and demanding advancement on top of it assumes the stuck region contains
+    # only ONE error. Christine 25.W 'Rxe1'->'Kxe1' cannot advance past 26.B no
+    # matter how right it is, because 26.W 'Ra1' is misread too ('Rg1'): the
+    # correct root-cause fix was charged -70 for the SECOND error's existence
+    # and lost to a 67%-similarity guess at the stuck ply.
+    # Such a fix still has not DEMONSTRATED progress, so it does not go free.
+    # It pays a reduced lateral penalty (half), and separately gives back the
+    # inflated reach bonus - granted against the Phase-2 stuck ply, where merely
+    # arriving at the real stuck point scores as if it were progress. Both parts
+    # are load-bearing: the give-back removes a double count, and the halved
+    # penalty is what keeps the chk_en family from vaulting over the Phase-1
+    # candidates. chk_en depends heavily on the position the fix produces rather
+    # than on the fix itself, so it tends to fire for a large SLICE of one ply's
+    # candidates at once - measured over the 10 recorded baselines it touches
+    # ~46% of the candidates at a ply it fires at all (mean value 54). In the
+    # Christine Phase-2 position it hit all nine 25.B candidates at an identical
+    # 54. A full waiver therefore promotes same-ply junk alongside the right fix.
+    # (An earlier version of this comment claimed chk_en is near-constant across
+    # EVERY candidate at a ply. That overstated one observed position; the
+    # measured spread among candidates it touches is ~13.6, not 0.)
+    # Falling SHORT of the stuck point is still fully penalized - that is a fix
+    # that made things worse.
+    #
+    # NOTE: this adds no new signal. It changes how an existing reconstruction
+    # signal (reach) is discounted, and defers to an existing permitted one
+    # (check symbol matching). No move-quality judgement enters here.
+    #
     # Skip KEEP-AS-IS fixes (already removed above).
+    _REACH_COMPONENT_KEYS = ('reach', 'reach_tb', 'reach10', 'complete')
+    PHASE2_LATERAL_PENALTY = 70
     phase2_penalized = 0
     for f in fixes:
         if f.get('before_frontier') and not f.get('is_keep_as_is'):
             if f['reach'] > stuck_ply:
                 phase2_penalty = 0  # Good - advances past original stuck point
             elif f['reach'] == stuck_ply:
-                phase2_penalty = 70  # Reaches stuck point but doesn't advance
+                if f.get('check_enabling_bonus', 0) > 0 and 'score_components' in f:
+                    # Direct stuck-anchored evidence: give back the inflated
+                    # reach bonus and halve the lateral penalty.
+                    comps = f['score_components']
+                    reach_granted = max(0, sum(comps.get(k, 0) or 0
+                                               for k in _REACH_COMPONENT_KEYS))
+                    phase2_penalty = reach_granted + PHASE2_LATERAL_PENALTY // 2
+                    f['phase2_reach_neutralized'] = True
+                else:
+                    phase2_penalty = PHASE2_LATERAL_PENALTY  # Reaches stuck point but doesn't advance
             else:
                 shortfall = stuck_ply - f['reach']
-                phase2_penalty = 70 + shortfall * 10  # Heavy penalty
+                phase2_penalty = PHASE2_LATERAL_PENALTY + shortfall * 10  # Heavy penalty
             if phase2_penalty > 0:
                 f['unified_score'] -= phase2_penalty
                 f['phase2_reach_penalty'] = phase2_penalty
@@ -4663,9 +5490,10 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
                     f['score_components']['p2_pen'] = -phase2_penalty
                 phase2_penalized += 1
                 if verbose:
+                    why = " (CHK-EN: reach bonus neutralized, not punished)" if f.get('phase2_reach_neutralized') else ""
                     print(f"   [P2 PENALTY] {ply_to_str(f['ply'])} '{f['ocr']}'->'{f['san']}' "
                           f"reach={ply_to_str(f['reach'])} vs stuck={ply_to_str(stuck_ply)} "
-                          f"-> penalty={phase2_penalty}")
+                          f"-> penalty={phase2_penalty}{why}")
 
     if phase2_penalized > 0:
         if verbose:
@@ -5066,6 +5894,17 @@ def _postprocess_phase2_fixes(fixes: List[dict], moves: List[str], stuck_ply: in
         elif not f.get('is_keep_as_is'):
             f['keep_as_is'] = False
 
+    # === CTC CONSTRAINED RE-OCR ===
+    # Applied LAST, and before the top-50 truncation so the term can actually
+    # change which fixes survive. No-op unless the caller supplied logits.
+    fixes = apply_ctc_rescore(fixes, ctc_logits, verbose)
+
+    # === HUMAN MOVE PRIOR ===
+    # After CTC and, like it, before the top-50 truncation so the term can
+    # change which fixes survive. The two are near-independent (~84% additive),
+    # so order between them does not matter; order against the truncation does.
+    fixes = apply_prior_rescore(fixes, move_prior, moves, verbose)
+
     top_fixes = fixes[:50]
 
     # === FINAL SUMMARY ===
@@ -5135,7 +5974,8 @@ class BacktrackSearchState:
                  min_ply: int = 0, fixed_plies: Set[int] = None, locked_plies: Set[int] = None,
                  verbose: bool = False,
                  phase_label: str = None, phase2_depth: int = 5,
-                 original_stuck_ply: int = None, stuck_reason: str = None):
+                 original_stuck_ply: int = None, stuck_reason: str = None,
+                 ctc_logits=None, move_prior=None):
         self.moves = moves
         self.stuck_ply = stuck_ply
         self.ocr_lookup = ocr_lookup
@@ -5145,6 +5985,9 @@ class BacktrackSearchState:
         self.verbose = verbose
         self.phase2_depth = phase2_depth
         self.stuck_reason = stuck_reason
+        # {ply: [seq_len][vocab] log-probs}; None disables the CTC term.
+        self.ctc_logits = ctc_logits
+        self.move_prior = move_prior
 
         # Results
         self.fixes = []
@@ -5391,7 +6234,7 @@ class BacktrackSearchState:
                         # pass), so the component list is a subset of Phase 1.
                         'score_components': {
                             'sim': round(_bf_char_sim * 40, 1),
-                            'hi_sim': 25 if _bf_char_sim >= 0.90 else 0,
+                            'hi_sim': 25 * W_HI_SIM if _bf_char_sim >= 0.90 else 0,
                             'reach': min(_bf_reach_imp * 10, 50),
                             'complete': 5 if _bf_completes else 0,
                             'ocr_c': round(_bf_ocr_conf * 15, 1),
@@ -5540,7 +6383,9 @@ class BacktrackSearchState:
         # === SHARED POST-PHASE-2 PROCESSING ===
         # Handles KEEP-AS-IS capping/removal, reach penalty, verify, UI marking, summary.
         # Safe to call even when Phase 2 didn't run (loops simply find no before_frontier fixes).
-        self.final_fixes = _postprocess_phase2_fixes(self.fixes, self.moves, self.stuck_ply, self.verbose)
+        self.final_fixes = _postprocess_phase2_fixes(self.fixes, self.moves, self.stuck_ply, self.verbose,
+                                                    ctc_logits=self.ctc_logits,
+                                                    move_prior=self.move_prior)
 
         return self.final_fixes
 
@@ -5573,9 +6418,13 @@ def find_fixes_two_phase(
     min_ply: int = 0,  # The "frontier" - normally start search here
     phase2_depth: int = 999,  # How far before frontier to search (0=skip Phase 2, 999=full game)
     verify_top_n: int = 15,  # How many top fixes to verify with full quiescence
-    stuck_reason: str = None  # If 'illegal' (from validation), skip the internal EAD replay
+    stuck_reason: str = None,  # If 'illegal' (from validation), skip the internal EAD replay
                               # so effective_stuck_ply stays at stuck_ply. Phase 1 only —
                               # Phase 2 re-anchors at frontier-1 and keeps its own EAD.
+    ctc_logits=None,  # {ply: [seq_len][vocab] log-probs} for the CTC re-score.
+                      # None leaves the signal absent. See the W_CTC block.
+    move_prior=None   # callable(board, sans)->{san: logp}, or {ply: {san: logp}}.
+                      # None leaves the signal absent. See the W_PRIOR block.
 ) -> List[dict]:
     """
     Two-phase fix finding for better performance.
@@ -5742,7 +6591,8 @@ def find_fixes_two_phase(
     # === SHARED POST-PHASE-2 PROCESSING ===
     # Handles KEEP-AS-IS capping/removal, reach penalty, verify, UI marking, summary.
     # Safe to call even when Phase 2 didn't run (loops simply find no before_frontier fixes).
-    return _postprocess_phase2_fixes(fixes, moves, stuck_ply, verbose, verify_top_n=verify_top_n)
+    return _postprocess_phase2_fixes(fixes, moves, stuck_ply, verbose, verify_top_n=verify_top_n,
+                                    ctc_logits=ctc_logits, move_prior=move_prior)
 
 
 # =============================================================================

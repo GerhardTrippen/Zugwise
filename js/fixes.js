@@ -46,7 +46,12 @@ var SCORE_COMPONENT_DESCRIPTIONS = {
   stuck:       'Bonus for fixes AT the stuck ply that advance',
   fut_cap:     'Bonus if a future OCR move references this fix\u2019s square',
   p2_pen:      'Phase-2 penalty (fixes found during extended search)',
-  v_mate:      'Verification penalty (fix creates material loss confirmed by quiescence)'
+  v_mate:      'Verification penalty (fix creates material loss confirmed by quiescence)',
+  ctc:         'CTC re-OCR: how well the raw cell logits support this move',
+  // The prior installs silently and every failure path degrades to no signal,
+  // so this pill is the only visible evidence it ran at all: present and green
+  // means it scored the candidate, absent means it abstained (term exactly 0).
+  prior:       'Human-move prior: how often club players play this move here'
 };
 
 // Render a single color-coded score-component pill for the fix-details panel.

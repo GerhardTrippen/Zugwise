@@ -92,6 +92,56 @@ await micropip.install('chess')
 // MESSAGE HANDLER
 // -----------------------------------------------------------------------------
 
+
+// -----------------------------------------------------------------------------
+// MOVE PRIOR (feeds fix_finding's W_PRIOR re-score)
+// -----------------------------------------------------------------------------
+
+/**
+ * Install this game's human-move-prior table as the process-wide default in
+ * Python, so EVERY ranking path in this worker uses it — the same reason the
+ * CTC logits are installed this way rather than threaded through each call.
+ *
+ * DATA, NOT A MODEL. The prior is an ONNX network, and this worker deliberately
+ * runs no ONNX (see the file header). It also could not help if it did: Pyodide
+ * cannot call an async JS session synchronously from Python. So move-prior-worker.js
+ * evaluates the positions and what arrives here is a plain table
+ * {ply: {san: logProb}} — exactly the dict form fix_finding.apply_prior_rescore
+ * accepts.
+ *
+ * Ply keys arrive as STRINGS (a JS object has no integer keys) and are converted
+ * back to ints, because the Python side looks them up with the fix's integer
+ * ply. A string key would match nothing and every candidate would silently
+ * abstain — the failure mode that looks exactly like "the signal did nothing".
+ */
+function setMovePrior(table) {
+    if (!pyodide) return { plies: 0 };
+    pyodide.globals.set('_mp_table', table || {});
+    // Keys are POSITIONS (see MovePrior.positionKey), so they stay strings and
+    // must NOT be coerced to ints the way the old ply keys were. They also
+    // cannot go stale: Python rebuilds the key from the list it is ranking, so
+    // an entry either describes that exact position or is absent, and absent
+    // abstains. That is what lets one table serve every search path at once.
+    const n = pyodide.runPython([
+        '_mp = _mp_table.to_py() if hasattr(_mp_table, "to_py") else (_mp_table or {})',
+        '_mp = {str(_k): dict(_v) for _k, _v in _mp.items()}',
+        'set_default_move_prior(_mp if _mp else None)',
+        'len(_mp)'
+    ].join('\n'));
+    console.log('[PRIOR] move prior installed for ' + n + ' position(s)');
+    pyodide.globals.set('_mp_table', null);
+    return { plies: n };
+}
+
+/**
+ * Drop the installed prior. Call on game switch: a stale table would score this
+ * game's candidates against another game's positions.
+ */
+function clearMovePrior() {
+    if (pyodide) pyodide.runPython('set_default_move_prior(None)');
+    return { cleared: true };
+}
+
 onmessage = async function(e) {
     const { id, type, data } = e.data;
 
@@ -190,8 +240,28 @@ onmessage = async function(e) {
                 result = checkAbsurdities(data.moves, data.candidates);
                 break;
 
+            case 'set-move-prior':
+                result = setMovePrior(data && data.table);
+                break;
+
+            case 'clear-move-prior':
+                result = clearMovePrior();
+                break;
+
+            case 'set-ctc-logits':
+                result = setCtcLogits(data && data.sheets);
+                break;
+
+            case 'clear-ctc-logits':
+                result = clearCtcLogits();
+                break;
+
             case 'constrained-reocr':
                 result = constrainedReOCR(data.ply, data.legalMoves, data.ocrMoves);
+                break;
+
+            case 'export-logits':
+                result = exportLogits(data && data.keys, data && data.pass);
                 break;
 
             case 'constrained-reocr-dual':
@@ -216,12 +286,97 @@ onmessage = async function(e) {
     }
 };
 
+// -----------------------------------------------------------------------------
+// CTC LOGITS (feeds fix_finding's W_CTC re-score)
+// -----------------------------------------------------------------------------
+
+/**
+ * Install this game's raw logits as the process-wide default in Python, so
+ * EVERY ranking path in this worker uses them — interactive find-fixes and the
+ * greedy/beam/dijkstra searches alike. Making the algorithms rank on the same
+ * evidence as the Fix Suggestions panel is the entire point: a signal present
+ * in one and missing from the other is exactly how the panel and the algorithms
+ * came to disagree on Christine's 7.W (panel ranked the correct Bg5 first, the
+ * algorithms ranked a 4.W fabrication first at 134 vs 113).
+ *
+ * Bytes in, decoded lazily. A fix list touches a MEDIAN OF 2 distinct plies, so
+ * expanding a whole sheet into Python floats would waste ~98% of the work — and
+ * this Pyodide has no numpy to do it quickly. See logits_io.LazyPlyLogits.
+ *
+ * NOTE the bare Python names: the loader flattens every backend module into ONE
+ * namespace (python-loader.js strips the local imports), so there is no
+ * `logits_io` module object here — `LazyPlyLogits` and `set_default_ctc_logits`
+ * are globals.
+ *
+ * @param {Array<{data: ArrayBuffer, plies: number[]}>} sheets - in preference
+ *        order; the first sheet to cover a ply wins.
+ * @returns {{plies: number}} how many plies ended up addressable
+ */
+function setCtcLogits(sheets) {
+    if (!pyodide) return { plies: 0 };
+    pyodide.globals.set('_ctc_sheets', (sheets || []).map(function(s) {
+        return { data: new Uint8Array(s.data), plies: s.plies };
+    }));
+    const n = pyodide.runPython(
+        '_lz = LazyPlyLogits()\n' +
+        'for _s in _ctc_sheets:\n' +
+        '    _lz.add(bytes(_s.data.to_py()), [int(_p) for _p in _s.plies])\n' +
+        'set_default_ctc_logits(_lz if len(_lz) else None)\n' +
+        'len(_lz)\n'
+    );
+    console.log('[CTC] logits installed for ' + n + ' ply/plies');
+    pyodide.globals.set('_ctc_sheets', null);
+    return { plies: n };
+}
+
+/**
+ * Drop the installed logits. Call on game switch: stale logits would score the
+ * right moves against another game's handwriting, silently and confidently.
+ */
+function clearCtcLogits() {
+    if (pyodide) pyodide.runPython('set_default_ctc_logits(None)');
+    return { cleared: true };
+}
+
 // =============================================================================
 // OCR WITH BEAM DECODER
 // =============================================================================
 
 // Storage for per-ply logits (populated during OCR, keyed by "moveNum_color")
 const storedLogits = new Map();
+
+/**
+ * Return the stored logits for a REQUESTED set of cell keys, for the
+ * .logits.bin sidecar. Mirrors exportLogits in ocr-worker.js — this worker
+ * keeps its OWN storedLogits for the non-pool path, so both need it.
+ *
+ * Key-driven rather than "everything": storedLogits is never cleared (the
+ * constrained re-OCR passes read it back), so it accumulates across a batch
+ * run; asking for one sheet's keys bounds the response to that sheet. The
+ * Float32Arrays are COPIED by structured clone, never transferred — the worker
+ * must keep its own copy.
+ *
+ * @param {string[]} keys
+ * @returns {{seqLen: number|null, vocabSize: number|null, cells: Object}}
+ */
+function exportLogits(keys, pass) {
+    const cells = {};
+    let seqLen = null, vocabSize = null, stale = 0;
+    (keys || []).forEach(function(k) {
+        const entry = storedLogits.get(k);
+        if (!entry) return;
+        // A key that has since been rewritten by a LATER pass (the next page,
+        // or the next game in a batch) is not this pass's cell. Skipping it
+        // makes the caller's cell count come up short, which refuses the whole
+        // sidecar — the loud, correct outcome. Returning it would attach one
+        // game's evidence to another game's moves, silently.
+        if (pass && entry.pass && entry.pass !== pass) { stale++; return; }
+        cells[k] = entry.data;
+        if (seqLen === null) { seqLen = entry.seqLen; vocabSize = entry.vocabSize; }
+    });
+    return { seqLen: seqLen, vocabSize: vocabSize, cells: cells, stale: stale };
+}
+
 
 const beamDecoder = new BeamDecoder(15, 5);  // beamWidth=15, topK=5
 
@@ -307,12 +462,22 @@ async function runOCR(imageData, width, height, cellBelow = null, moveInfo = nul
     // Get color from moveInfo for grammar-aware decoding
     const color = moveInfo?.color || null;
     
-    // Store logits for potential constrained re-OCR later
-    storedLogits.set(moveLabel, { data: logProbs, seqLen, vocabSize });
+    // Store logits for potential constrained re-OCR later.
+    //
+    // `pass` stamps WHICH OCR pass produced this cell. The key is only
+    // "<moveNum>_<color>", which is NOT unique across a batch run: page 2 of a
+    // sheet restarts move numbering, and every game has a 1_w. Entries are
+    // never evicted (constrained re-OCR reads them back at any time), so a key
+    // always holds the MOST RECENT writer. Order alone keeps the sidecar
+    // export honest today, and the stamp is what stops that from being a
+    // silent correctness dependency — see exportLogits.
+    const _pass = (moveInfo && moveInfo.pass) || null;
+    const _game = (moveInfo && moveInfo.game) || null;
+    storedLogits.set(moveLabel, { data: logProbs, seqLen, vocabSize, pass: _pass, game: _game });
     // If sheet ID provided (dual-sheet mode), also store under sheet-specific key
     if (moveInfo?.sheet) {
         const sheetKey = `${moveLabel}_sheet${moveInfo.sheet}`;
-        storedLogits.set(sheetKey, { data: logProbs, seqLen, vocabSize });
+        storedLogits.set(sheetKey, { data: logProbs, seqLen, vocabSize, pass: _pass, game: _game });
     }
 
     const _tAfterSoftmax = OCR_TIMING ? performance.now() : 0;

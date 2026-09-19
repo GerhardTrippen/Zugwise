@@ -11,13 +11,114 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 from helpers import (
     try_move, count_changes, get_semantic_changes, infer_move_squares,
     piece_value, _is_valid_move_notation, _disambig_consistent_with_move,
-    extract_destination
+    extract_destination, ply_to_str
 )
-from absurdity import would_capture_be_bad, is_piece_adequately_defended, is_piece_genuinely_hanging
+from absurdity import (would_capture_be_bad, is_piece_adequately_defended,
+                       is_piece_genuinely_hanging, is_apparently_hanging,
+                       find_free_captures)
 from play import is_bad_trade_move, check_piece_hanging
 
 # Constants
 OCR_ALT_MIN_CONFIDENCE = 0.05
+
+
+# =============================================================================
+# STANDING FREE CAPTURE WARNING  (diagnostic text only - never ranks anything)
+# =============================================================================
+# EAD answers "did the move just played leave something hanging?" and is
+# deliberately quiet in two situations: it acquits when the NEXT cell cannot be
+# parsed (the opponent probably did capture, the cell is just corrupt - measured
+# right 16 of 18 times on the corpus), and it never fires at all when the hang
+# was created by the OPPONENT's move rather than by the mover's own.
+#
+# Both silences were correct in the reported game and both hid the same fact.
+# Round 3 Board 4: 17...Qa5+ was read as Qc7. Downstream, 20.Nd5 then attacks a
+# queen that is not really there, 20...f6 does not save it, and the stop at
+# 21.W says only "Be5 is illegal" - true, and no help at all. The user's own
+# summary is the detector's missing sentence: "Black lets the queen hang and
+# White does not capture either. It's getting a bit absurd."
+#
+# So say it. This is a NOTE ON THE STOP, not a signal: it never enters a score,
+# never reorders a panel, never suppresses a fix. It reports a fact about the
+# board that the operator cannot see from a one-line illegality message.
+#
+# Fires only when the hang has SURVIVED A MOVE BY ITS OWNER - the owner had a
+# chance to save the piece and did not. That gate is what keeps it off the
+# ordinary case (opponent hangs something, you are about to take it, the cell
+# that takes it is just misread), which is the shape of all 18 corpus
+# acquittals: there the hang is one ply old and the owner has had no turn.
+#
+# Cost: one quiescence-backed find_free_captures at the stop, then a cheap
+# is_apparently_hanging walk backwards. Same hybrid discipline as absurdity.py.
+MAX_HANG_WALKBACK = 40   # plies; a hang older than 20 moves is not diagnostic
+
+
+def describe_standing_free_capture(board: chess.Board, moves: List[str],
+                                   stuck_at: int) -> Optional[str]:
+    """One sentence about a major piece that has been free for a while, or None.
+
+    board    position AT the stop (before the stuck move); board.turn is the
+             side that could capture
+    moves    the move list being validated
+    stuck_at index of the stuck move
+
+    Returns text for the UI, or None when there is nothing worth saying.
+    """
+    try:
+        free_caps = find_free_captures(board, board.turn)
+        if not free_caps:
+            return None
+
+        # Most valuable genuinely-free capture (quiescence already vetted it).
+        move, captured, gain = max(free_caps, key=lambda fc: fc[2])
+        square = move.to_square
+        sq_name = chess.square_name(square)
+        capture_san = board.san(move)
+
+        # Walk back to the ply that created the hang, using the cheap Layer-1
+        # test. Stop as soon as the piece was NOT hanging (or was elsewhere).
+        start_ply = stuck_at
+        probe = chess.Board()
+        history = []
+        for i in range(min(stuck_at, len(moves))):
+            m = try_move(probe, moves[i])
+            if not m:
+                history = []
+                break
+            probe.push(m)
+            history.append(probe.copy())
+        if not history:
+            return None
+
+        limit = max(0, len(history) - MAX_HANG_WALKBACK)
+        for i in range(len(history) - 1, limit - 1, -1):
+            snap = history[i]
+            pc = snap.piece_at(square)
+            if (pc is None or pc.color == board.turn
+                    or pc.piece_type != captured.piece_type
+                    or not is_apparently_hanging(snap, square, pc)):
+                break
+            start_ply = i
+
+        # The hang must have survived at least one move by its OWNER. If it was
+        # created by the move immediately before the stop, the owner has not had
+        # a turn yet and there is nothing absurd about it.
+        if stuck_at - start_ply < 2:
+            return None
+
+        owner = 'White' if captured.color == chess.WHITE else 'Black'
+        piece_word = chess.piece_name(captured.piece_type)
+        since = f"{ply_to_str(start_ply)} {moves[start_ply]}"
+        span = stuck_at - start_ply
+        # Hedged deliberately, because BOTH readings are common and the note
+        # cannot tell them apart: the capture really is the move here (the
+        # ordinary case, and the shape of all 18 corpus EAD acquittals), or the
+        # board is wrong because something upstream was misread.
+        return (f"{owner}'s {piece_word} has stood en prise on {sq_name} since {since} "
+                f"({span} plies) and {capture_san} is still available. "
+                f"If the move here is not that capture, an earlier move may be misread.")
+    except Exception:
+        return None
 PERSISTENCE_THRESHOLD = 2
 
 
@@ -916,6 +1017,12 @@ def validate_moves(
         'legal_moves': sorted([board.san(m) for m in board.legal_moves]) if stuck_at is not None else [],
         'is_checkmate': board.is_checkmate(),
     }
+
+    # Diagnostic note on the stop (never a ranking signal - see the block above).
+    if stuck_at is not None:
+        note = describe_standing_free_capture(board, moves, stuck_at)
+        if note:
+            result['hanging_warning'] = note
 
     if pending_confirmation:
         result['pending_confirmation'] = pending_confirmation

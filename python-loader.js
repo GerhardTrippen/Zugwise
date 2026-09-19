@@ -20,6 +20,8 @@ async function loadPythonModules(pyodide) {
         'constraints.py',
         'missing_moves.py',
         'lenient_normalize.py',
+        'logits_io.py',
+        'ctc_align.py',
         'fix_finding.py',
         'full_game_search.py',
         'dijkstra_search.py',
@@ -29,7 +31,7 @@ async function loadPythonModules(pyodide) {
     // List of local module names to strip from imports
     const localModules = [
         'data_structures', 'helpers', 'similarity', 'absurdity',
-        'constraints', 'missing_moves', 'lenient_normalize', 'fix_finding', 'play',
+        'constraints', 'missing_moves', 'lenient_normalize', 'ctc_align', 'logits_io', 'fix_finding', 'play',
         'chess_quiescence', 'full_game_search', 'dijkstra_search', 'validation'
     ];
     const singleLinePattern = new RegExp(

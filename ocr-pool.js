@@ -152,6 +152,40 @@ class OcrPool {
         return this._sendTo(this._workerForPly(ply), 'constrained-reocr-dual', { ply, legalMoves });
     }
 
+    /**
+     * Collect stored logits for a sheet's cells, for the .logits.bin sidecar.
+     *
+     * Asks EVERY worker for the full key list rather than routing each key to
+     * its owner by affinity. Affinity would be exact today, but it is derived
+     * from a `ply % size` that must have been the same when the cell was OCR'd
+     * — and a single stale assumption there would silently drop cells, which
+     * for a sidecar means misaligned or missing evidence rather than a visible
+     * error. Asking everyone costs one extra round trip per worker and cannot
+     * be wrong: each key lives in exactly one worker, so the total data
+     * returned across all of them is still one sheet.
+     *
+     * @param {string[]} keys - cell keys in sidecar order
+     * @param {string} pass - OCR pass token; entries stamped with a different
+     *        pass are skipped as stale (see exportLogits in ocr-worker.js)
+     * @returns {Promise<{seqLen:number|null, vocabSize:number|null, cells:Object}>}
+     */
+    async exportLogits(keys, pass) {
+        const parts = await Promise.all(
+            this.workers.map((_w, i) => this._sendTo(i, 'export-logits', { keys, pass })
+                .catch(() => ({ seqLen: null, vocabSize: null, cells: {} })))
+        );
+        const merged = { seqLen: null, vocabSize: null, cells: {} };
+        for (const p of parts) {
+            if (!p) continue;
+            if (merged.seqLen === null && p.seqLen !== null) {
+                merged.seqLen = p.seqLen;
+                merged.vocabSize = p.vocabSize;
+            }
+            Object.assign(merged.cells, p.cells || {});
+        }
+        return merged;
+    }
+
     // moveInfo carries {num, color}; derive the 0-indexed ply so OCR and its
     // later constrained re-OCR (which only knows ply) hash to the same worker.
     static plyFromMoveInfo(moveInfo) {

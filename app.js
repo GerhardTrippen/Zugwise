@@ -681,22 +681,18 @@ function initBatchHandlers() {
       var opt = document.createElement('option');
       opt.value = p.name;
       opt.textContent = p.name;
+      opt.title = p.name;
       if (p.name === active.name) opt.selected = true;
       batchProfileSelect.appendChild(opt);
     });
-    // Show summary (full multi-page format matching Image tab)
+    // Show summary (shared formatter — this used to be a second copy of the
+    // page-summary loop, which is how it missed the "(repeats P1)" marker).
     var batchProfileSummary = document.getElementById('batch-profile-summary');
     function updateBatchProfileSummary(profile) {
       if (!batchProfileSummary || !profile) return;
-      var parts = [];
-      profile.pages.forEach(function(pg, i) {
-        var desc = pg.format + ' ' + pg.rowCount + 'r';
-        if (pg.headerRows > 0) desc += ' +' + pg.headerRows + 'h';
-        if (pg.footerRows > 0) desc += ' +' + pg.footerRows + 'f';
-        if (pg.startingMove > 1) desc += ' @' + pg.startingMove;
-        parts.push('P' + (i + 1) + ':' + desc);
-      });
-      batchProfileSummary.textContent = parts.join(' | ');
+      batchProfileSummary.textContent = window.SheetProfiles.formatProfileSummary(profile);
+      // Full name on hover — the select truncates on a narrow window.
+      batchProfileSelect.title = profile.name || '';
     }
     updateBatchProfileSummary(active);
     batchProfileSelect.onchange = function() {
@@ -972,7 +968,36 @@ function initBatchHandlers() {
   }
 
   // --- Step 2: Select folder (File System Access API — Chrome/Edge) ---
+
+  /**
+   * Confirm the scan folder is WRITABLE and say so plainly when it is not.
+   *
+   * Everything that makes a round resumable is a write into the folder: the
+   * OCR `.txt` cache, the `.grid.json` coordinate sidecars, `.logits.bin`, and
+   * the per-game/round PGNs. Without write permission those paths take their
+   * silent no-op branch (`if (!this.outputDirHandle) return`) or fall back to a
+   * browser download, so the round looks like it processed fine and then
+   * re-OCRs from scratch next time. Never let that be invisible.
+   */
+  async function _confirmFolderWritable(dirHandle) {
+    if (!window.BatchFolderStore || !dirHandle ||
+        typeof dirHandle.queryPermission !== 'function') return true;
+    var ok = false;
+    try {
+      ok = await window.BatchFolderStore.verifyPermission(dirHandle, 'readwrite');
+    } catch (e) { ok = false; }
+    if (!ok) {
+      log('⚠ Read-only access to "' + (dirHandle.name || 'folder') + '". ' +
+          'OCR results and grid sidecars CANNOT be cached, so this round will be ' +
+          're-OCR\'d from scratch next time, and PGNs will go to your Downloads ' +
+          'folder instead. Re-pick the folder and choose "Edit files" to enable ' +
+          'caching.');
+    }
+    return ok;
+  }
+
   async function _adoptDirHandle(dirHandle) {
+    await _confirmFolderWritable(dirHandle);
     var result = await window.BatchGameList.initFromFolder(dirHandle);
     onBatchFilesDiscovered(result);
     if (window.BatchFolderStore) {
@@ -996,7 +1021,10 @@ function initBatchHandlers() {
       return;
     }
     try {
-      var dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+      // 'readwrite', not 'read': the OCR cache, grid sidecars and PGN saves all
+      // write back into this folder. Asking for read-only made every one of
+      // those silently no-op, so each run re-OCR'd the whole round.
+      var dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
       await _adoptDirHandle(dirHandle);
     } catch (e) {
       if (e.name !== 'AbortError') {
@@ -1024,7 +1052,12 @@ function initBatchHandlers() {
     link.title = 'Re-open the last tournament folder you used';
     link.onclick = async function() {
       try {
-        var ok = await window.BatchFolderStore.verifyPermission(handle, 'read');
+        // Re-authorize for WRITE so the restored folder keeps its OCR cache.
+        // Chromium drops file-system grants between sessions, so this is the
+        // gesture that re-arms caching; fall back to read if write is refused
+        // (_adoptDirHandle then warns that the round cannot be cached).
+        var ok = await window.BatchFolderStore.verifyPermission(handle, 'readwrite');
+        if (!ok) ok = await window.BatchFolderStore.verifyPermission(handle, 'read');
         if (!ok) { log('Permission to access "' + handle.name + '" was denied'); return; }
         await _adoptDirHandle(handle);
       } catch (e) {

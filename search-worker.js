@@ -55,6 +55,108 @@ except Exception:
 
 let searchStateCounter = 0;
 
+// -----------------------------------------------------------------------------
+// CTC LOGITS (feeds fix_finding's W_CTC re-score)
+// -----------------------------------------------------------------------------
+
+/**
+ * Install this game's raw logits as the process-wide default in Python, so
+ * EVERY ranking path in this worker uses them — interactive find-fixes and the
+ * greedy/beam/dijkstra searches alike. Making the algorithms rank on the same
+ * evidence as the Fix Suggestions panel is the entire point: a signal present
+ * in one and missing from the other is exactly how the panel and the algorithms
+ * came to disagree on Christine's 7.W (panel ranked the correct Bg5 first, the
+ * algorithms ranked a 4.W fabrication first at 134 vs 113).
+ *
+ * Bytes in, decoded lazily. A fix list touches a MEDIAN OF 2 distinct plies, so
+ * expanding a whole sheet into Python floats would waste ~98% of the work — and
+ * this Pyodide has no numpy to do it quickly. See logits_io.LazyPlyLogits.
+ *
+ * NOTE the bare Python names: the loader flattens every backend module into ONE
+ * namespace (python-loader.js strips the local imports), so there is no
+ * `logits_io` module object here — `LazyPlyLogits` and `set_default_ctc_logits`
+ * are globals.
+ *
+ * @param {Array<{data: ArrayBuffer, plies: number[]}>} sheets - in preference
+ *        order; the first sheet to cover a ply wins.
+ * @returns {{plies: number}} how many plies ended up addressable
+ */
+function setCtcLogits(sheets) {
+    if (!pyodide) return { plies: 0 };
+    pyodide.globals.set('_ctc_sheets', (sheets || []).map(function(s) {
+        return { data: new Uint8Array(s.data), plies: s.plies };
+    }));
+    const n = pyodide.runPython(
+        '_lz = LazyPlyLogits()\n' +
+        'for _s in _ctc_sheets:\n' +
+        '    _lz.add(bytes(_s.data.to_py()), [int(_p) for _p in _s.plies])\n' +
+        'set_default_ctc_logits(_lz if len(_lz) else None)\n' +
+        'len(_lz)\n'
+    );
+    console.log('[CTC] logits installed for ' + n + ' ply/plies');
+    pyodide.globals.set('_ctc_sheets', null);
+    return { plies: n };
+}
+
+/**
+ * Drop the installed logits. Call on game switch: stale logits would score the
+ * right moves against another game's handwriting, silently and confidently.
+ */
+function clearCtcLogits() {
+    if (pyodide) pyodide.runPython('set_default_ctc_logits(None)');
+    return { cleared: true };
+}
+
+
+// -----------------------------------------------------------------------------
+// MOVE PRIOR (feeds fix_finding's W_PRIOR re-score)
+// -----------------------------------------------------------------------------
+
+/**
+ * Install this game's human-move-prior table as the process-wide default in
+ * Python, so EVERY ranking path in this worker uses it — the same reason the
+ * CTC logits are installed this way rather than threaded through each call.
+ *
+ * DATA, NOT A MODEL. The prior is an ONNX network, and this worker deliberately
+ * runs no ONNX (see the file header). It also could not help if it did: Pyodide
+ * cannot call an async JS session synchronously from Python. So move-prior-worker.js
+ * evaluates the positions and what arrives here is a plain table
+ * {ply: {san: logProb}} — exactly the dict form fix_finding.apply_prior_rescore
+ * accepts.
+ *
+ * Ply keys arrive as STRINGS (a JS object has no integer keys) and are converted
+ * back to ints, because the Python side looks them up with the fix's integer
+ * ply. A string key would match nothing and every candidate would silently
+ * abstain — the failure mode that looks exactly like "the signal did nothing".
+ */
+function setMovePrior(table) {
+    if (!pyodide) return { plies: 0 };
+    pyodide.globals.set('_mp_table', table || {});
+    // Keys are POSITIONS (see MovePrior.positionKey), so they stay strings and
+    // must NOT be coerced to ints the way the old ply keys were. They also
+    // cannot go stale: Python rebuilds the key from the list it is ranking, so
+    // an entry either describes that exact position or is absent, and absent
+    // abstains. That is what lets one table serve every search path at once.
+    const n = pyodide.runPython([
+        '_mp = _mp_table.to_py() if hasattr(_mp_table, "to_py") else (_mp_table or {})',
+        '_mp = {str(_k): dict(_v) for _k, _v in _mp.items()}',
+        'set_default_move_prior(_mp if _mp else None)',
+        'len(_mp)'
+    ].join('\n'));
+    console.log('[PRIOR] move prior installed for ' + n + ' position(s)');
+    pyodide.globals.set('_mp_table', null);
+    return { plies: n };
+}
+
+/**
+ * Drop the installed prior. Call on game switch: a stale table would score this
+ * game's candidates against another game's positions.
+ */
+function clearMovePrior() {
+    if (pyodide) pyodide.runPython('set_default_move_prior(None)');
+    return { cleared: true };
+}
+
 onmessage = async function(e) {
     const { id, type, data } = e.data;
 
@@ -74,6 +176,22 @@ onmessage = async function(e) {
             // =================================================================
             // STREAMING SEARCH PROTOCOL
             // =================================================================
+
+            case 'set-ctc-logits':
+                result = setCtcLogits(data && data.sheets);
+                break;
+
+            case 'clear-ctc-logits':
+                result = clearCtcLogits();
+                break;
+
+            case 'set-move-prior':
+                result = setMovePrior(data && data.table);
+                break;
+
+            case 'clear-move-prior':
+                result = clearMovePrior();
+                break;
 
             case 'search-create':
                 result = await createSearchState(data.ocrMoves, data.method, data.options, data.lockedPlies, data.tier1AgreedPlies);
@@ -332,7 +450,15 @@ elif _st['method'] == 'greedy':
     # All iteration logic lives in greedy_step (full_game_search.py).
     # The worker is now just a JS dispatcher; Python's run_greedy_search
     # uses the same greedy_step in a Python loop. One source of truth.
-    _step_result = json.dumps(greedy_step(_st))
+    #
+    # The current move list rides along so the driver can keep the move prior
+    # pointed at the line Greedy is actually on. Attached HERE rather than
+    # inside greedy_step, which returns from a dozen places. Greedy only: beam
+    # and dijkstra hold MANY paths, each with its own list, so there is no
+    # single "current list" for them to report.
+    _greedy_out = greedy_step(_st)
+    _greedy_out['moves'] = list(_st.get('moves') or [])
+    _step_result = json.dumps(_greedy_out)
 
 elif _st['method'] == 'beam':
     # === BEAM: one iteration ===

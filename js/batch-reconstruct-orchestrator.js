@@ -516,6 +516,36 @@ var BatchReconstructOrchestrator = (function() {
   }
 
   /**
+   * Replace the retained raw OCR for a game WITHOUT re-running anything.
+   *
+   * `_ocrByGame[gameId]` is captured once, at enqueue() time, and is the
+   * input every no-override path falls back to: escalation
+   * (_handleMethodComplete -> queues[next].enqueue) and the speculative
+   * Beam feeder (_feedSpeculative). Nothing else ever wrote to it, so when
+   * the user truncated trailing OCR noise the orchestrator kept handing the
+   * PRE-truncation cells to those two paths.
+   *
+   * Symptom that fixes: user right-clicks a noise move -> "Delete from here
+   * onward" (dual-sheet batch), then fixes some other move; a method that
+   * escalates or gets speculatively fed in the window before the fix's
+   * debounced requeue lands runs on the stale noisy OCR, its result.moves
+   * carries the full pre-truncation tail, and the next Review applies it
+   * (verification-ui _applyPickedToState does `state.moves = paired`) — the
+   * deleted move is back.
+   *
+   * Also drops any override captured against the OLD OCR: it is keyed to
+   * ply positions in a sequence that no longer exists. Deliberately does NOT
+   * touch this.results / methodStatus or start any work — callers
+   * (syncAfterTruncation, onTruncationComplete) do their own abort +
+   * re-enqueue.
+   */
+  Orchestrator.prototype.updateOcr = function(gameId, ocrResult) {
+    if (!gameId || !ocrResult) return;
+    this._ocrByGame[gameId] = ocrResult;
+    delete this._overrideByGame[gameId];
+  };
+
+  /**
    * Re-enqueue after user override. Goes back through greedy first — the
    * override changes the input, so every method has to re-run if escalation
    * fires again. Clears prior per-game results to avoid stale triage.

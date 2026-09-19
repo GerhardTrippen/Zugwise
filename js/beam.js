@@ -252,7 +252,18 @@ function handleSearchStep(method, step) {
 
   if (step.message) {
     // Color fix lines green for greedy
-    if (method === 'greedy' && step.fix_to) {
+    if (method === 'greedy' && step.fix_to && step.fix_kept) {
+      // A KEEP: proper scoring at an ambiguous forced stop chose the move
+      // already on the board. It is a review step, not a change, and must not
+      // look like one \u2014 this branch used to fall into the green [fix] render
+      // below and print "[fix] 32.W: Kd3 -> Kd3", swallowing the "kept as-is"
+      // message greedy_step had written for exactly this case.
+      appendPanelLogHtml(panel,
+        '<span class="text-sky-300">[keep] ' + (step.fix_ply || '') + ': ' +
+        (step.fix_to || '') + ' unchanged \u2014 flagged for review</span>' +
+        elapsed
+      );
+    } else if (method === 'greedy' && step.fix_to) {
       appendPanelLogHtml(panel,
         '<span class="text-green-400">[fix] ' + (step.fix_ply || '') + ': ' +
         (step.fix_from || '') + ' \u2192 ' + (step.fix_to || '') + '</span>' +

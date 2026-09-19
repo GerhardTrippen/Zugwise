@@ -1,10 +1,20 @@
 // sw.js - Service Worker for Zugwise PWA
 // Place this file in your root directory (same level as index.html)
 
-const CACHE_NAME = 'zugwise-v0.11.15';
+// This is the app's version register: bump it on every shipped change, and
+// update the footer in index.html to match (they silently diverged for 18
+// versions after v0.8.0).
+const CACHE_NAME = 'zugwise-v0.11.26';   // move prior metadata + analytics bypass
 
 // Origins that don't send CORS headers — must use no-cors (gives opaque responses)
 const NO_CORS_ORIGINS = ['docs.opencv.org', 'cdn.tailwindcss.com'];
+
+// Origins the service worker must NOT touch. External assets are served
+// cache-first, which is right for versioned CDN files and wrong for analytics:
+// a cached count.js and, worse, a cached count request would make every repeat
+// visit invisible. Letting these through unhandled also means they simply fail
+// offline, which is the correct behaviour for a page-view counter.
+const NO_CACHE_ORIGINS = ['gc.zgo.at', 'zugwise.goatcounter.com'];
 
 // Generate piece asset paths: 12 sets × 12 pieces = 144 SVGs
 const PIECE_SETS = ['maestro','chessnut','california','fresca','cardinal','gioco','tatiana','dubrovny','icpieces','kosal','staunty','rhosgfx'];
@@ -33,6 +43,13 @@ const STATIC_ASSETS = [
   './search-worker.js',
   './python-loader.js',
   './search-manager.js',
+  './move-prior.js',
+  './move-prior-client.js',
+  './move-prior-worker.js',
+  // The move-prior weights themselves are NOT here: *.onnx is gitignored, so
+  // like the BiLSTM they ship from HuggingFace, not the repo. See
+  // MOVE_PRIOR_MODEL_URL in move-prior-worker.js.
+  './models/move-prior.json',
   './chess-grammar.js',
   './lenient-grammar.js',
   './beam-decoder.js',
@@ -70,6 +87,7 @@ const STATIC_ASSETS = [
   // Batch mode
   './js/batch-naming.js',
   './js/batch-folder-paths.js',
+  './js/logits-io.js',
   './js/batch-ocr-queue.js',
   './js/batch-triage.js',
   './js/batch-nw-autoapply.js',
@@ -128,6 +146,10 @@ const CDN_ASSETS = [
   
   // ONNX model from HuggingFace
   'https://huggingface.co/GerhardTrippen/chess-ocr-bilstm/resolve/main/chess_ocr.onnx',
+
+  // Move-prior weights (~9.6 MB). Cached for offline use like the BiLSTM; a
+  // failed fetch here only costs the prior signal, never the app.
+  'https://huggingface.co/GerhardTrippen/chess-move-prior/resolve/main/move-prior.onnx',
   
   // OpenCV.js (for image processing, grid detection)
   'https://docs.opencv.org/4.9.0/opencv.js',
@@ -166,6 +188,11 @@ self.addEventListener('install', (event) => {
           const needsNoCors = NO_CORS_ORIGINS.some(origin => url.includes(origin));
           const request = needsNoCors ? new Request(url, { mode: 'no-cors' }) : url;
           return fetch(request).then(response => {
+            // Never precache an error: cache-first would then serve that 404
+            // until the next CACHE_NAME bump (e.g. a model not yet uploaded).
+            if (!response.ok && response.type !== 'opaque') {
+              throw new Error('HTTP ' + response.status);
+            }
             return cache.put(url, response);
           }).catch(err => {
             console.warn(`[SW] Failed to cache ${url}:`, err.message);
@@ -221,6 +248,11 @@ self.addEventListener('fetch', (event) => {
 
   // Skip chrome-extension and other non-http(s) requests
   if (!url.protocol.startsWith('http')) {
+    return;
+  }
+
+  // Skip analytics entirely — never cached, never served from cache
+  if (NO_CACHE_ORIGINS.some(origin => url.hostname === origin)) {
     return;
   }
 

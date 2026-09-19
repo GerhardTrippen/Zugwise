@@ -65,6 +65,13 @@
     ]
   }
   </script>
+
+  <!-- Anonymous page-view counting (GoatCounter): no cookies, no personal data,
+       nothing about a game. Scoresheets, tournament files and moves stay on the
+       device, as they always have. The service worker deliberately does NOT
+       intercept these two hosts; see NO_CACHE_ORIGINS in service-worker.js. -->
+  <script data-goatcounter="https://zugwise.goatcounter.com/count"
+          async src="//gc.zgo.at/count.js"></script>
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col">
   <noscript>
@@ -158,11 +165,15 @@
         </div>
         <div id="mode-upload" class="input-content">
           <!-- Sheet Profile Selector -->
-          <div id="profile-bar" class="flex items-center gap-2 mb-2 text-sm">
-            <label class="text-gray-400">Profile:</label>
-            <select id="profile-select" class="bg-gray-700 text-white rounded px-2 py-1 text-sm flex-1 max-w-md"></select>
-            <button id="btn-edit-profile" class="text-gray-300 hover:text-white text-sm" title="Edit profiles">&#9998;</button>
-            <span id="profile-summary" class="text-gray-400 text-xs ml-2"></span>
+          <!-- Profile names carry the layout AND what page 2 does, so they run
+               to ~90 chars. No max-width cap: min-w-0 lets the select shrink on
+               narrow windows without overflowing, and the summary takes its own
+               line so the name never competes with it for room. -->
+          <div id="profile-bar" class="flex flex-wrap items-center gap-2 mb-2 text-sm">
+            <label class="text-gray-400 shrink-0">Profile:</label>
+            <select id="profile-select" class="bg-gray-700 text-white rounded px-2 py-1 text-sm flex-1 min-w-0"></select>
+            <button id="btn-edit-profile" class="text-gray-300 hover:text-white text-sm shrink-0" title="Edit profiles">&#9998;</button>
+            <span id="profile-summary" class="w-full text-gray-400 text-xs"></span>
           </div>
           <!-- Unified sheet uploader (rendered by sheets.js) -->
           <div id="sheets-uploader">
@@ -253,10 +264,11 @@
                 <label class="text-xs text-gray-400">Step 1: Scoresheet profile</label>
                 <button class="batch-help-btn w-4 h-4 rounded-full bg-gray-600 hover:bg-blue-500 text-[10px] leading-4 text-center text-gray-300 hover:text-white" data-help="profile" title="Help: Scoresheet profiles">?</button>
               </div>
-              <div class="flex items-center gap-2">
-                <select id="batch-profile-select" class="bg-gray-700 text-white rounded px-2 py-1 text-sm flex-1 max-w-md"></select>
-                <button id="btn-batch-edit-profile" class="text-gray-300 hover:text-white text-sm" title="Edit profiles">&#9998;</button>
-                <span id="batch-profile-summary" class="text-gray-400 text-xs"></span>
+              <!-- See #profile-bar above: no max-width cap, summary on its own line. -->
+              <div class="flex flex-wrap items-center gap-2">
+                <select id="batch-profile-select" class="bg-gray-700 text-white rounded px-2 py-1 text-sm flex-1 min-w-0"></select>
+                <button id="btn-batch-edit-profile" class="text-gray-300 hover:text-white text-sm shrink-0" title="Edit profiles">&#9998;</button>
+                <span id="batch-profile-summary" class="w-full text-gray-400 text-xs"></span>
               </div>
             </div>
             <!-- Step 2: Scan folder -->
@@ -503,7 +515,10 @@
   </div>
   <footer class="bg-gray-800 border-t border-gray-700 px-6 py-3">
     <div class="max-w-7xl mx-auto flex items-center justify-between text-sm text-gray-500">
-      <div>Zugwise v0.8.0</div>
+      <!-- Keep in sync with CACHE_NAME in service-worker.js, which is bumped on
+           every shipped change. They were last in sync at v0.8.0 (Mar 2026);
+           this footer then sat still for 18 cache versions. -->
+      <div>Zugwise v0.11.26</div>
       <div class="flex items-center gap-4">
         <a href="https://buymeacoffee.com/zugwise" target="_blank" rel="noopener noreferrer"
            class="text-yellow-500 hover:text-yellow-400 flex items-center gap-1"
@@ -782,9 +797,11 @@
   <script src="js/ocr.js"></script>
   <script src="js/validation.js"></script>
   <script src="search-manager.js"></script>
+  <script src="move-prior-client.js"></script>
   <script src="js/beam.js"></script>
   <script src="js/batch-naming.js"></script>
   <script src="js/batch-folder-paths.js"></script>
+  <script src="js/logits-io.js"></script>
   <script src="js/batch-grid-template.js"></script>
   <script src="js/batch-ocr-queue.js"></script>
   <script src="js/batch-triage.js"></script>

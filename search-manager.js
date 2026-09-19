@@ -19,6 +19,10 @@ var SearchManager = (function() {
         // PARTIAL result with full alternative detail without waiting for a
         // long in-flight step to finish.
         this.partialFixes = {};
+        // Per-method: the '|'-joined list the installed prior describes, and how
+        // many refreshes this run has done (a hard bound on the worst case).
+        this._priorLine = {};
+        this._priorRefreshes = {};
 
         // Callbacks for UI
         this.onStepUpdate = null;   // function(method, stepData)
@@ -141,6 +145,8 @@ var SearchManager = (function() {
         this.cancelFlags[method] = false;
         this.nextId[method] = 1;
         this.partialFixes[method] = [];
+        this._priorLine[method] = null;
+        this._priorRefreshes[method] = 0;
 
         if (this.onStatusChange) this.onStatusChange(method, 'loading');
 
@@ -279,6 +285,57 @@ var SearchManager = (function() {
             }
             opts.low_conf_floor = _lowConfFloor;
 
+            // Same logits the interactive path uses, so the algorithms rank on
+            // identical evidence. Sent before search-create; a failure here is
+            // non-fatal — the search simply runs without the signal, exactly as
+            // it did before, rather than not running at all.
+            try {
+                if (window.zugwise && window.zugwise.getCtcSheets) {
+                    var _sheets = window.zugwise.getCtcSheets();
+                    if (_sheets && _sheets.length) {
+                        await worker._send('set-ctc-logits', { sheets: _sheets });
+                    }
+                }
+            } catch (e) {
+                console.warn('[CTC] Search worker did not receive logits:', e.message);
+            }
+
+            // Human move prior, installed the same way and for the same reason:
+            // the algorithms must rank on identical evidence to the Fix
+            // Suggestions panel. Seeded from the OCR top reads, which is the
+            // list this search starts from.
+            //
+            // The table is keyed by POSITION, so this seed is a cache of the
+            // positions along the starting line, not a description of it: a
+            // path that has applied fixes simply misses and abstains rather
+            // than reading another position's entry. That is why one install
+            // can serve beam and dijkstra, which hold many paths at once.
+            //
+            // KNOWN GAP: the seed stops at the first illegal move, so on Crown
+            // it covers 3.6% of replacement decisions. Refreshing it as the
+            // searches advance is the obvious next step and was tried once
+            // (e6f9f99, reverted in acfd030): re-scoring the whole prefix on
+            // every step, through the ONE main-thread prior worker that all
+            // three searches share, stalled dijkstra for 39s on a single
+            // branch. Any retry must send only unseen positions and must be
+            // measured for COST, not just coverage.
+            //
+            // Non-fatal, like the logits above: MovePriorClient returns {} for
+            // every failure path, and an empty table means the signal is absent
+            // rather than every candidate scoring badly.
+            try {
+                if (typeof window !== 'undefined' && window.MovePriorClient) {
+                    var _sans = (ocrMoves || []).map(function (m) { return m.move; });
+                    var _table = await window.MovePriorClient.tableFor(_sans);
+                    if (_table && Object.keys(_table).length) {
+                        await worker._send('set-move-prior', { table: _table });
+                        self._priorLine[method] = _sans.join('|');
+                    }
+                }
+            } catch (e) {
+                console.warn('[PRIOR] Search worker did not receive the prior:', e.message);
+            }
+
             // Create search state
             var stateInfo = await worker._send('search-create', {
                 ocrMoves: ocrMoves,
@@ -316,6 +373,37 @@ var SearchManager = (function() {
                     throw err;
                 }
                 done = step.done;
+
+                // --- keep the prior pointed at the line Greedy is on --------
+                // The table is position-keyed, so the seed installed at launch
+                // stays CORRECT as Greedy advances — it just stops COVERING it,
+                // and every candidate then abstains (which costs exactly zero,
+                // but the signal is gone). Measured: the launch seed reaches
+                // 3.6% of Crown's replacement decisions.
+                //
+                // Affordable now, where e6f9f99 was not, because
+                // MovePriorClient caches by position and scores only positions
+                // it has never seen. A step that changed nothing skips entirely
+                // (the line-hash guard); a step that applied one fix pays for
+                // the tail that fix actually changed. MAX_PRIOR_REFRESH bounds
+                // the worst case regardless — a refresh that does not happen
+                // costs the signal, never correctness.
+                if (step && step.moves && window.MovePriorClient
+                        && self._priorRefreshes[method] < 40) {
+                    var _line = step.moves.join('|');
+                    if (_line !== self._priorLine[method]) {
+                        self._priorLine[method] = _line;
+                        self._priorRefreshes[method]++;
+                        try {
+                            var _t = await window.MovePriorClient.tableFor(step.moves);
+                            if (_t && Object.keys(_t).length) {
+                                await worker._send('set-move-prior', { table: _t });
+                            }
+                        } catch (e) {
+                            console.warn('[PRIOR] refresh skipped for ' + method + ': ' + e.message);
+                        }
+                    }
+                }
 
                 // Accumulate greedy's review-ready applied fix (full detail,
                 // incl. all_candidates) so an instant Cancel can rebuild a
