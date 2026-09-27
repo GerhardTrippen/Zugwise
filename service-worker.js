@@ -4,7 +4,7 @@
 // This is the app's version register: bump it on every shipped change, and
 // update the footer in index.html to match (they silently diverged for 18
 // versions after v0.8.0).
-const CACHE_NAME = 'zugwise-v0.12.0';    // paper release: engine + security fixes, full precache
+const CACHE_NAME = 'zugwise-v0.12.1';    // comment refresh after v0.12.0 paper release
 
 // Origins that don't send CORS headers — must use no-cors (gives opaque responses)
 const NO_CORS_ORIGINS = ['docs.opencv.org', 'cdn.tailwindcss.com'];

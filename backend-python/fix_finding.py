@@ -407,7 +407,7 @@ _DEFAULT_CTC_LOGITS = None
 #      Crown, without it 70% surface a median 3 plies later and 18% are never
 #      flagged (analyze_absurdity_stops.py). Keep abs_pen for that.
 #
-# MEASURED (Sept 26 2026, test_cases_crown_v2: recorded after the recorder fix
+# MEASURED (Sept 26 2026, test_cases_crown: re-recorded after the recorder fix
 # and the engine fixes, all 45 Crown games, 1166 replacement decisions;
 # move_prior/analyze_ctc_prior_grid.py):
 #   scorer 731 (62.7%) | +CTC 806 (69.1%) | +prior 875 (75.0%) | both 899 (77.1%)
