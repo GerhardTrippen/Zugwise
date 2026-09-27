@@ -84,7 +84,7 @@ W_FUTURE_MOVES = 0
 #     hi_sim   the losers average char_sim 0.942 against the correct fixes'
 #              0.744; in 20 of 22 the correct fix got no hi_sim at all.
 #
-#   Measured (1080 ranked decisions, 44 clean games):
+#   Measured (Aug 2026 recording, 1080 ranked decisions, 44 clean games):
 #     offline   hi_sim x0 +16, reach10 x0 +14, together +33; game-clustered
 #               bootstrap 95% CI [+19, +47], no round negative for either
 #     LIVE      full 45-game re-record: 52.7% -> 55.4% rank-1, +33 exactly as
@@ -112,7 +112,8 @@ W_REACH10 = 0
 #   top-k?) and ctc by scoring the SAN against the raw frames directly, which
 #   is strictly more information.
 #
-#   Offline over the CTC-enabled 45-game re-record (862 ranked decisions):
+#   Offline over the CTC-enabled 45-game re-record (Sept 2026, before the
+#   recorder fix; 862 ranked decisions):
 #
 #       baseline                        573   66.5%
 #       without ocr_pat                 576   66.8%    +3
@@ -301,8 +302,9 @@ def mfc_capture_preserved(board, candidate_move, free_caps) -> bool:
 # This is OCR confidence, a core PERMITTED signal (CLAUDE.md ranking rule). It
 # carries no chess opinion whatsoever - it cannot, it has never seen a board.
 #
-# Measured, 45-game MCC Crown corpus, 947 decisions that have logits, against
-# the CURRENT baseline (hi_sim/reach10 already zeroed - emulated by subtracting
+# Measured (Aug 2026, an earlier recording; current figures are in the W_PRIOR
+# block below), 45-game MCC Crown corpus, 947 decisions that have logits, against
+# the then-current baseline (hi_sim/reach10 already zeroed - emulated by subtracting
 # those two additive score_components, an emulation that reproduces the live
 # re-record's +33 exactly):
 #     baseline 516 (54.5%)  ->  in-sample W=3: 614 (64.8%, +98)
@@ -325,11 +327,10 @@ def mfc_capture_preserved(board, candidate_move, free_caps) -> bool:
 # Moving it earlier would also change which candidates the top-N quiescence
 # verify pass examines. That may well be better - it is simply UNMEASURED.
 #
-# INERT UNTIL LOGITS ARE SUPPLIED. Nothing writes the `.logits.bin` sidecar yet
-# (batch-folder-paths.js routes the extension; no producer exists), and with no
-# logits the term is never computed. W_CTC holds its measured value so that
-# writing the producer is the only remaining step - not so that behaviour
-# changes today.
+# LIVE. The batch OCR queue writes the `.logits.bin` sidecar per sheet
+# (routed by batch-folder-paths.js) and the workers pass the logits in; the
+# Crown recordings carry a ctc component on 930 of 1063 decisions. With no
+# logits for a game the term is simply never computed (not a penalty).
 W_CTC = 3
 
 # What an UNSCORABLE candidate receives: no logits for its ply (a fix upstream
@@ -390,8 +391,8 @@ _DEFAULT_CTC_LOGITS = None
 #   1. RATING-MATCHED. The model is trained on club-level games, not strong
 #      play. A strong-play policy reintroduces the population mismatch that
 #      made the forbidden signals wrong.
-#   2. ADDITIVE, NEVER A REPLACEMENT. Measured, the prior ALONE ranks 45.4%,
-#      WORSE than the scorer's own 52.7%. It is complementary evidence.
+#   2. ADDITIVE, NEVER A REPLACEMENT. Measured, the prior ALONE ranks 44.5%,
+#      WORSE than the scorer's own 62.7%. It is complementary evidence.
 #   3. WEIGHT BY CROSS-VALIDATION. W=10 is leave-one-round-out CV over the
 #      Crown corpus for the SHIPPED model (move_prior_b8f128_mb0, 8x128, 48.4%
 #      move match; Sept 2026): fold weights [12,10,10,10,16,10,10,8,10], +83 CV
@@ -400,12 +401,17 @@ _DEFAULT_CTC_LOGITS = None
 #      did NOT pick it (its folds say 8; W=10 costs it 9 of 990). The older
 #      W=12 was fitted for the 4x64 colab model. Every forbidden signal arrived
 #      instead with a compelling example.
-#   4. IT DOES NOT REPLACE abs_pen, which is still worth +21 rank-1 on top.
+#   4. IT DOES NOT REPLACE absurdity DETECTION. In RANKING the prior nearly
+#      absorbs abs_pen (dropping it costs 48 rank-1 without the prior, 2 with).
+#      Detection's job is to STOP at the error: of 71 errors it stops at on
+#      Crown, without it 70% surface a median 3 plies later and 18% are never
+#      flagged (analyze_absurdity_stops.py). Keep abs_pen for that.
 #
-# MEASURED: +85 rank-1 cross-validated over 947 jointly-covered decisions
-# (516 -> 601, 54.5% -> 63.5%), against a re-weighting ceiling of +5.4 for all
-# existing signals combined. With CTC as well, 663 (70.0%) at W_prior=12,
-# W_ctc=2 - the two are ~84% additive.
+# MEASURED (Sept 26 2026, test_cases_crown_v2: recorded after the recorder fix
+# and the engine fixes, all 45 Crown games, 1166 replacement decisions;
+# move_prior/analyze_ctc_prior_grid.py):
+#   scorer 731 (62.7%) | +CTC 806 (69.1%) | +prior 875 (75.0%) | both 899 (77.1%)
+#   the two are 77% additive. Premier (validation, no logits): 56.6% -> 67.5%.
 #
 # THE HONEST DOWNSIDE, unchanged from CLAUDE.md: the failure mode that killed
 # win_cap is not absent. The prior gains far more than it loses, but some of the
@@ -413,9 +419,9 @@ _DEFAULT_CTC_LOGITS = None
 # human actually wrote. The trade is accepted knowingly, and the damage is to
 # RANK-1, not to visibility.
 #
-# INERT UNTIL A PRIOR IS SUPPLIED, exactly like W_CTC: with no prior installed
-# the term is never computed. This constant holds its measured value so that
-# supplying the model is the only remaining step.
+# LIVE in the browser: the move-prior worker scores each game's positions before
+# a search and hands the table in. With no prior loaded (model failed to load,
+# or a CLI run without one) the term is never computed, not penalised.
 W_PRIOR = 10
 
 # What an UNSCORABLE candidate receives: a SAN that will not parse at its ply, a
@@ -711,7 +717,8 @@ def find_piece_confusion_candidates(
     moves: List[str],
     ocr_lookup: Dict[int, OCRMove],
     stuck_ply: int,
-    lookback: int = 10
+    lookback: int = 10,
+    skip_plies: Optional[Set[int]] = None
 ) -> List[dict]:
     """
     Look back through recent moves to find where piece confusion might have occurred.
@@ -721,14 +728,21 @@ def find_piece_confusion_candidates(
     2. The OCR candidates included an alternative piece
     3. Both the original and alternative were legal at that position
 
+    skip_plies: plies that must never be modified (user locks, auto-locked
+    dual-sheet agreement, already-fixed plies). The main backtrack search
+    skips these; this lookback must too.
+
     Returns:
         List of candidate fixes with details
     """
     candidates = []
     start_ply = max(0, stuck_ply - lookback)
+    skip_plies = skip_plies or set()
 
     for ply in range(start_ply, stuck_ply):
         if ply >= len(moves):
+            continue
+        if ply in skip_plies:
             continue
 
         move = moves[ply]
@@ -895,7 +909,8 @@ def find_backtrack_piece_fixes(
     ocr_lookup: Dict[int, OCRMove],
     stuck_ply: int,
     top_k: int = 5,
-    verbose: bool = False
+    verbose: bool = False,
+    skip_plies: Optional[Set[int]] = None
 ) -> List[dict]:
     """
     Main function: Find and rank backtrack piece confusion fixes.
@@ -906,12 +921,14 @@ def find_backtrack_piece_fixes(
         stuck_ply: Where game got stuck
         top_k: Number of top fixes to return
         verbose: Print debug info
+        skip_plies: Locked / already-fixed plies that must not be changed
 
     Returns:
         List of ranked fixes with scores
     """
     # Find candidates
-    candidates = find_piece_confusion_candidates(moves, ocr_lookup, stuck_ply)
+    candidates = find_piece_confusion_candidates(moves, ocr_lookup, stuck_ply,
+                                                 skip_plies=skip_plies)
 
     if not candidates:
         if verbose:
@@ -2669,6 +2686,18 @@ def _precompute_backtrack_context(
                 if ead_ply in fixed_plies:
                     if verbose:
                         print(f"\n   [EAD] Absurdity at {ply_to_str(ead_ply)} but ply is APPROVED - ignoring")
+                elif ead_ply < min_ply or ead_ply in locked_plies:
+                    # Behind the validation frontier (or locked): that position
+                    # was already confirmed with the absurdity in it, so it is
+                    # accepted play (a real hanging rook the player left), not
+                    # evidence about THIS stop. Re-anchoring here abandoned the
+                    # actual illegal move: shanquang_william 29.B "Re8" (needs
+                    # Rde8) was searched only at 25.W, every stop after it too,
+                    # and the correct fixes were never proposed. Phase 2 still
+                    # questions pre-frontier plies through its own window.
+                    if verbose:
+                        print(f"\n   [EAD] Absurdity at {ply_to_str(ead_ply)} is behind the frontier "
+                              f"({ply_to_str(min_ply)}) - keeping the stuck ply {ply_to_str(stuck_ply)}")
                 else:
                     # Absurdity detected - the error is likely at or before this ply
                     effective_stuck_ply = ead_ply
@@ -2718,7 +2747,10 @@ def _precompute_backtrack_context(
 
     # NEW: Build a mapping from each duplicate ply to its "partner" ply
     # So if 7.B and 15.B are duplicates, we can quickly find the partner
-    duplicate_partners = {}  # ply -> partner_ply
+    # ply -> SET of partner plies. A move recorded three times is reported as
+    # (1st, 2nd) and (1st, 3rd); a plain ply -> ply map overwrote the first
+    # ply's partner, so from 1st only 3rd was ever searched.
+    duplicate_partners = {}
 
     if ocr_duplicates:
         if verbose:
@@ -2726,8 +2758,8 @@ def _precompute_backtrack_context(
         for dup in ocr_duplicates:
             duplicate_suspect_plies.add(dup['suspect_ply'])
             # Store BOTH plies as partners of each other
-            duplicate_partners[dup['first_ply']] = dup['second_ply']
-            duplicate_partners[dup['second_ply']] = dup['first_ply']
+            duplicate_partners.setdefault(dup['first_ply'], set()).add(dup['second_ply'])
+            duplicate_partners.setdefault(dup['second_ply'], set()).add(dup['first_ply'])
             if verbose:
                 print(f"      - '{dup['move']}' ({dup['color']}) at "
                       f"{ply_to_str(dup['first_ply'])} ({dup['first_confidence']:.0%}) AND "
@@ -2888,17 +2920,16 @@ def _precompute_backtrack_context(
         # If we're stuck at a ply that's part of a duplicate pair,
         # add the PARTNER ply to the search WITHOUT doing full backward search!
         if effective_stuck_ply in duplicate_partners:
-            partner_ply = duplicate_partners[effective_stuck_ply]
-            extended_search_plies.add(partner_ply)
-            if verbose:
-                print(f"   [LINK] TARGETED DUPLICATE SEARCH: Stuck at {ply_to_str(effective_stuck_ply)}, "
-                      f"adding partner ply {ply_to_str(partner_ply)} to search")
+            for partner_ply in sorted(duplicate_partners[effective_stuck_ply]):
+                extended_search_plies.add(partner_ply)
+                if verbose:
+                    print(f"   [LINK] TARGETED DUPLICATE SEARCH: Stuck at {ply_to_str(effective_stuck_ply)}, "
+                          f"adding partner ply {ply_to_str(partner_ply)} to search")
 
         # Also check: if ANY ply in the normal search range has a partner outside the range,
         # add that partner too
         for ply in range(min_ply, search_limit + 1):
-            if ply in duplicate_partners:
-                partner = duplicate_partners[ply]
+            for partner in sorted(duplicate_partners.get(ply, ())):
                 if partner < min_ply:  # Partner is before our search range
                     extended_search_plies.add(partner)
                     if verbose:
@@ -4407,6 +4438,9 @@ def _search_single_ply_for_fixes(
             'disamb': disamb_bonus,
             'dup_fix': 15 if is_duplicate_fix else 0,
             'dup_res': duplicate_resolution_bonus,
+            # Was added to unified_score but missing here, so the breakdown
+            # did not sum to the score whenever the lenient grammar matched.
+            'lenient': lenient_bonus,
             'future': future_moves_enabled * W_FUTURE_MOVES,
             'near': nearest_ply_bonus,
             'ocr_c': round(ocr_conf * 15, 1),
@@ -4701,7 +4735,8 @@ def find_deep_backtrack_fixes(
     # === BACKTRACK PIECE CONFUSION SEARCH ===
     # Look for R<->K, B<->R type confusions at earlier plies where both were legal
     # (The function itself prints verbose output now)
-    backtrack_fixes = find_backtrack_piece_fixes(moves, ocr_lookup, stuck_ply, top_k=5, verbose=verbose)
+    backtrack_fixes = find_backtrack_piece_fixes(moves, ocr_lookup, stuck_ply, top_k=5, verbose=verbose,
+                                                 skip_plies=locked_plies | fixed_plies)
 
     # Convert backtrack fixes to standard fix format and add to fixes list
     if backtrack_fixes:
@@ -4724,7 +4759,6 @@ def find_deep_backtrack_fixes(
 
             # Calculate unified_score using the SAME formula as regular fixes
             # (Don't use bf['score'] which has a different scale)
-            reach_improvement = bf['plies_gained']
             completes = bf.get('new_stuck_ply') is None
             ocr_conf = bf['ocr_conf']
             ocr_candidate_bonus = (25 * W_OCR_PAT) if bf['in_candidates'] else 0
@@ -4735,10 +4769,18 @@ def find_deep_backtrack_fixes(
             test_moves = moves[:fix_ply] + [bf['alternative']] + moves[fix_ply + 1:]
             test_reach = bf.get('new_stuck_ply') or len(test_moves)
 
+            # Reach and the absurdity window are measured against the ORIGINAL
+            # stuck ply, as on the main path (see its reach_improvement
+            # comment). bf['plies_gained'] is relative to the Phase 2 anchor
+            # (frontier - 1), which over-scored Phase 2 piece swaps by up to
+            # the 50-point reach cap. Kept non-negative as before.
+            _pc_original_stuck = ctx.get('original_stuck_ply', stuck_ply)
+            reach_improvement = max(0, test_reach - _pc_original_stuck)
+
             # Check for absurdities in the test sequence (up to stuck_ply + 2)
             # Only count absurdities FROM fix_ply onwards - pre-existing ones shouldn't penalize this fix
             # NOTE: Using fast_mode=True here for speed. Top candidates are re-verified later with fast_mode=False.
-            absurdity_check_limit = min(test_reach, stuck_ply + 1)
+            absurdity_check_limit = min(test_reach, _pc_original_stuck + 1)
             absurdities_result = find_all_absurdities(test_moves[:absurdity_check_limit], verbose=False, fast_mode=True,
                                                        start_ply=fix_ply)
             absurdities_result = [a for a in absurdities_result if a.ply >= fix_ply]
@@ -6196,7 +6238,8 @@ class BacktrackSearchState:
         # Add piece confusion fixes (optional - can skip if user accepted early)
         if not self.early_exit:
             backtrack_fixes = find_backtrack_piece_fixes(
-                self.moves, self.ocr_lookup, self.effective_stuck_ply, top_k=5, verbose=False
+                self.moves, self.ocr_lookup, self.effective_stuck_ply, top_k=5, verbose=False,
+                skip_plies=self.locked_plies | self.fixed_plies
             )
             if backtrack_fixes:
                 for bf in backtrack_fixes:
@@ -6207,7 +6250,9 @@ class BacktrackSearchState:
                         _bf_char_sim, _ = _best_sim_across_candidates(_bf_ocr_m.candidates, bf['alternative'])
                     else:
                         _bf_char_sim = move_similarity(bf['original'], bf['alternative'])
-                    _bf_reach_imp = bf['plies_gained']
+                    # Against the ORIGINAL stuck ply, as in find_deep_backtrack_fixes.
+                    _bf_reach_imp = max(0, (bf.get('new_stuck_ply') or len(self.moves))
+                                        - self.ctx.get('original_stuck_ply', self.effective_stuck_ply))
                     _bf_completes = bf.get('new_stuck_ply') is None
                     _bf_ocr_conf = bf['ocr_conf']
                     fix = {

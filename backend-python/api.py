@@ -82,7 +82,25 @@ def parse_auto_fix_settings(auto_fix_settings):
 
 # Create Flask app
 app = Flask(__name__)
-CORS(app)
+# Cross-origin access only from the local frontend and the public deployment.
+# CORS(app) allowed any web page the user visited to call this local API.
+CORS(app, origins=[r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+                   "https://gerhardtrippen.github.io"])
+
+import logging
+_log = logging.getLogger("zugwise.api")
+
+
+def _error_response(extra=None, status=400):
+    """Generic client error plus a correlation id; the details (exception and
+    traceback) go to the server log only, never into the response."""
+    cid = uuid.uuid4().hex[:12]
+    _log.error("request failed [%s]\n%s", cid, traceback.format_exc())
+    body = {"error": f"Request failed (id {cid}). See the server log for details.",
+            "correlation_id": cid}
+    if extra:
+        body.update(extra)
+    return jsonify(body), status
 
 # Global OCR model (lazy loaded)
 _ocr_model = None
@@ -221,7 +239,7 @@ def api_validate():
         result = validate_moves(moves, ocr_data=ocr_data, settings=settings, approved_plies=approved_plies)
         return jsonify(result)
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        return _error_response()
 
 
 @app.route('/api/position', methods=['POST'])
@@ -238,7 +256,7 @@ def api_position():
                                      piece_file_confusions=piece_file_confusions)
         return jsonify(result)
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        return _error_response()
 
 
 @app.route('/api/legal-moves', methods=['POST'])
@@ -260,7 +278,7 @@ def api_legal_moves():
         legal = sorted([board.san(m) for m in board.legal_moves])
         return jsonify({'legal_moves': legal, 'count': len(legal)})
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        return _error_response()
 
 
 @app.route('/api/similarity', methods=['POST'])
@@ -290,7 +308,7 @@ def api_similarity():
 
         return jsonify({'scores': scores})
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        return _error_response()
 
 
 @app.route('/api/ocr', methods=['POST'])
@@ -350,13 +368,12 @@ def api_ocr():
                 })
 
             response = {'moves': results, 'total_cells': len(results), 'has_grid_image': _ocr_grid_image is not None}
-            response['debug_dir'] = debug_dir
             return jsonify(response)
         finally:
             os.unlink(tmp_path)
     
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 400
+        return _error_response()
 
 
 @app.route('/api/ocr-context', methods=['POST'])
@@ -464,7 +481,7 @@ def api_ocr_context():
         })
     
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 400
+        return _error_response()
 
 
 @app.route('/api/extract-grid', methods=['POST'])
@@ -526,11 +543,7 @@ def api_extract_grid():
             os.unlink(tmp_path)
 
     except Exception as e:
-        return jsonify({
-            'error': str(e),
-            'has_grid_image': False,
-            'traceback': traceback.format_exc()
-        }), 400
+        return _error_response({'has_grid_image': False})
 
 
 @app.route('/api/find-fixes', methods=['POST'])
@@ -767,7 +780,7 @@ def api_find_fixes():
             'position_fen': pos['fen'],
         })
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 400
+        return _error_response()
 
 
 @app.route('/api/quick-scan', methods=['POST'])
@@ -815,7 +828,7 @@ def api_quick_scan():
             'complete': result.status == 'SOLVED',
         })
     except Exception as e:
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 400
+        return _error_response()
 
 
 @app.route('/api/reconstruct', methods=['POST'])
@@ -915,7 +928,7 @@ def api_reconstruct():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({'error': str(e)}), 400
+        return _error_response()
 
 
 def _parse_ocr_data(ocr_data):
@@ -999,8 +1012,12 @@ def _run_beam_job(job_id, moves, ocr_lookup, method, max_fixes, beam_width):
                 'method': result.method
             }
     except Exception as e:
+        # Returned later by the status endpoint: generic text plus an id, the
+        # details only in the server log (same rule as _error_response).
+        _cid = uuid.uuid4().hex[:12]
+        _log.error("beam job %s failed [%s]\n%s", job_id, _cid, traceback.format_exc())
         _beam_jobs[job_id]['status'] = 'error'
-        _beam_jobs[job_id]['error'] = str(e)
+        _beam_jobs[job_id]['error'] = f"Search failed (id {_cid}). See the server log for details."
 
 
 @app.route('/api/reconstruct-async', methods=['POST'])
@@ -1058,7 +1075,7 @@ def api_reconstruct_async():
 
         return jsonify({'job_id': job_id, 'status': 'running', 'method': method})
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        return _error_response()
 
 
 @app.route('/api/reconstruct-cancel/<job_id>', methods=['POST'])
@@ -1160,7 +1177,7 @@ def api_detect_grid():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({'error': str(e), 'grid_found': False}), 500
+        return _error_response({'grid_found': False}, status=500)
 
 
 @app.route('/api/perspective-correct', methods=['POST'])
@@ -1213,7 +1230,7 @@ def api_perspective_correct():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return _error_response(status=500)
 
 
 # =============================================================================

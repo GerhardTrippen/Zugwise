@@ -1424,10 +1424,15 @@ def analyze_absurdities_for_root_cause(absurdities: List[Absurdity],
 def find_duplicate_pawn_destinations(ocr_lookup: Dict[int, 'OCRMove']) -> List[dict]:
     """
     Find cases where the same pawn destination appears twice for one color.
-    A pawn can only move to a specific square once, so one must be wrong.
+    One pawn can make a given move only once, so a repeat needs a second
+    pawn on the same file. That can only arrive by a pawn capture onto the
+    file (e.g. c4 ... dxc4, bxc3, then c4 again), so a repeat is reported
+    only when no such capture by the same colour precedes it.
     """
     pawn_destinations = {}
     duplicates = []
+    # Files each colour has captured onto with a pawn so far (OCR text).
+    files_entered_by_capture = {'W': set(), 'B': set()}
 
     for ply in sorted(ocr_lookup.keys()):
         ocr_move = ocr_lookup[ply]
@@ -1440,7 +1445,7 @@ def find_duplicate_pawn_destinations(ocr_lookup: Dict[int, 'OCRMove']) -> List[d
 
         color = 'W' if ply % 2 == 0 else 'B'
         clean = san.replace('+', '').replace('#', '').replace('x', '').replace('=', '')
-        
+
         if len(clean) >= 3 and clean[-1] in 'QRBN':
             clean = clean[:-1]
 
@@ -1454,7 +1459,12 @@ def find_duplicate_pawn_destinations(ocr_lookup: Dict[int, 'OCRMove']) -> List[d
                 key = (color, source_file, dest)
                 conf = ocr_move.top_confidence if hasattr(ocr_move, 'top_confidence') else 0.5
 
-                if key in pawn_destinations:
+                is_capture = 'x' in san and dest[0] != source_file
+                second_pawn_possible = source_file in files_entered_by_capture[color]
+                if is_capture:
+                    files_entered_by_capture[color].add(dest[0])
+
+                if key in pawn_destinations and not second_pawn_possible:
                     first_ply, first_conf = pawn_destinations[key]
                     suspect_ply = first_ply if first_conf < conf else ply
 
@@ -1481,10 +1491,15 @@ find_duplicate_pawn_moves_in_ocr = find_duplicate_pawn_destinations
 def find_duplicate_pawn_moves(moves: List[str], verbose: bool = False) -> List[dict]:
     """
     Find duplicate pawn destination squares in a move list.
+
+    Keyed on the move actually played (after any auto-correction), not the
+    raw text. A repeat is legal when a second pawn of the same colour has
+    reached the file by capture before it, so such repeats are not reported.
     """
     pawn_destinations = {}
     duplicates = []
     board = chess.Board()
+    files_entered_by_capture = {'W': set(), 'B': set()}
 
     for ply, san in enumerate(moves):
         move = try_move(board, san)
@@ -1492,25 +1507,25 @@ def find_duplicate_pawn_moves(moves: List[str], verbose: bool = False) -> List[d
             break
 
         # Check if pawn move
-        if san[0] in 'abcdefgh':
+        if board.piece_type_at(move.from_square) == chess.PAWN:
             color = 'W' if ply % 2 == 0 else 'B'
-            source_file = san[0]
-            clean = san.replace('+', '').replace('#', '').replace('x', '')
-            if len(clean) >= 2:
-                dest = clean[-2:]
-                if dest[0] in 'abcdefgh' and dest[1] in '12345678':
-                    key = (color, source_file, dest)
-                    if key in pawn_destinations:
-                        first_ply = pawn_destinations[key]
-                        duplicates.append({
-                            'first_ply': first_ply,
-                            'second_ply': ply,
-                            'move': san,
-                            'color': color,
-                            'destination': dest
-                        })
-                    else:
-                        pawn_destinations[key] = ply
+            source_file = chess.square_name(move.from_square)[0]
+            dest = chess.square_name(move.to_square)
+            second_pawn_possible = source_file in files_entered_by_capture[color]
+            if chess.square_file(move.from_square) != chess.square_file(move.to_square):
+                files_entered_by_capture[color].add(dest[0])
+            key = (color, source_file, dest)
+            if key in pawn_destinations and not second_pawn_possible:
+                first_ply = pawn_destinations[key]
+                duplicates.append({
+                    'first_ply': first_ply,
+                    'second_ply': ply,
+                    'move': san,
+                    'color': color,
+                    'destination': dest
+                })
+            else:
+                pawn_destinations[key] = ply
 
         board.push(move)
 

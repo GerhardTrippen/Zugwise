@@ -2033,15 +2033,25 @@ var VerificationUI = (function() {
         }
       }
     }
+    // Restore BEFORE awaiting. computeQuickFixes reads the swapped cell only
+    // in its synchronous prologue (before its first await, the constrained
+    // re-OCR), so the swap is no longer needed once the promise exists.
+    // Holding it across the await let a confirm/override made during re-OCR
+    // be overwritten by the finally-restore, and let renders and exports in
+    // that window see the swapped illegal OCR text.
+    var pending;
     try {
-      return (await computeQuickFixes()) || [];
-    } catch (e) {
-      return [];
+      pending = computeQuickFixes();
     } finally {
       if (swapped) {
         if (isWhite) { entry.white = savedSan; entry.wStatus = savedStatus; }
         else { entry.black = savedSan; entry.bStatus = savedStatus; }
       }
+    }
+    try {
+      return (await pending) || [];
+    } catch (e) {
+      return [];
     }
   }
 
@@ -2112,7 +2122,13 @@ var VerificationUI = (function() {
       if (!_isChosenCand && state && Array.isArray(state.moves)) {
         var _cm = state.moves[Math.floor(cPly / 2)];
         var _curAtPly = _cm ? ((cPly % 2 === 0 ? _cm.white : _cm.black) || '') : '';
-        if (_curAtPly && san === _curAtPly.replace(/[+#]$/, '')) return false;
+        // Same phantom-check carve-out as the no-op filter above (1e6f818):
+        // when the algorithm's pick is an EARLIER backtrack fix, the stuck ply
+        // still holds the raw illegal "Bf4+", and the repair "Bf4" equals it
+        // once '+' is stripped — this filter (added later, b266dfb) was
+        // deleting the one correct alternative from the list.
+        var _phantomRepair = (rawSan !== _curAtPly) && (c.original_was_legal === false);
+        if (_curAtPly && san === _curAtPly.replace(/[+#]$/, '') && !_phantomRepair) return false;
       }
       return true;
     });
@@ -3391,7 +3407,10 @@ var VerificationUI = (function() {
     // in v.fixes (e.g. first greedy run fixed 7.W, second run doesn't
     // list it because it was already baked in as a legal SAN).
     if (state.moves) {
-      var maxMi = Math.floor(ply / 2);
+      // ceil, not floor: when the override is on a black ply, the white ply
+      // of the same move is earlier and must be harvested too (addIfNew
+      // already drops anything at or after `ply`).
+      var maxMi = Math.ceil(ply / 2);
       for (var mi = 0; mi < maxMi && mi < state.moves.length; mi++) {
         var m = state.moves[mi];
         if (m.wStatus === 'fixed' && m.wOriginal) {

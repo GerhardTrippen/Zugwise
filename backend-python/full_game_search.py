@@ -381,8 +381,11 @@ def resolve_forced_stop_choice(moves, ply, ocr_lookup, forced_stop_plies=None,
     or None (single-legal / nothing found).
     """
     ocr_m = ocr_lookup.get(ply)
-    if not ocr_m or not getattr(ocr_m, 'candidates', None):
-        return None
+    # No sheet readings is not by itself a reason to bail: a SAN-ambiguous
+    # move (checked below) still has disambiguation variants to choose from.
+    # Returning None here for it left the caller re-stopping at this ply
+    # forever (greedy never reaches its max_fixes check on this branch).
+    _has_readings = bool(ocr_m and getattr(ocr_m, 'candidates', None))
     cur = moves[ply] if ply < len(moves) else ''
     # --- GATE: >= 2 LEGAL sheet readings? ---
     prefix = chess.Board()
@@ -392,7 +395,7 @@ def resolve_forced_stop_choice(moves, ply, ocr_lookup, forced_stop_plies=None,
             return None  # prefix broken — let the normal path handle it
         prefix.push(mv)
     legal_readings = 0
-    for cand in {c for c, _ in ocr_m.candidates if c}:
+    for cand in ({c for c, _ in ocr_m.candidates if c} if _has_readings else ()):
         # STRICT (auto_correct=False) so an illegal reading like 'Rb7' isn't
         # silently legalised into the count.
         if try_move(prefix, cand, auto_correct=False) is not None:
@@ -589,7 +592,11 @@ def _recompute_auto_locks_into(moves, tier1_agreed_plies, locked_set) -> None:
         return
     board = chess.Board()
     for ply in range(len(moves)):
-        m = try_move(board, moves[ply])
+        # Strict: "legal as written". With auto-correct on, the walk continued
+        # past an OCR-illegal but auto-correctable move, so Tier-1 locks could
+        # extend beyond the real illegal ply -- unlike JS classifyTiers and
+        # play_until_stuck, which both stop there.
+        m = try_move(board, moves[ply], auto_correct=False)
         if m is None:
             return
         board.push(m)
@@ -672,6 +679,28 @@ def greedy_step(state: dict) -> dict:
     # surfaced as a keep-marker. Either way the ply is a review step with the
     # candidates PROPERLY SCORED; Greedy proposes, the user confirms/overrides.
     if stop_reason == 'ambiguous':
+        # Same backstop as the main path's max_fixes check further down. That
+        # check is never reached on this branch (it returns early), so a ply
+        # that re-stops every step would otherwise spin without bound.
+        if state['iteration'] >= state['max_fixes']:
+            msg = (f"Hit max_fixes ({state['max_fixes']}) — stuck at "
+                   f"{ply_to_str(stuck)} (ambiguous, {round(elapsed, 1)}s)")
+            state['done'] = True
+            state['result'] = {
+                'status': 'PARTIAL',
+                'moves': list(moves),
+                'fixes': list(state['all_fixes']),
+                'reached_ply': stuck,
+                'stop_reason': 'max_fixes',
+                'stop_message': msg,
+            }
+            return {
+                'done': True, 'status': 'PARTIAL',
+                'stuck_at': ply_to_str(stuck),
+                'fixes_so_far': len(state['all_fixes']),
+                'elapsed': round(elapsed, 1),
+                'message': msg,
+            }
         marker = resolve_forced_stop_choice(
             moves, stuck, state['ocr_lookup'],
             fixed_plies=state['fixed_plies'], locked_plies=state['locked_plies'],
@@ -845,6 +874,13 @@ def greedy_step(state: dict) -> dict:
         ]
         _fixes = [f for f in _fixes if f['ply'] not in state['fixed_plies']]
         _funnel.append(('fixed_plies', len(_fixes)))
+        # Drop any fix at a locked ply (user locks + Tier-1 auto-locks), as
+        # beam_step and Dijkstra do. fixed_plies above was seeded before the
+        # auto-lock pass, so it does not cover auto-locks; and some candidate
+        # sources (heuristic-extended plies) can reach locked plies.
+        if eff_locked:
+            _fixes = [f for f in _fixes if f['ply'] not in eff_locked]
+        _funnel.append(('locked_plies', len(_fixes)))
         # Window-restrict: Phase 1 → [eff_min_ply, stuck], Phase 2 → [phase2_floor,
         # eff_min_ply). Drop heuristic-extended candidates outside both windows.
         # Exception: from_heuristic-tagged fixes bypass the window check (their
@@ -1017,6 +1053,7 @@ def greedy_step(state: dict) -> dict:
         _reason_txt = {
             'engine': "the search produced no candidates",
             'fixed_plies': "every candidate was at an already-fixed ply",
+            'locked_plies': "every candidate was at a locked ply",
             'window': "every candidate fell outside the backtrack window",
             'cosmetic_noop': "every candidate was a cosmetic no-op",
             'score_floor>=0': "every candidate scored below 0 (Greedy's auto-apply floor)",
@@ -1739,6 +1776,14 @@ def beam_step(state: dict) -> dict:
         if eff_locked:
             fixes = [f for f in fixes
                      if f.get('ply', 0) not in eff_locked]
+        # Nor at a ply this path already fixed. Phase 2 deliberately ignores
+        # fixed_plies, and greedy (fixed_plies funnel stage) and Dijkstra both
+        # drop these; without it a beam path re-fixed its own earlier plies,
+        # including no-op X->X (it survives the cosmetic filter above, which
+        # compares against the OCR text), paying LAMBDA and duplicating fixes.
+        if path.fixed_plies:
+            fixes = [f for f in fixes
+                     if f.get('ply', 0) not in path.fixed_plies]
 
         # Forced-stop ambiguity: SCORE the readings (proper unified score, see
         # resolve_forced_stop_choice) and either apply the best CHANGE or KEEP the

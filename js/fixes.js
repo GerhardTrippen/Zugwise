@@ -191,7 +191,7 @@ function createRevertToOcrButton(originalOcr, container) {
   var btn = document.createElement('button');
   btn.className = 'w-full text-left p-2 rounded-lg border bg-blue-600/30 border-blue-500 mb-2 hover:bg-blue-500/40';
   btn.title = 'Restore the original OCR text';
-  btn.innerHTML = '<span class="text-blue-300 font-medium">↩ Revert to OCR: <span class="font-mono">' + originalOcr + '</span></span>';
+  btn.innerHTML = '<span class="text-blue-300 font-medium">↩ Revert to OCR: <span class="font-mono">' + escapeHtml(originalOcr) + '</span></span>';
 
   var revertFix = {
     ocr: currentMove,
@@ -278,7 +278,7 @@ function createKeepAsIsButton(container) {
   var _keepScoreSuffix = (state.stuckInfo && typeof state.stuckInfo.keepScore === 'number')
     ? ' <span class="text-gray-400 text-xs">score=' + Math.round(state.stuckInfo.keepScore) + '</span>'
     : '';
-  btn.innerHTML = '<span class="text-yellow-300 font-medium">✓ Keep ' + keepSan + '</span> <span class="text-yellow-400/70 text-xs">— accept as-is</span>' + _keepScoreSuffix;
+  btn.innerHTML = '<span class="text-yellow-300 font-medium">✓ Keep ' + escapeHtml(keepSan) + '</span> <span class="text-yellow-400/70 text-xs">— accept as-is</span>' + _keepScoreSuffix;
 
   var keepFix = {
     ocr: move,
@@ -375,14 +375,14 @@ function renderFixes(fixes){
       ? ' <span class="text-red-400" title="' + pc.absurd_warning.replace(/"/g, '&quot;') + '">⚠️</span>'
       : '';
     var pcAbsurdLine2 = pc.absurd_warning
-      ? '<div class="text-xs text-red-400 mt-1">' + pc.absurd_warning + '</div>'
+      ? '<div class="text-xs text-red-400 mt-1">' + escapeHtml(pc.absurd_warning) + '</div>'
       : '';
     // OCR text color: red on the actual stuck ply, yellow on a backtrack
     // proposal at an earlier ply. Reuses ocrColorClass to keep this
     // pending-similarity block consistent with the deep-search list and
     // the headline / move-list / OCR-cell highlights.
     var pcOcrColor = ocrColorClass({ ply: pcPly });
-    btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm"><span class="text-gray-400">' + pcPlyStr + '</span> <span class="' + pcOcrColor + '">' + pc.original + '</span> → <span class="text-yellow-300 font-semibold">' + pc.suggested + '</span>' + pcAbsurdTag2 + '</span><span class="text-yellow-400 text-xs">' + pc.num_changes + ' changes</span></div>' + pcAbsurdLine2 + '<div class="text-xs text-yellow-600 mt-1">Requires confirmation - click to accept</div>';
+    btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm"><span class="text-gray-400">' + pcPlyStr + '</span> <span class="' + pcOcrColor + '">' + escapeHtml(pc.original) + '</span> → <span class="text-yellow-300 font-semibold">' + escapeHtml(pc.suggested) + '</span>' + pcAbsurdTag2 + '</span><span class="text-yellow-400 text-xs">' + pc.num_changes + ' changes</span></div>' + pcAbsurdLine2 + '<div class="text-xs text-yellow-600 mt-1">Requires confirmation - click to accept</div>';
     // Compute arrow squares for pending confirmation
     var pcFrom = null, pcTo = null;
     try {
@@ -434,7 +434,7 @@ function renderFixes(fixes){
     var simBadge = sim >= 50 ? 'text-green-400' : (sim >= 25 ? 'text-yellow-400' : 'text-gray-500');
     var rBadge = reachBadgeColor(fix, maxReach);
     var plyLabel = fix.ply_str ? '<span class="text-gray-400">' + fix.ply_str + '</span> ' : '';
-    btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm">' + plyLabel + '<span class="' + ocrColorClass(fix) + '">' + fix.ocr + '</span> → <span class="text-green-400 font-semibold">' + fix.san + '</span></span><span class="text-xs"><span class="' + simBadge + '">Sim:' + sim + '%</span>' + (reach ? ' <span class="' + rBadge + '">' + reach + '</span>' : '') + '</span></div>';
+    btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm">' + plyLabel + '<span class="' + ocrColorClass(fix) + '">' + escapeHtml(fix.ocr) + '</span> → <span class="text-green-400 font-semibold">' + escapeHtml(fix.san) + '</span></span><span class="text-xs"><span class="' + simBadge + '">Sim:' + sim + '%</span>' + (reach ? ' <span class="' + rBadge + '">' + reach + '</span>' : '') + '</span></div>';
     btn.onclick = function(){ selectFix(fix, btn); };
     btn.ondblclick = function(){ selectFix(fix, btn); applyFix(); };
     container.appendChild(btn);
@@ -452,9 +452,9 @@ function renderFixes(fixes){
       var btn = document.createElement('button');
       btn.className = 'w-full text-left p-2.5 rounded-lg border bg-purple-900/30 hover:bg-purple-800/30 border-purple-600';
       var status = reachLabel(mc) || '?';
-      var insertInfo = 'Insert <span class="text-purple-300 font-semibold">' + mc.inserted_move + '</span>';
+      var insertInfo = 'Insert <span class="text-purple-300 font-semibold">' + escapeHtml(mc.inserted_move) + '</span>';
       if(mc.corrected_stuck_move){
-        insertInfo += ' + change <span class="text-gray-400">' + mc.original_stuck_move + '</span> → <span class="text-purple-300">' + mc.corrected_stuck_move + '</span>';
+        insertInfo += ' + change <span class="text-gray-400">' + escapeHtml(mc.original_stuck_move) + '</span> → <span class="text-purple-300">' + escapeHtml(mc.corrected_stuck_move) + '</span>';
       }
       btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm">' + (i+1) + '. ' + insertInfo + '</span><span class="text-purple-400 text-xs">' + status + '</span></div>';
       btn.title = 'Insert missing move before stuck position';
@@ -502,7 +502,7 @@ function renderSimpleFixes(){
     btn.className = 'w-full text-left p-2.5 rounded-lg border ' + (isFirst ? 'bg-green-600/30 border-green-500' : 'bg-gray-700 hover:bg-gray-600 border-gray-600');
     btn.title = 'Click to select • Double-click to apply';
     var simBadge = item.sim >= 50 ? 'text-green-400' : (item.sim >= 25 ? 'text-yellow-400' : 'text-gray-500');
-    btn.innerHTML = '<div class="flex justify-between"><span class="font-mono text-sm"><span class="text-gray-400">' + lbl + '</span> <span class="text-red-400">' + ocr + '</span> → <span class="text-green-400">' + item.san + '</span></span><span class="' + simBadge + ' text-xs">Sim:' + item.sim + '%</span></div>';
+    btn.innerHTML = '<div class="flex justify-between"><span class="font-mono text-sm"><span class="text-gray-400">' + lbl + '</span> <span class="text-red-400">' + escapeHtml(ocr) + '</span> → <span class="text-green-400">' + escapeHtml(item.san) + '</span></span><span class="' + simBadge + ' text-xs">Sim:' + item.sim + '%</span></div>';
     var fix = {ocr: ocr, san: item.san, similarity: item.sim, ply_str: lbl};
     btn.onclick = function(){ selectFix(fix, btn); };
     btn.ondblclick = function(){ selectFix(fix, btn); applyFix(); };
@@ -1638,6 +1638,10 @@ async function computeQuickFixes() {
   var moveEntry = state.moves[moveNum];
   if (!moveEntry) return [];
 
+  // Read everything needed from moveEntry here, before the first await.
+  // Review mode (_computeQuickFixesAtPly) swaps the OCR text into this
+  // entry only for this synchronous prologue and restores it before awaiting.
+
   // Get OCR alternatives for this ply
   var alts = isWhite ? moveEntry.wAlts : moveEntry.bAlts;
   var lenientAlts = isWhite ? (moveEntry.wLenientAlts || []) : (moveEntry.bLenientAlts || []);
@@ -2093,15 +2097,30 @@ function _normalizeLenientJS(raw, chessInstance, legalMoves) {
     if (before[0] >= 'A' && before[0] <= 'Z' && before[0] !== 'P') {
       piece = before[0];
     }
+    // Written source square (f3 in Nf3-e5, e4 in e4-d5): when present the
+    // legal move must start there, else "e4-d5" could become a d-pawn push.
+    var dashSrc = (before.match(/([a-h][1-8])$/) || [])[1] || null;
+    var fromOk = function(san) {
+      if (!dashSrc) return true;
+      try {
+        var r = chessInstance.move(san);
+        if (r) {
+          var ok = r.from === dashSrc;
+          chessInstance.undo();
+          return ok;
+        }
+      } catch (e) { /* not legal */ }
+      return false;
+    };
     if (after.length >= 2) {
       // Try piece + dest
       var candidate = piece + after;
-      if (legalMoves.indexOf(candidate) >= 0) return candidate;
+      if (legalMoves.indexOf(candidate) >= 0 && fromOk(candidate)) return candidate;
       // Try with capture
       candidate = piece + 'x' + after;
-      if (legalMoves.indexOf(candidate) >= 0) return candidate;
+      if (legalMoves.indexOf(candidate) >= 0 && fromOk(candidate)) return candidate;
       // Pawn: just dest
-      if (!piece && legalMoves.indexOf(after) >= 0) return after;
+      if (!piece && legalMoves.indexOf(after) >= 0 && fromOk(after)) return after;
     }
     return null;
   }
@@ -2124,7 +2143,9 @@ function _normalizeLenientJS(raw, chessInstance, legalMoves) {
   // Piece-captures-piece: BxN, RxR → find matching capture using board state
   if (raw.length >= 3 && raw[1] === 'x' && raw[0] >= 'A' && raw[2] >= 'A') {
     var attackerPiece = raw[0] === 'P' ? '' : raw[0]; // P prefix → pawn
-    var victimPiece = raw[2] === 'P' ? null : raw[2]; // what's being captured
+    // what's being captured — P is kept (not null) so BxP must capture a
+    // pawn; chess.js reports en passant as captured 'p' too.
+    var victimPiece = raw[2];
     // Optional square after victim: NxBc4 → victim on c4
     var victimSquare = (raw.length >= 5 && raw[3] >= 'a' && raw[3] <= 'h' && raw[4] >= '1' && raw[4] <= '8') ? raw.slice(3, 5) : null;
     var matches = [];
@@ -2252,8 +2273,8 @@ function renderQuickFixes(quickFixes) {
         var reBadge = fix.reocr_conf >= 30 ? 'text-cyan-400' : (fix.reocr_conf >= 10 ? 'text-cyan-600' : 'text-gray-500');
         scoreParts += ' <span class="' + reBadge + '">Re:' + fix.reocr_conf + '%</span>';
       }
-      var absurdTag = fix.absurd_warning ? ' <span class="text-red-400" title="' + (fix.absurd_reason || 'Tactically absurd') + '">⚠️</span>' : '';
-      btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm"><span class="text-gray-400">' + fix.ply_str + '</span> <span class="' + ocrColorClass(fix) + '">' + fix.ocr + '</span> → <span class="' + sanClass + ' font-semibold">' + fix.san + '</span>' + sourceTag + absurdTag + '</span><span class="text-xs">' + scoreParts + '</span></div>';
+      var absurdTag = fix.absurd_warning ? ' <span class="text-red-400" title="' + escapeHtml((fix.absurd_reason || 'Tactically absurd')) + '">⚠️</span>' : '';
+      btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm"><span class="text-gray-400">' + fix.ply_str + '</span> <span class="' + ocrColorClass(fix) + '">' + escapeHtml(fix.ocr) + '</span> → <span class="' + sanClass + ' font-semibold">' + escapeHtml(fix.san) + '</span>' + sourceTag + absurdTag + '</span><span class="text-xs">' + scoreParts + '</span></div>';
       btn.onclick = function() { selectFix(fix, btn); };
       btn.ondblclick = function() { selectFix(fix, btn); applyFix(); };
       container.appendChild(btn);
@@ -2289,9 +2310,9 @@ function renderQuickFixes(quickFixes) {
       ? ' <span class="text-red-400" title="' + pc.absurd_warning.replace(/"/g, '&quot;') + '">⚠️</span>'
       : '';
     var pcAbsurdLine = pc.absurd_warning
-      ? '<div class="text-xs text-red-400 mt-1">' + pc.absurd_warning + '</div>'
+      ? '<div class="text-xs text-red-400 mt-1">' + escapeHtml(pc.absurd_warning) + '</div>'
       : '';
-    btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm"><span class="text-gray-400">' + pcPlyStr + '</span> <span class="text-red-400">' + pc.original + '</span> → <span class="text-yellow-300 font-semibold">' + pc.suggested + '</span>' + pcAbsurdTag + '</span><span class="text-yellow-400 text-xs">' + reasonStr + '</span></div>' + pcAbsurdLine + '<div class="text-xs text-yellow-600 mt-1">Requires confirmation - click to accept</div>';
+    btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm"><span class="text-gray-400">' + pcPlyStr + '</span> <span class="text-red-400">' + escapeHtml(pc.original) + '</span> → <span class="text-yellow-300 font-semibold">' + escapeHtml(pc.suggested) + '</span>' + pcAbsurdTag + '</span><span class="text-yellow-400 text-xs">' + reasonStr + '</span></div>' + pcAbsurdLine + '<div class="text-xs text-yellow-600 mt-1">Requires confirmation - click to accept</div>';
     // Compute arrow squares for pending confirmation
     var pcFrom = null, pcTo = null;
     try {
@@ -2423,9 +2444,9 @@ function mergeBacktrackFixes(backtrackFixes, missingMoveCandidates) {
       var rBadge = reachBadgeColor(fix, maxBacktrackReach);
       var plyLabel = fix.ply_str ? '<span class="text-gray-400">' + fix.ply_str + '</span> ' : '';
       if (isKeepAsIs) {
-        btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm">' + plyLabel + '<span class="text-yellow-400 font-semibold">Keep ' + fix.san + ' as-is</span></span><span class="text-yellow-500 text-xs">Current move</span></div>';
+        btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm">' + plyLabel + '<span class="text-yellow-400 font-semibold">Keep ' + escapeHtml(fix.san) + ' as-is</span></span><span class="text-yellow-500 text-xs">Current move</span></div>';
       } else {
-        btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm">' + plyLabel + '<span class="' + ocrColorClass(fix) + '">' + fix.ocr + '</span> → <span class="text-green-400 font-semibold">' + fix.san + '</span></span><span class="text-xs"><span class="' + simBadge + '">Sim:' + sim + '%</span>' + (reach ? ' <span class="' + rBadge + '">' + reach + '</span>' : '') + '</span></div>';
+        btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm">' + plyLabel + '<span class="' + ocrColorClass(fix) + '">' + escapeHtml(fix.ocr) + '</span> → <span class="text-green-400 font-semibold">' + escapeHtml(fix.san) + '</span></span><span class="text-xs"><span class="' + simBadge + '">Sim:' + sim + '%</span>' + (reach ? ' <span class="' + rBadge + '">' + reach + '</span>' : '') + '</span></div>';
       }
       btn.onclick = function() { selectFix(fix, btn); };
       btn.ondblclick = function() { selectFix(fix, btn); applyFix(); };
@@ -2466,9 +2487,9 @@ function mergeBacktrackFixes(backtrackFixes, missingMoveCandidates) {
       var btn = document.createElement('button');
       btn.className = 'w-full text-left p-2.5 rounded-lg border bg-purple-900/30 hover:bg-purple-800/30 border-purple-600';
       var status = reachLabel(mc) || '?';
-      var insertInfo = 'Insert <span class="text-purple-300 font-semibold">' + mc.inserted_move + '</span>';
+      var insertInfo = 'Insert <span class="text-purple-300 font-semibold">' + escapeHtml(mc.inserted_move) + '</span>';
       if (mc.corrected_stuck_move) {
-        insertInfo += ' + change <span class="text-gray-400">' + mc.original_stuck_move + '</span> → <span class="text-purple-300">' + mc.corrected_stuck_move + '</span>';
+        insertInfo += ' + change <span class="text-gray-400">' + escapeHtml(mc.original_stuck_move) + '</span> → <span class="text-purple-300">' + escapeHtml(mc.corrected_stuck_move) + '</span>';
       }
       btn.innerHTML = '<div class="flex justify-between items-center"><span class="font-mono text-sm">' + (i + 1) + '. ' + insertInfo + '</span><span class="text-purple-400 text-xs">' + status + '</span></div>';
       btn.title = 'Insert missing move before stuck position';

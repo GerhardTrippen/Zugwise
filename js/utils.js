@@ -2,6 +2,19 @@
 // UTILITIES - Small helper functions
 // =============================================================================
 
+/**
+ * Escape a string for HTML text or a quoted attribute value.
+ * Move text, OCR text and tournament-file names are untrusted input
+ * (saved .txt caches, pasted PGN, XLS/CSV/SJSON) and must pass through
+ * this before any innerHTML concatenation.
+ */
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 // =============================================================================
 // Dual-sheet detection & splitting (shared by Image tab + Batch mode)
 // =============================================================================

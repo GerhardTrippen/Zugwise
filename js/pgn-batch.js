@@ -841,6 +841,10 @@ window.PgnBatch = (function() {
           // Fresh SearchManager per game so background work doesn't
           // clobber the user's foreground interactive search workers.
           var mgr = new SearchManager();
+          // PGN batch has no scans, so no CTC. Point the manager at a key no
+          // OCR'd game can have, so it never borrows the logits of whatever
+          // game is under review (worker-api getCtcSheets).
+          mgr.ctcGameId = '\u0000pgn-batch';
           var results = await mgr.launchSearchesPromise(
             ocrMoves,
             ['greedy'],

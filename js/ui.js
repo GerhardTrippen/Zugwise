@@ -476,7 +476,7 @@ function renderMoveList(){
     };
     var icon = function(s, orig, num, color){
       if(s === 'fixed' && orig){
-        return ' <span class="revert-fix cursor-pointer text-green-400 hover:text-green-300" data-num="' + num + '" data-color="' + color + '" title="was: ' + orig + ' — double-click to revert">✓</span>';
+        return ' <span class="revert-fix cursor-pointer text-green-400 hover:text-green-300" data-num="' + num + '" data-color="' + color + '" title="was: ' + escapeHtml(orig) + ' — double-click to revert">✓</span>';
       }
       return {error:' ❌', fixed:' ✓', locked:' 🔒'}[s] || '';
     };
@@ -496,9 +496,9 @@ function renderMoveList(){
       if(status === 'fixed' || status === 'locked') return '';
       if(isAlgoProposed) return '';
       if(isOcrAlt){
-        return ' <span class="text-cyan-400 text-xs cursor-help" title="Auto-corrected from: ' + orig + '">🔄</span>';
+        return ' <span class="text-cyan-400 text-xs cursor-help" title="Auto-corrected from: ' + escapeHtml(orig) + '">🔄</span>';
       }
-      return ' <span class="text-yellow-400 text-xs cursor-help" title="Auto-corrected from: ' + orig + '">⚡</span>';
+      return ' <span class="text-yellow-400 text-xs cursor-help" title="Auto-corrected from: ' + escapeHtml(orig) + '">⚡</span>';
     };
     // Delete button for suspicious tail moves (OCR noise)
     var deleteBtn = function(ply, color){
@@ -553,7 +553,7 @@ function renderMoveList(){
     if(wSuspicious) wClass += ' bg-red-900/20';
     wTd.className = wClass;
     wTd.title = m.wOriginal ? 'was: ' + m.wOriginal + (m.wStatus === 'fixed' ? ' — double-click ✓ to revert' : '') : 'Click to view • Double-click to edit • Right-click for insert/delete';
-    wTd.innerHTML = tierInd(wPly) + (m.white || '') + corrInd(m.wOriginal, m.wOcrAlt, m.wStatus, m.wAlgoProposed) + confInd(m.wConf) + forcedStopInd(wPly, m.wStatus, m.wConf) + icon(m.wStatus, m.wOriginal, m.num, 'w') + (wSuspicious ? deleteBtn(wPly, 'w') : '');
+    wTd.innerHTML = tierInd(wPly) + escapeHtml((m.white || '')) + corrInd(m.wOriginal, m.wOcrAlt, m.wStatus, m.wAlgoProposed) + confInd(m.wConf) + forcedStopInd(wPly, m.wStatus, m.wConf) + icon(m.wStatus, m.wOriginal, m.num, 'w') + (wSuspicious ? deleteBtn(wPly, 'w') : '');
     wTd.onclick = function(e){ if(!e.target.classList.contains('delete-from-here')) goToPly(idx*2 + 1, { skipScroll: true }); };
     wTd.ondblclick = function(e){ if(e.target.classList.contains('delete-from-here')) return; if(e.target.classList.contains('revert-fix')){ e.stopPropagation(); revertToOriginalOcr(parseInt(e.target.dataset.num), e.target.dataset.color); return; } e.stopPropagation(); enterEditMode(m.num, 'w'); };
     wTd.oncontextmenu = function(e){ e.preventDefault(); showMoveContextMenu(e, idx*2, m.num, 'w'); };
@@ -563,7 +563,7 @@ function renderMoveList(){
     if(bSuspicious) bClass += ' bg-red-900/20';
     bTd.className = bClass;
     bTd.title = m.bOriginal ? 'was: ' + m.bOriginal + (m.bStatus === 'fixed' ? ' — double-click ✓ to revert' : '') : 'Click to view • Double-click to edit • Right-click for insert/delete';
-    bTd.innerHTML = tierInd(bPly) + (m.black || '') + corrInd(m.bOriginal, m.bOcrAlt, m.bStatus, m.bAlgoProposed) + confInd(m.bConf) + forcedStopInd(bPly, m.bStatus, m.bConf) + icon(m.bStatus, m.bOriginal, m.num, 'b') + (bSuspicious && m.black ? deleteBtn(bPly, 'b') : '');
+    bTd.innerHTML = tierInd(bPly) + escapeHtml((m.black || '')) + corrInd(m.bOriginal, m.bOcrAlt, m.bStatus, m.bAlgoProposed) + confInd(m.bConf) + forcedStopInd(bPly, m.bStatus, m.bConf) + icon(m.bStatus, m.bOriginal, m.num, 'b') + (bSuspicious && m.black ? deleteBtn(bPly, 'b') : '');
     bTd.onclick = function(e){ if(!e.target.classList.contains('delete-from-here')) goToPly(idx*2 + 2, { skipScroll: true }); };
     bTd.ondblclick = function(e){ if(e.target.classList.contains('delete-from-here')) return; if(e.target.classList.contains('revert-fix')){ e.stopPropagation(); revertToOriginalOcr(parseInt(e.target.dataset.num), e.target.dataset.color); return; } e.stopPropagation(); enterEditMode(m.num, 'b'); };
     bTd.oncontextmenu = function(e){ e.preventDefault(); showMoveContextMenu(e, idx*2+1, m.num, 'b'); };

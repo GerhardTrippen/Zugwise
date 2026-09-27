@@ -37,6 +37,13 @@ var SearchManager = (function() {
         // locked set after each applied fix, matching what the frontend's
         // classifyTiers would compute on a manual revalidate.
         this.tier1AgreedPlies = new Set();
+
+        // Which game's CTC logits this manager's searches rank with. Left
+        // undefined, it means "the game under review" — right for the UI
+        // singleton. Background batch managers MUST set it to the game they
+        // reconstruct: the reviewed game is usually a different one, and
+        // handing its handwriting to another game's search is a wrong answer.
+        this.ctcGameId = undefined;
     }
 
     /**
@@ -291,7 +298,9 @@ var SearchManager = (function() {
             // it did before, rather than not running at all.
             try {
                 if (window.zugwise && window.zugwise.getCtcSheets) {
-                    var _sheets = window.zugwise.getCtcSheets();
+                    var _sheets = (self.ctcGameId !== undefined)
+                        ? window.zugwise.getCtcSheets(self.ctcGameId)
+                        : window.zugwise.getCtcSheets();
                     if (_sheets && _sheets.length) {
                         await worker._send('set-ctc-logits', { sheets: _sheets });
                     }

@@ -355,6 +355,21 @@
       var w2Top = _norm(_topMove(w2));
       if (!w1Top || w1Top !== w2Top) continue;
       topMatchCount++;
+      // Exchange guard: "a player cannot make the same move twice" is false
+      // for captures — 25.Rxd8+ Rxd8 26.Rxd8+ Rxd8 or Nxd5 Nxd5 Nxd5 repeat
+      // legally while pieces are traded on one square. No position is
+      // available here (the cells are raw OCR, often past the verified
+      // prefix), so use the structural signature instead: W captures on X,
+      // B's intervening move also captures on X. That is a recapture chain,
+      // not a duplicated row. Cost: a genuinely duplicated exchange row is
+      // no longer caught here and is left to the NW layer.
+      if (w1Top.indexOf('x') >= 0) {
+        var b1Top = _norm(_topMove(b1));
+        var sqRe = /([a-h][1-8])(=?[QRBN])?$/;
+        var wDst = w1Top.match(sqRe);
+        var bDst = b1Top ? b1Top.match(sqRe) : null;
+        if (wDst && bDst && b1Top.indexOf('x') >= 0 && wDst[1] === bDst[1]) continue;
+      }
       var wScore = poolOverlap(_fullAlts(w1), _fullAlts(w2)).score;
       var bScore = poolOverlap(_fullAlts(b1), _fullAlts(b2)).score;
       // Structured B-overlap as a fuzzy fallback: catches near-duplicates

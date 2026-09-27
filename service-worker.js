@@ -4,7 +4,7 @@
 // This is the app's version register: bump it on every shipped change, and
 // update the footer in index.html to match (they silently diverged for 18
 // versions after v0.8.0).
-const CACHE_NAME = 'zugwise-v0.11.26';   // move prior metadata + analytics bypass
+const CACHE_NAME = 'zugwise-v0.12.0';    // paper release: engine + security fixes, full precache
 
 // Origins that don't send CORS headers — must use no-cors (gives opaque responses)
 const NO_CORS_ORIGINS = ['docs.opencv.org', 'cdn.tailwindcss.com'];
@@ -104,8 +104,12 @@ const STATIC_ASSETS = [
   './js/batch-dashboard.js',
   './js/batch-game-list.js',
   './js/pgn-batch.js',
-  
-  // Python modules (served by dev server at /backend-python/)
+  './js/batch-grid-template.js',
+  './js/batch-scoresheet-collect.js',
+  './js/pgn-header-editor.js',
+
+  // Python modules (served by dev server at /backend-python/).
+  // Keep in sync with PYTHON_MODULES in python-loader.js.
   './backend-python/data_structures.py',
   './backend-python/helpers.py',
   './backend-python/similarity.py',
@@ -115,8 +119,11 @@ const STATIC_ASSETS = [
   './backend-python/constraints.py',
   './backend-python/missing_moves.py',
   './backend-python/lenient_normalize.py',
+  './backend-python/logits_io.py',
+  './backend-python/ctc_align.py',
   './backend-python/fix_finding.py',
   './backend-python/full_game_search.py',
+  './backend-python/dijkstra_search.py',
   './backend-python/validation.py',
 
   // Vendored Python wheel (installed by search-worker.js via micropip for offline use)

@@ -22,6 +22,7 @@ class ZugwiseAPI {
         this.onStatusChange = null;
         this.useWorker = true; // Toggle between worker and Flask backend
         this.ocrPool = null;   // OcrPool instance when USE_OCR_POOL
+        this._ctcByGame = new Map();  // gameKey -> [{data, plies}] (see _ctcKey)
     }
 
     async init(onStatus) {
@@ -135,38 +136,119 @@ class ZugwiseAPI {
      * leaves it null, where there is nothing to disambiguate.
      */
     setOcrGameTag(gameId) {
-        // A new game invalidates the accumulated logits: keeping them would
-        // score this game's moves against the previous game's handwriting.
-        if (gameId !== this._ocrGameTag) this._ctcSheets = [];
+        // Starting (re-)OCR of a batch game invalidates THAT game's logits:
+        // the pass about to run replaces them. Other games keep theirs — they
+        // are still being reconstructed or reviewed (see _ctcByGame).
+        // Single-game mode (null tag) is left exactly as it was.
+        if (gameId) this._ctcByGame.set(this._ctcKey(gameId), []);
         this._ocrGameTag = gameId || null;
     }
 
-    /**
-     * The logits for the game under REVIEW, as {data, plies} per sheet. Handed
-     * to the search worker so greedy/beam/dijkstra rank on the SAME evidence as
-     * the interactive panel — the divergence that made the algorithms pick a
-     * 4.W fabrication over the correct 7.W Bg5.
-     *
-     * THE GUARD: returns nothing unless the accumulated sheets belong to the
-     * game being reviewed. Batch OCR runs AHEAD of review, so what is in hand
-     * is usually a LATER game's; handing that over would score the right moves
-     * against the wrong handwriting — silently, and with full confidence.
-     * Single-game mode leaves both tags null, so the check passes trivially.
-     *
-     * Batch review of an already-OCR'd game therefore gets no signal yet; the
-     * sidecar is on disk for it and loading that back is the remaining step.
-     * Missing evidence is a lost improvement. Wrong evidence is a wrong answer.
-     */
-    getCtcSheets() {
-        if (this._reviewGameTag !== this._ocrGameTag) return [];
-        return this._ctcSheets || [];
+    // -------------------------------------------------------------------------
+    // CTC logits, stored PER GAME
+    // -------------------------------------------------------------------------
+    // This used to be ONE slot (_ctcSheets), reset whenever the OCR queue moved
+    // to the next game, and handed out only when the game under review was the
+    // game OCR happened to be on. Batch OCR runs ahead of both review and
+    // reconstruction, so a background search for game X almost always got
+    // NOTHING — and in the one case the tags did match (OCR finished, user
+    // reviewing the last game, a slow Dijkstra still running on game 1), it got
+    // the reviewed game's handwriting against game 1's plies. Keyed by game,
+    // every consumer asks for the game it is actually working on.
+    //
+    // Key '' is single-game mode (null tags), which therefore behaves as the
+    // old single slot did. Bounded LRU: a sheet-page is ~0.4 MB, so the cap is
+    // generous for a round; an evicted game simply ranks without CTC.
+
+    _ctcKey(gameId) {
+        return gameId == null ? '' : String(gameId);
     }
 
-    /** Install the accumulated logits into this worker's Python namespace. */
+    _ctcSheetsFor(gameId) {
+        const key = this._ctcKey(gameId);
+        let sheets = this._ctcByGame.get(key);
+        if (!sheets) {
+            sheets = [];
+            this._ctcByGame.set(key, sheets);
+            while (this._ctcByGame.size > ZugwiseAPI.CTC_MAX_GAMES) {
+                this._ctcByGame.delete(this._ctcByGame.keys().next().value);
+            }
+        }
+        return sheets;
+    }
+
+    /**
+     * A sidecar's bytes are usable only if their cell count equals the ply
+     * list. Plies are POSITIONAL (entry i of the sidecar is plies[i]), so a
+     * mismatch does not degrade, it attaches one move's handwriting to another.
+     */
+    _ctcSheetOk(data, plies) {
+        if (!data || !plies || !plies.length) return false;
+        if (typeof LogitsIO !== 'undefined' && LogitsIO.decode) {
+            let nCells = null;
+            try {
+                nCells = LogitsIO.decode(data).nCells;
+            } catch (e) {
+                console.warn('[CTC] sidecar unreadable, skipping:', e.message);
+                return false;
+            }
+            if (nCells !== plies.length) {
+                console.warn('[CTC] sidecar has ' + nCells + ' cells but the text has ' +
+                             plies.length + ' — refusing it rather than misaligning the evidence.');
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * The logits for one game, as {data, plies} per sheet, in preference order.
+     * Handed to the search worker so greedy/beam/dijkstra rank on the SAME
+     * evidence as the interactive panel — the divergence that made the
+     * algorithms pick a 4.W fabrication over the correct 7.W Bg5.
+     *
+     * With no argument: the game under REVIEW (the interactive panel's game).
+     * Background reconstruction MUST pass the game it is reconstructing — the
+     * reviewed game is a different game most of the time.
+     * Missing evidence is a lost improvement. Wrong evidence is a wrong answer.
+     */
+    getCtcSheets(gameId) {
+        const key = arguments.length ? this._ctcKey(gameId)
+                                     : this._ctcKey(this._reviewGameTag);
+        return this._ctcByGame.get(key) || [];
+    }
+
+    /**
+     * Install the REVIEWED game's logits into this worker's Python namespace.
+     * With none, CLEAR the installed default — a no-op would leave the
+     * previous install (possibly from before a re-OCR) scoring this game.
+     */
     async installCtcLogits() {
         const sheets = this.getCtcSheets();
-        if (!sheets.length) return { plies: 0 };
+        if (!sheets.length) {
+            await this._send('clear-ctc-logits', {});
+            return { plies: 0 };
+        }
         return this._send('set-ctc-logits', { sheets });
+    }
+
+    /**
+     * Replace one game's logits with the given sheets ({data, plies}, in
+     * preference order — the first sheet to cover a ply wins). Each sheet is
+     * checked by _ctcSheetOk and dropped individually if it fails.
+     *
+     * The batch OCR queue calls this once per game, on a cache hit AND after a
+     * fresh pass, from the same sidecar bytes and the same page-aware plies —
+     * so a game ranks on identical evidence whether or not it was just OCR'd.
+     */
+    async setGameCtcSheets(gameId, sheets) {
+        const kept = (sheets || []).filter((s) => s && this._ctcSheetOk(s.data, s.plies))
+                                   .map((s) => ({ data: s.data, plies: s.plies }));
+        const key = this._ctcKey(gameId);
+        this._ctcByGame.delete(key);          // re-insert = most recently used
+        this._ctcSheetsFor(gameId).push(...kept);
+        if (key === this._ctcKey(this._reviewGameTag)) await this.installCtcLogits();
+        return { sheets: kept.length };
     }
 
     /**
@@ -229,30 +311,16 @@ class ZugwiseAPI {
      * check on the way out.
      */
     async addCachedCtcSheet(data, plies) {
-        if (!data || !plies || !plies.length) return { plies: 0 };
-        if (typeof LogitsIO !== 'undefined' && LogitsIO.decode) {
-            let nCells = null;
-            try {
-                nCells = LogitsIO.decode(data).nCells;
-            } catch (e) {
-                console.warn('[CTC] cached sidecar unreadable, skipping:', e.message);
-                return { plies: 0 };
-            }
-            if (nCells !== plies.length) {
-                console.warn('[CTC] cached sidecar has ' + nCells + ' cells but the cached ' +
-                             'text has ' + plies.length + ' — refusing it rather than ' +
-                             'misaligning the evidence.');
-                return { plies: 0 };
-            }
-        }
-        this._ctcSheets = this._ctcSheets || [];
-        this._ctcSheets.push({ data: data, plies: plies });
+        if (!this._ctcSheetOk(data, plies)) return { plies: 0 };
+        // Appends to the game currently being OCR'd. The batch queue now uses
+        // setGameCtcSheets (explicit game, replace); kept for other callers.
+        this._ctcSheetsFor(this._ocrGameTag).push({ data: data, plies: plies });
         return this.installCtcLogits();
     }
 
-    /** Forget accumulated logits (game switch, or a fresh upload). */
+    /** Forget ALL stored logits (every game) and the installed default. */
     clearCtcLogits() {
-        this._ctcSheets = [];
+        this._ctcByGame.clear();
         try { this._send('clear-ctc-logits', {}); } catch (e) { /* worker may be down */ }
     }
 
@@ -711,14 +779,20 @@ class ZugwiseAPI {
                 // Keep an encoded copy per sheet: the sidecar format is already
                 // what both Python readers understand, so the browser, the
                 // search worker and the recorder all consume the same bytes.
-                this._ctcSheets = this._ctcSheets || [];
-                this._ctcSheets.push({
+                // Interim, per page, printed move numbers: batch mode REPLACES
+                // this game's entry when the whole game is done
+                // (BatchOcrQueue -> setGameCtcSheets, page-aware plies).
+                this._ctcSheetsFor(this._ocrGameTag).push({
                     data: LogitsIO.encode(logitsCells.data.map((d) => ({
                         data: d, seqLen: logitsCells.seqLen, vocabSize: logitsCells.vocabSize
                     }))),
                     plies: result.cells.map((c) => (c.moveNumber - 1) * 2 + (c.color === 'w' ? 0 : 1))
                 });
-                await this.installCtcLogits();
+                // Only the reviewed game's logits live in the panel worker;
+                // a page of a game running ahead changes nothing there.
+                if (this._ctcKey(this._ocrGameTag) === this._ctcKey(this._reviewGameTag)) {
+                    await this.installCtcLogits();
+                }
             }
         } catch (e) {
             // NB: sheetTag is const-scoped to the OCR_TIMING block above.
@@ -791,6 +865,9 @@ class ZugwiseAPI {
         }
     }
 }
+
+// Games whose CTC logits are kept in memory (LRU). ~0.4 MB per sheet-page.
+ZugwiseAPI.CTC_MAX_GAMES = 64;
 
 // Global instance
 window.zugwise = new ZugwiseAPI();

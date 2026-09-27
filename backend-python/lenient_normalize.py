@@ -92,17 +92,33 @@ def _try_zero_castling(raw: str, board: chess.Board) -> Optional[Dict]:
         san = 'O-O-O'
         try:
             board.parse_san(san)
-            return {'san': san + suffix, 'raw': raw, 'notation_type': 'zero_castling', 'ambiguous': False}
+            return {'san': _suffixed(san, suffix), 'raw': raw, 'notation_type': 'zero_castling', 'ambiguous': False}
         except:
             return {'san': None, 'raw': raw, 'notation_type': 'zero_castling', 'ambiguous': False}
     elif clean == '0-0':
         san = 'O-O'
         try:
             board.parse_san(san)
-            return {'san': san + suffix, 'raw': raw, 'notation_type': 'zero_castling', 'ambiguous': False}
+            return {'san': _suffixed(san, suffix), 'raw': raw, 'notation_type': 'zero_castling', 'ambiguous': False}
         except:
             return {'san': None, 'raw': raw, 'notation_type': 'zero_castling', 'ambiguous': False}
     return None
+
+
+def _suffixed(san: str, suffix: str) -> str:
+    """Attach the WRITTEN check/mate suffix without doubling one board.san()
+    already produced ("Ra8+" + "+" was "Ra8++", which matches no legal move)."""
+    return san.rstrip('+#') + suffix if suffix else san
+
+
+def _promo_ok(move: chess.Move, promo: str) -> bool:
+    """True unless a promotion piece was WRITTEN ("=N") and this move promotes
+    to something else. Without it e7-e8=N matched all four promotions, was
+    marked ambiguous and returned the first (normally =Q)."""
+    if not promo or move.promotion is None:
+        return True
+    letter = promo.lstrip('=')[:1].upper()
+    return chess.piece_symbol(move.promotion).upper() == letter
 
 
 def _try_extended_notation(raw: str, board: chess.Board) -> Optional[Dict]:
@@ -152,6 +168,8 @@ def _try_extended_notation(raw: str, board: chess.Board) -> Optional[Dict]:
     for move in board.legal_moves:
         if move.to_square != dest_square or move.from_square != src_square:
             continue
+        if not _promo_ok(move, promo):
+            continue
         san = board.san(move)
         if piece:
             # Verify piece type matches
@@ -169,9 +187,9 @@ def _try_extended_notation(raw: str, board: chess.Board) -> Optional[Dict]:
         # Add promotion if needed
         if promo and '=' not in san:
             san = san + promo
-        return {'san': san + suffix, 'raw': raw, 'notation_type': 'extended', 'ambiguous': False}
+        return {'san': _suffixed(san, suffix), 'raw': raw, 'notation_type': 'extended', 'ambiguous': False}
     elif len(matches) > 1:
-        return {'san': matches[0] + suffix, 'raw': raw, 'notation_type': 'extended', 'ambiguous': True}
+        return {'san': _suffixed(matches[0], suffix), 'raw': raw, 'notation_type': 'extended', 'ambiguous': True}
 
     return None
 
@@ -200,7 +218,7 @@ def _try_square_captures_square(raw: str, board: chess.Board) -> Optional[Dict]:
 
     matches = []
     for move in board.legal_moves:
-        if move.from_square == src_square and move.to_square == dst_square:
+        if move.from_square == src_square and move.to_square == dst_square and _promo_ok(move, promo):
             san = board.san(move)
             matches.append(san)
 
@@ -208,9 +226,9 @@ def _try_square_captures_square(raw: str, board: chess.Board) -> Optional[Dict]:
         san = matches[0]
         if promo and '=' not in san:
             san = san + promo
-        return {'san': san + suffix, 'raw': raw, 'notation_type': 'square_captures_square', 'ambiguous': False}
+        return {'san': _suffixed(san, suffix), 'raw': raw, 'notation_type': 'square_captures_square', 'ambiguous': False}
     elif len(matches) > 1:
-        return {'san': matches[0] + suffix, 'raw': raw, 'notation_type': 'square_captures_square', 'ambiguous': True}
+        return {'san': _suffixed(matches[0], suffix), 'raw': raw, 'notation_type': 'square_captures_square', 'ambiguous': True}
 
     return None
 

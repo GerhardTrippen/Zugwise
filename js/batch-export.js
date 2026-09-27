@@ -28,9 +28,10 @@ var BatchExport = (function() {
                            'WhiteElo', 'BlackElo',
                            'WhiteTitle', 'BlackTitle',
                            'WhiteCfcId', 'BlackCfcId',
+                           'WhiteFideId', 'BlackFideId',
                            'ECO', 'PlyCount',
                            'EventDate', 'EventType', 'EventRounds', 'EventCountry',
-                           'Source', 'Termination'];
+                           'Source', 'Termination', 'ZugwiseReview'];
 
   // Termination tag value used for the incomplete-PGN export. Standard PGN
   // (§9.8.1) defines a small set of values (abandoned, normal, time forfeit,

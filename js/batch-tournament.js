@@ -211,8 +211,12 @@ var BatchTournament = (function() {
           var color = parts[2];
           var boardNum = parseInt(parts[3]) || 0;
           if (opponentPair <= 0 || color === '-') return;
-          if (seenBoards[boardNum]) return;
-          seenBoards[boardNum] = true;
+          // Board 0 = board number missing: key on the (unordered) player
+          // pair instead, else every game after the first would be dropped.
+          var seenKey = boardNum > 0 ? boardNum
+            : 'p' + Math.min(p.Pair, opponentPair) + '-' + Math.max(p.Pair, opponentPair);
+          if (seenBoards[seenKey]) return;
+          seenBoards[seenKey] = true;
 
           var whitePair, blackPair, result;
           if (color === 'W') {

@@ -356,6 +356,7 @@ var BatchReconstructQueue = (function() {
 
     var self = this;
     var mgr = new window.SearchManager();
+    mgr.ctcGameId = gameId;   // rank with THIS game's handwriting, not the reviewed game's
     this._currentManager = mgr;
 
     // If this run is a review-requeue (override at ply N), thread the

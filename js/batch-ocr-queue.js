@@ -405,10 +405,27 @@ var BatchOcrQueue = (function() {
    * position i of one lines up with position i of the other. Mirrors the
    * fresh-OCR expression in worker-api (moveNumber/color there, num/color in
    * the parsed cache).
+   *
+   * MULTI-PAGE: a sheet spanning several pages RESTARTS its printed move
+   * numbers at 1 on every page (all 6 multi-page Crown .p1.txt files do). Taken
+   * literally, page 2's cells land on page 1's plies, and LazyPlyLogits keeps
+   * the FIRST entry per ply — so every move past page 1 silently got no CTC,
+   * while the offline recorder (test_recorder.parse_ocr_text_file) applied the
+   * offset and measured the signal on plies the browser never scored. Same
+   * restart rule as the recorder, so the two assign identical plies: numbering
+   * going backwards starts a new page, offset by the previous page's max.
    */
   function _pliesForCells(cells) {
+    var pageOffset = 0, lastNum = 0, pageMax = 0;
     return (cells || []).map(function(c) {
-      return (c.num - 1) * 2 + (c.color === 'w' ? 0 : 1);
+      var num = c.num;
+      if (num < lastNum) {
+        pageOffset += pageMax;
+        pageMax = 0;
+      }
+      lastNum = num;
+      if (num > pageMax) pageMax = num;
+      return (num + pageOffset - 1) * 2 + (c.color === 'w' ? 0 : 1);
     });
   }
 
@@ -418,25 +435,65 @@ var BatchOcrQueue = (function() {
    * this existed — it must never fail a cache hit that otherwise succeeded.
    */
   async function restoreCachedCtcLogits(dirHandle, gameId, sheetSpecs) {
-    if (!window.zugwise || !window.zugwise.addCachedCtcSheet) return 0;
-    var restored = 0;
+    if (!window.zugwise || !window.zugwise.setGameCtcSheets) return 0;
+    var sheets = [];
     for (var i = 0; i < sheetSpecs.length; i++) {
       var spec = sheetSpecs[i];
       if (!spec.cells || !spec.cells.length) continue;
       try {
         var buf = await readBinaryFile(dirHandle, spec.file);
         if (!buf) continue;
-        var res = await window.zugwise.addCachedCtcSheet(buf, _pliesForCells(spec.cells));
-        if (res && res.plies) restored++;
+        sheets.push({ data: buf, plies: _pliesForCells(spec.cells) });
       } catch (e) {
         console.warn('[CTC] could not restore ' + spec.file + ': ' + e.message);
       }
+    }
+    var restored = 0;
+    try {
+      // Keyed to THIS game explicitly — not to whichever game the OCR tag or
+      // the review tag points at when a search later asks for it.
+      var res = await window.zugwise.setGameCtcSheets(gameId, sheets);
+      restored = (res && res.sheets) || 0;
+    } catch (e) {
+      console.warn('[CTC] could not install restored logits for ' + gameId + ': ' + e.message);
     }
     if (restored) {
       console.log('[CTC] restored logits for ' + gameId + ' from ' + restored +
                   ' cached sidecar(s) — the CTC signal survives the cache hit');
     }
     return restored;
+  }
+
+  /**
+   * After a FRESH OCR pass, replace this game's logits with exactly what the
+   * sidecar holds: the encoded, per-sheet bytes of the cells that were KEPT,
+   * with page-aware plies. The per-page pushes made during OCR used printed
+   * move numbers (page 2 collides with page 1) and included passes the queue
+   * discarded (a weak grid before a template rescue), so they are overwritten.
+   * Doing it from the same bytes and the same _pliesForCells as the cache-hit
+   * path means a game ranks on identical evidence before and after a reload.
+   * Needs no scan folder, so "(downloaded)" mode gets CTC too.
+   */
+  async function installFreshCtcLogits(gameId, result) {
+    if (!window.zugwise || !window.zugwise.setGameCtcSheets || !result) return 0;
+    var sheets = [];
+    if (result.isDualSheet) {
+      if (result.sheet1Logits && result.sheet1 && result.sheet1.length) {
+        sheets.push({ data: result.sheet1Logits, plies: _pliesForCells(result.sheet1) });
+      }
+      if (result.sheet2Logits && result.sheet2 && result.sheet2.length) {
+        sheets.push({ data: result.sheet2Logits, plies: _pliesForCells(result.sheet2) });
+      }
+    } else if (result.logits && result.ocrCells && result.ocrCells.length) {
+      sheets.push({ data: result.logits, plies: _pliesForCells(result.ocrCells) });
+    }
+    try {
+      var res = await window.zugwise.setGameCtcSheets(gameId, sheets);
+      return (res && res.sheets) || 0;
+    } catch (e) {
+      console.warn('[CTC] could not install fresh logits for ' + gameId + ': ' + e.message);
+      return 0;
+    }
   }
 
   async function writeTextFile(dirHandle, filename, content) {
@@ -649,6 +706,11 @@ var BatchOcrQueue = (function() {
     try {
       var result = await this._processGame(item.game);
       this.results[item.gameId] = result;
+
+      // Cache hits installed theirs inside _processGame (restoreCachedCtcLogits).
+      if (!result.fromCache) {
+        await installFreshCtcLogits(item.gameId, result);
+      }
 
       // Save OCR files if output directory is set (skip on cache hits — already on disk)
       if (this.outputDirHandle && !result.fromCache) {

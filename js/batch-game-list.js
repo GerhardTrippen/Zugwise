@@ -946,7 +946,12 @@ var BatchGameList = (function() {
     if (!folder) return;
     var names = [
       gameId + '.txt', gameId + '.p1.txt', gameId + '.p2.txt',
-      gameId + '.grid.json', gameId + '.p1.grid.json', gameId + '.p2.grid.json'
+      gameId + '.grid.json', gameId + '.p1.grid.json', gameId + '.p2.grid.json',
+      // The logits sidecars too: a re-OCR that fails to produce logits writes
+      // none, and the stale file would then be restored against the NEW text.
+      // The cell-count guard does not catch it when the count is unchanged —
+      // exactly the 2col20@1 -> 2col20@41 re-layout this re-OCR exists for.
+      gameId + '.logits.bin', gameId + '.p1.logits.bin', gameId + '.p2.logits.bin'
     ];
     for (var i = 0; i < names.length; i++) {
       var name = names[i];
@@ -983,6 +988,25 @@ var BatchGameList = (function() {
     game.cachedLayout = null;
     game.ocrProgress = null;
     game.status = GAME_STATUS.QUEUED;
+
+    // The working snapshot was built from the OLD OCR. _restoreGameWorkingState
+    // overwrites state.moves/sans/ocrCells/per-sheet cells with it, so leaving
+    // it made the re-OCR invisible: the game reopened on the old layout's cells.
+    // Kept as a backup (same as the poison discard), never destroyed.
+    if (game.workingState) {
+      game._discardedWorkingState = game.workingState;
+      game.workingState = null;
+    }
+    // If this game is on screen, `state` still mirrors the old OCR until it is
+    // loaded again; don't let a switch-away re-snapshot it. Cleared in
+    // selectGame once the game loads from its new OCR.
+    game._reOcrPending = true;
+    // A debounced requeue would re-submit cells built from the old state.
+    if (_requeueTimer && _requeuePendingForGame === gameId) {
+      clearTimeout(_requeueTimer);
+      _requeueTimer = null;
+      _requeuePendingForGame = null;
+    }
   }
 
   /**
@@ -1023,8 +1047,9 @@ var BatchGameList = (function() {
   // reopened looking like untouched work. The artifact was on disk and correct;
   // nothing looked at it. (User: "it didn't remember any of my previous work.")
   //
-  // A plain "<stem>.pgn" is written only when a game completes — partial saves
-  // are named "_incomplete" — so its presence is the signal. BatchPaths routes
+  // A plain "<stem>.pgn" is ALSO written by the unreviewed auto-save and by a
+  // partial Save, so presence alone is NOT the signal — those two carry a
+  // marker tag and are skipped (see _loadSavedPgnForGame). BatchPaths routes
   // the read into Zugwise/PGN/ with a flat-root fallback, so pre-layout
   // tournaments resume too.
 
@@ -1055,6 +1080,17 @@ var BatchGameList = (function() {
         text = await window.BatchPaths.readText(folder, names[i]);
       } catch (e) { text = null; }
       if (!text) continue;
+      // Two OTHER writers use this same filename, and neither is finished
+      // work: _autoSaveGame (algorithm SOLVED, not yet reviewed — tagged
+      // ZugwiseReview "pending") and the partial Save button (confirmed
+      // prefix only — tagged Termination "Reconstruction incomplete").
+      // Restoring either as VERIFIED skipped the user's review entirely.
+      // Result "*" alone is NOT used: a verified game with no known result
+      // legitimately carries it.
+      if (/^\[ZugwiseReview\s+"pending"\]/m.test(text) ||
+          /^\[Termination\s+"Reconstruction incomplete/m.test(text)) {
+        continue;
+      }
       var sans = _parsePgnSans(text);
       if (!sans.length) continue;
       return { fileName: names[i], sans: sans, plyCount: sans.length };
@@ -1275,6 +1311,8 @@ var BatchGameList = (function() {
     }
     var game = batchState.games.get(gameId);
     if (!game) return;
+    // Re-OCR in flight or not yet reloaded: `state` is the OLD OCR's view.
+    if (game._reOcrPending) return;
     // Don't snapshot if processAllSheets hasn't even populated state.moves yet
     // (e.g. we never actually opened this game).
     if (!state.moves || !state.moves.length) return;
@@ -1830,6 +1868,14 @@ var BatchGameList = (function() {
       window.zugwise.setReviewGameTag(gameId);
     }
     var game = batchState.games.get(gameId);
+    // A re-OCR'd game whose new OCR has landed now loads FROM that OCR, so
+    // `state` stops being the old view and snapshots are safe again. Checked
+    // before the IN_REVIEW flip below, which would hide "still OCR'ing".
+    if (game && game._reOcrPending &&
+        game.status !== GAME_STATUS.QUEUED &&
+        game.status !== GAME_STATUS.OCR_RUNNING) {
+      delete game._reOcrPending;
+    }
     if (game && game.status !== GAME_STATUS.VERIFIED &&
         game.status !== GAME_STATUS.EXPORTED) {
       game.status = GAME_STATUS.IN_REVIEW;
@@ -3273,12 +3319,15 @@ var BatchGameList = (function() {
     } else if (game && game.board != null) {
       roundStr2 = '?.' + game.board;
     }
-    headers2.push('[Event "' + ((tournamentData && tournamentData.event) || 'Tournament') + '"]');
+    // Same escaping as BatchExport._escapeHeader (a " or \ in a name
+    // would otherwise break the tag).
+    var esc2 = function(v) { return String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"'); };
+    headers2.push('[Event "' + esc2((tournamentData && tournamentData.event) || 'Tournament') + '"]');
     headers2.push('[Site "?"]');
     headers2.push('[Date "' + new Date().toISOString().slice(0, 10).replace(/-/g, '.') + '"]');
-    headers2.push('[Round "' + roundStr2 + '"]');
-    headers2.push('[White "' + ((pairing && pairing.whiteName) || '?') + '"]');
-    headers2.push('[Black "' + ((pairing && pairing.blackName) || '?') + '"]');
+    headers2.push('[Round "' + esc2(roundStr2) + '"]');
+    headers2.push('[White "' + esc2((pairing && pairing.whiteName) || '?') + '"]');
+    headers2.push('[Black "' + esc2((pairing && pairing.blackName) || '?') + '"]');
     headers2.push('[Result "' + result + '"]');
     if (moves && moves.length > 0) headers2.push('[PlyCount "' + moves.length + '"]');
     headers2.push('[Source "Zugwise (gerhardtrippen.github.io/Zugwise)"]');
@@ -3358,13 +3407,15 @@ var BatchGameList = (function() {
     } else if (game && game.board != null) {
       roundStr = '?.' + game.board;
     }
+    // Same escaping as BatchExport._escapeHeader.
+    var esc = function(v) { return String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"'); };
     var lines = [
-      '[Event "' + ((tournamentData && tournamentData.event) || 'Tournament') + '"]',
-      '[Site "' + ((tournamentData && tournamentData.site) || '?') + '"]',
+      '[Event "' + esc((tournamentData && tournamentData.event) || 'Tournament') + '"]',
+      '[Site "' + esc((tournamentData && tournamentData.site) || '?') + '"]',
       '[Date "' + new Date().toISOString().slice(0, 10).replace(/-/g, '.') + '"]',
-      '[Round "' + roundStr + '"]',
-      '[White "' + ((pairing && pairing.whiteName) || '?') + '"]',
-      '[Black "' + ((pairing && pairing.blackName) || '?') + '"]',
+      '[Round "' + esc(roundStr) + '"]',
+      '[White "' + esc((pairing && pairing.whiteName) || '?') + '"]',
+      '[Black "' + esc((pairing && pairing.blackName) || '?') + '"]',
       '[Result "' + pairingResult + '"]',
       '[Termination "Reconstruction incomplete (Zugwise)"]',
       '[Source "Zugwise (gerhardtrippen.github.io/Zugwise)"]',
@@ -3488,7 +3539,15 @@ var BatchGameList = (function() {
       ? window.BatchTournament.buildPgnHeaders(game, tournamentData)
       : { Event: 'Tournament', Site: '?', Date: '?', Round: '?',
           White: '?', Black: '?', Result: '*' };
-    var pgn = window.BatchExport.generatePgn(game, moves, headers);
+    // Mark the file as UNREVIEWED algorithm output. It shares its name with
+    // the verified save (so the TD sees one file per game), which made the
+    // resume reader (_loadSavedPgnForGame) restore every auto-solved game as
+    // VERIFIED on reopen — nobody had looked at it. A verify overwrites this
+    // file without the tag, so the tag's presence is exactly "not reviewed".
+    var _autoHdrs = {};
+    Object.keys(headers).forEach(function(k) { _autoHdrs[k] = headers[k]; });
+    _autoHdrs.ZugwiseReview = 'pending';
+    var pgn = window.BatchExport.generatePgn(game, moves, _autoHdrs);
     var fileName = _buildPgnFilename(gameId, game) || (gameId + '.pgn');
 
     var savedTo = await window.BatchExport.saveText(pgn, fileName, 'application/x-chess-pgn');
@@ -3726,7 +3785,7 @@ var BatchGameList = (function() {
     } else {
       html += 'Round ' + (batchState.selectedRound || '?');
       if (sortedGames.length > 0 && sortedGames[0].section) {
-        html += ' &mdash; ' + sortedGames[0].section;
+        html += ' &mdash; ' + _esc(sortedGames[0].section);
       }
     }
     html += '</span>';
@@ -3852,7 +3911,7 @@ var BatchGameList = (function() {
         classes += ' opacity-60';
       }
 
-      html += '<div class="' + classes + '" data-game-id="' + game.gameId + '">';
+      html += '<div class="' + classes + '" data-game-id="' + _esc(game.gameId) + '">';
       // Status icon — for RECONSTRUCTING, override color + tooltip to surface
       // which method is currently running OR queued (the two states produce
       // different labels so the user can tell apart "actually running on
@@ -3897,7 +3956,7 @@ var BatchGameList = (function() {
       if (_isPlayerMode && game.round != null) {
         html += '<span class="text-gray-400 font-mono">R' + _esc(game.round) + '</span> ';
       }
-      html += window.BatchNaming.gameDisplayLabel(game, game.pairing);
+      html += _esc(window.BatchNaming.gameDisplayLabel(game, game.pairing));
       // Inline OCR progress while the per-image OCR queue is chewing on
       // this game. Similar to the single-game in-line progress the user
       // is used to seeing; just smaller to fit a row. Cleared by
