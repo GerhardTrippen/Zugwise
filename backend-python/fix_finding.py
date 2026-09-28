@@ -393,7 +393,7 @@ _DEFAULT_CTC_LOGITS = None
 #      play. A strong-play policy reintroduces the population mismatch that
 #      made the forbidden signals wrong.
 #   2. ADDITIVE, NEVER A REPLACEMENT. Measured, the prior ALONE ranks 44.5%,
-#      WORSE than the scorer's own 62.7%. It is complementary evidence.
+#      WORSE than the scorer's own 62.5%. It is complementary evidence.
 #   3. WEIGHT BY CROSS-VALIDATION. W=10 is leave-one-round-out CV over the
 #      Crown corpus for the SHIPPED model (move_prior_b8f128_mb0, 8x128, 48.4%
 #      move match; Sept 2026): fold weights [12,10,10,10,16,10,10,8,10], +83 CV
@@ -403,16 +403,16 @@ _DEFAULT_CTC_LOGITS = None
 #      W=12 was fitted for the 4x64 colab model. Every forbidden signal arrived
 #      instead with a compelling example.
 #   4. IT DOES NOT REPLACE absurdity DETECTION. In RANKING the prior nearly
-#      absorbs abs_pen (dropping it costs 48 rank-1 without the prior, 2 with).
+#      absorbs abs_pen (dropping it costs 48 rank-1 without the prior, 9 with).
 #      Detection's job is to STOP at the error: of 71 errors it stops at on
 #      Crown, without it 70% surface a median 3 plies later and 18% are never
 #      flagged (analyze_absurdity_stops.py). Keep abs_pen for that.
 #
-# MEASURED (Sept 26 2026, test_cases_crown: re-recorded after the recorder fix
-# and the engine fixes, all 45 Crown games, 1166 replacement decisions;
+# MEASURED (Sept 28 2026, test_cases_crown: re-recorded after the ofc fix
+# 88822d4, all 45 Crown games, 1167 replacement decisions;
 # move_prior/analyze_ctc_prior_grid.py):
-#   scorer 731 (62.7%) | +CTC 806 (69.1%) | +prior 875 (75.0%) | both 899 (77.1%)
-#   the two are 77% additive. Premier (validation, no logits): 56.6% -> 67.5%.
+#   scorer 729 (62.5%) | +CTC 805 (69.0%) | +prior 875 (75.0%) | both 896 (76.8%)
+#   the two are 75% additive. Premier (validation, no logits, 45 games): 56.5% -> 67.6%.
 #
 # THE HONEST DOWNSIDE, unchanged from CLAUDE.md: the failure mode that killed
 # win_cap is not absent. The prior gains far more than it loses, but some of the

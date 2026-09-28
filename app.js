@@ -174,7 +174,7 @@ document.addEventListener('DOMContentLoaded',async function(){
     hidePyodideLoadingOverlay();
   }
 
-  log('Zugwise v0.12.7 ready'+(CONFIG.usePyodide?' (client-side mode)':' (server mode)'));
+  log('Zugwise v0.12.8 ready'+(CONFIG.usePyodide?' (client-side mode)':' (server mode)'));
 });
 
 function setupEventListeners(){

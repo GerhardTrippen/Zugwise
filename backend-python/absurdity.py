@@ -662,9 +662,19 @@ def would_capture_be_bad(board: chess.Board, capture_square: chess.Square,
 
 def would_capture_be_bad_quiescence(board: chess.Board, capture_square: chess.Square,
                                      threshold: int = 0, max_depth: int = 8, 
-                                     debug: bool = False) -> Tuple[bool, int, str]:
+                                     debug: bool = False,
+                                     first_move: Optional[chess.Move] = None) -> Tuple[bool, int, str]:
     """
     Full quiescence search to evaluate if capturing is bad.
+
+    By default this is SQUARE-level: it tries every capture onto
+    capture_square and reports the best - the right question for "is the
+    piece on this square genuinely hanging?". Pass first_move to evaluate
+    ONE specific capture instead. A caller certifying a particular move must
+    do that: square-level lets a different capture of the same piece supply
+    the score (reported Sept 2026: in 5b2/k5p1/8/8/8/2B5/7P/K5R1 w, Rxg7+
+    loses a point after ...Bxg7 Bxg7, but square-level returned Bxg7's +1,
+    so Rxg7+ was certified as a free capture with check).
     
     Returns: (is_trap, net_gain_for_capturer, explanation)
     - is_trap: True if capturing loses material
@@ -677,6 +687,8 @@ def would_capture_be_bad_quiescence(board: chess.Board, capture_square: chess.Sq
     
     capturer_color = not target.color
     captures = [m for m in board.legal_moves if m.to_square == capture_square and board.is_capture(m)]
+    if first_move is not None:
+        captures = [m for m in captures if m == first_move]
     if not captures:
         return False, 0, "No captures"
     
@@ -953,7 +965,10 @@ def find_free_captures_with_check(board: chess.Board, side_to_move: chess.Color,
             continue
 
         # Quiescence to verify capture is genuinely free (not a trap)
-        is_trap, net_gain, _ = would_capture_be_bad_quiescence(board, move.to_square, threshold=0, max_depth=max_depth)
+        # Evaluate THIS checking capture, not the best capture onto the square
+        # (a non-checking capture of the same piece must not lend its score).
+        is_trap, net_gain, _ = would_capture_be_bad_quiescence(
+            board, move.to_square, threshold=0, max_depth=max_depth, first_move=move)
 
         if not is_trap and net_gain >= 1:
             free_captures.append((move, captured_piece, net_gain))

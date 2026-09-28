@@ -4,7 +4,7 @@
 // This is the app's version register: bump it on every shipped change, and
 // update the footer in index.html to match (they silently diverged for 18
 // versions after v0.8.0).
-const CACHE_NAME = 'zugwise-v0.12.7';    // re-copy inserted placeholders after deletes too
+const CACHE_NAME = 'zugwise-v0.12.8';    // free-capture-with-check evaluates the checking capture itself
 
 // Origins that don't send CORS headers — must use no-cors (gives opaque responses)
 const NO_CORS_ORIGINS = ['docs.opencv.org', 'cdn.tailwindcss.com'];
