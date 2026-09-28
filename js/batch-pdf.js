@@ -13,6 +13,18 @@ var BatchPdf = (function() {
   var pdfjsLoaded = false;
   var pdfjsLoadPromise = null;
 
+  // What to tell the user when pdf.js cannot be loaded. Offline it is almost
+  // always "not cached yet" (the service worker precaches it from v0.12.2 on,
+  // which needs one online visit after an update), so say that instead of
+  // blaming a CDN the user cannot reach anyway.
+  function _pdfUnavailableMessage() {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      return 'PDF support is not available offline yet: open Zugwise once while ' +
+             'online so it can be cached, or convert the PDF to an image first';
+    }
+    return 'pdf.js could not be loaded from the CDN';
+  }
+
   /**
    * Ensure pdf.js is loaded. Lazy-loads on first use.
    */
@@ -48,7 +60,7 @@ var BatchPdf = (function() {
           }
         };
         fallback.onerror = function() {
-          reject(new Error('pdf.js CDN unavailable'));
+          reject(new Error(_pdfUnavailableMessage()));
         };
         document.head.appendChild(fallback);
       };
@@ -88,7 +100,7 @@ var BatchPdf = (function() {
             }
           };
           fallback.onerror = function() {
-            reject(new Error('pdf.js CDN unavailable'));
+            reject(new Error(_pdfUnavailableMessage()));
           };
           document.head.appendChild(fallback);
         });

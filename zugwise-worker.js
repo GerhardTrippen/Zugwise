@@ -50,10 +50,18 @@ async function initWorker(loadOnnx = true) {
 
         postMessage({ type: 'status', message: 'Installing python-chess...' });
 
-        // Install python-chess via micropip
+        // Install python-chess from the vendored wheel (precached by the service
+        // worker), exactly as search-worker.js does. A bare install('chess')
+        // goes to PyPI and only worked offline while that download happened to
+        // sit in the runtime cache, which every CACHE_NAME bump deletes.
+        const chessWheelUrl = new URL('vendor/chess-1.10.0-py3-none-any.whl', self.location).href;
+        pyodide.globals.set('CHESS_WHEEL_URL', chessWheelUrl);
         await pyodide.runPythonAsync(`
 import micropip
-await micropip.install('chess')
+try:
+    await micropip.install(CHESS_WHEEL_URL)
+except Exception:
+    await micropip.install('chess')  # network fallback
         `);
 
         // Load ONNX only when this worker will actually serve OCR. With the OCR

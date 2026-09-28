@@ -84,3 +84,47 @@
   background-position: center;
   opacity: 0.9;
 }
+
+/* Side-by-side review (move-list-sheets.js). Sheet cells are <th>
+   so the move-list td contract [num, white, black] stays intact. */
+#move-list-container:has(table.mls-on) { container-type: inline-size; }
+table.mls-on { table-layout: fixed; border-collapse: separate; border-spacing: 2px; }
+table.mls-on .mls-h-num { width: 2rem; }
+table.mls-on .mls-h { text-align: center; font-weight: 400; }
+table.mls-on .mls-s1b { border-left: 1px solid #4b5563; }
+table.mls-on .mls-narrow { display: none; }
+table.mls-on td.mls-mw, table.mls-on td.mls-mb { text-align: center; padding-left: 2px; padding-right: 2px; background: rgba(55, 65, 81, 0.45); border-radius: 4px; }
+table.mls-on tr:has(td.move-current) { background: rgba(253, 224, 71, 0.06); }
+.mls-cell { position: relative; height: 30px; padding: 1px; font-weight: 400; text-align: center; vertical-align: middle; cursor: pointer; border-radius: 4px; background: rgba(243, 244, 246, 0.92); overflow: hidden; }
+.mls-cell:hover { outline: 1px solid #9ca3af; outline-offset: -1px; }
+.mls-img { display: block; width: 100%; height: 28px; object-fit: contain; }
+.mls-text { background: rgba(55, 65, 81, 0.6); color: #d1d5db; border: 1px dashed #6b7280; font-size: 0.75rem; }
+.mls-missing, .mls-placeholder.mls-text { background: transparent; color: #6b7280; border: 1px dashed #4b5563; }
+/* Inserted cell echoing the settled move-list move: clearly not a reading. */
+.mls-inserted { color: #9ca3af; font-style: italic; font-size: 0.75rem; }
+/* Same red as .move-error: sheet reading differs from the move list. */
+.mls-disagree { box-shadow: inset 0 0 0 2px rgba(239, 68, 68, 0.9); }
+/* No OCR panel above in this layout: fill the column (its height is set by
+   the board / fix-suggestion panels) instead of the stacked 50vh cap.
+   contain:size keeps the long list from stretching the grid row itself. */
+#move-list-container.mls-tall { max-height: none; flex: 1 1 0; min-height: 50vh; contain: size; }
+#move-layout-toggle .mls-toggle-on { background: #2563eb; color: #fff; }
+
+/* Narrow move panel: each full move becomes a W line and a B line. */
+@container (max-width: 479px) {
+  table.mls-on, table.mls-on thead, table.mls-on tbody { display: block; }
+  table.mls-on tr { display: grid; grid-template-columns: 2rem repeat(3, minmax(0, 1fr)); gap: 2px; margin-bottom: 3px; }
+  table.mls-on tr > * { grid-row: 1; }
+  table.mls-on tr > td:first-child { grid-column: 1; }
+  table.mls-on .mls-s1w { grid-column: 2; }
+  table.mls-on .mls-mw { grid-column: 3; }
+  table.mls-on .mls-s2w { grid-column: 4; }
+  table.mls-on .mls-s1b { grid-column: 2; grid-row: 2; border-left: 0; }
+  table.mls-on .mls-mb { grid-column: 3; grid-row: 2; }
+  table.mls-on .mls-s2b { grid-column: 4; grid-row: 2; }
+  table.mls-on thead .mls-s1b, table.mls-on thead .mls-mb, table.mls-on thead .mls-s2b { display: none; }
+  table.mls-on .mls-wide { display: none; }
+  table.mls-on .mls-narrow { display: inline; }
+  table.mls-on.mls-single tr { grid-template-columns: 2rem repeat(2, minmax(0, 1fr)); }
+  table.mls-on td.mls-mw, table.mls-on td.mls-mb { display: flex; align-items: center; justify-content: center; }
+}

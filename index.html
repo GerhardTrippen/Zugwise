@@ -53,7 +53,7 @@
       "@type": "Person",
       "name": "Gerhard Trippen"
     },
-    "license": "https://polyformproject.org/licenses/noncommercial/1.0.0/",
+    "license": "https://www.gnu.org/licenses/agpl-3.0.html",
     "featureList": [
       "Handwritten chess scoresheet OCR using BiLSTM neural network",
       "Engine-validated chess game reconstruction",
@@ -315,7 +315,7 @@
                 <select id="batch-player-select" class="bg-gray-700 text-gray-200 rounded px-2 py-1 text-sm border border-gray-600 hidden" title="Player">
                   <option value="">-- Select Player --</option>
                 </select>
-                <button id="btn-batch-start" class="px-3 py-1.5 bg-green-600 hover:bg-green-500 rounded text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed" disabled>Start Batch OCR</button>
+                <button id="btn-batch-start" class="px-3 py-1.5 bg-green-600 hover:bg-green-500 rounded text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed disabled:animate-none disabled:ring-0" disabled>Start Batch OCR</button>
                 <button id="btn-batch-cancel" class="px-3 py-1.5 bg-red-700 hover:bg-red-600 rounded text-sm hidden">Cancel</button>
                 <button id="btn-batch-export-headers" class="px-3 py-1.5 bg-gray-600 hover:bg-gray-500 rounded text-sm hidden" title="Set PGN header defaults (Site, Event, Date…) applied to every exported game — fills gaps the tournament file left blank">✎ Edit Headers</button>
                 <button id="btn-batch-export-round" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm hidden" title="Concatenate all verified games in this round into one PGN file">Export Round PGN</button>
@@ -477,7 +477,7 @@
       </div>
       <div id="panel-moves" class="col-span-4">
         <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 h-full flex flex-col">
-          <h2 class="text-lg font-semibold mb-3 text-gray-200 flex items-center gap-2">Moves<span id="scoresheet-links" class="flex items-center gap-1"></span></h2>
+          <h2 class="text-lg font-semibold mb-3 text-gray-200 flex items-center gap-2">Moves<span id="scoresheet-links" class="flex items-center gap-1"></span><span id="move-layout-toggle" class="hidden ml-auto flex text-xs font-normal border border-gray-600 rounded overflow-hidden" role="group" aria-label="Dual-sheet layout"><button type="button" data-layout="stacked" class="px-2 py-0.5 text-gray-400 hover:text-gray-200" title="OCR panel above the move list">Stacked</button><button type="button" data-layout="side_by_side" class="px-2 py-0.5 text-gray-400 hover:text-gray-200" title="Both sheets' cells beside every move">Side by side</button></span></h2>
           <!-- Pairing header (round/board/date + players + result, populated when a batch game with pairing data is open) -->
           <div id="game-header" class="hidden mb-3 p-2 bg-gray-700/40 rounded border border-gray-600 text-sm">
             <div id="game-header-roundinfo" class="text-xs text-gray-400 whitespace-nowrap mb-1"></div>
@@ -518,7 +518,7 @@
       <!-- Keep in sync with CACHE_NAME in service-worker.js, which is bumped on
            every shipped change. They were last in sync at v0.8.0 (Mar 2026);
            this footer then sat still for 18 cache versions. -->
-      <div>Zugwise v0.12.1</div>
+      <div>Zugwise v0.12.7</div>
       <div class="flex items-center gap-4">
         <a href="https://buymeacoffee.com/zugwise" target="_blank" rel="noopener noreferrer"
            class="text-yellow-500 hover:text-yellow-400 flex items-center gap-1"
@@ -529,6 +529,11 @@
            class="text-gray-400 hover:text-gray-300 flex items-center gap-1"
            title="Report a bug or request a feature">
           🐛 <span class="hidden sm:inline">Report issue</span>
+        </a>
+        <a href="https://github.com/GerhardTrippen/Zugwise" target="_blank" rel="noopener noreferrer"
+           class="text-gray-400 hover:text-gray-300 flex items-center gap-1"
+           title="Source code, licensed under the GNU AGPL v3 or later">
+          📜 <span class="hidden sm:inline">Source (AGPL-3.0)</span>
         </a>
       </div>
       <div class="flex gap-4">
@@ -792,6 +797,7 @@
   <script src="js/board.js"></script>
   <script src="js/navigation.js"></script>
   <script src="js/ui.js"></script>
+  <script src="js/move-list-sheets.js"></script>
   <script src="js/fixes.js"></script>
   <script src="js/shift-ops.js"></script>
   <script src="js/ocr.js"></script>
@@ -819,6 +825,7 @@
   <script src="js/batch-dashboard.js"></script>
   <script src="js/batch-scoresheet-collect.js"></script>
   <script src="js/batch-game-list.js"></script>
+  <script src="js/batch-edit-log.js"></script>
   <script src="js/pgn-batch.js"></script>
   <script src="js/pgn-header-editor.js"></script>
   <script src="app.js"></script>

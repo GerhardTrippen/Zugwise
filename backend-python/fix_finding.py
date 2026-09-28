@@ -13,6 +13,7 @@ Combines multiple strategies:
 """
 
 import math
+import re
 import chess
 from typing import List, Dict, Optional, Set, Tuple
 from data_structures import OCRMove, Absurdity
@@ -2371,13 +2372,112 @@ def compute_future_capture_bonus(candidate_san: str, fix_ply: int, moves: List[s
 
 
 # =============================================================================
+# RECORD-REQUIREMENT CONSISTENCY ("rec_brk")
+# =============================================================================
+#
+# compute_future_capture_bonus (fut_cap) looks one way: it REWARDS a candidate
+# that puts a piece where the opponent later records a capture. The mirror case
+# had no signal: a candidate that DESTROYS what a later recorded move needs.
+# Reported case (Premier R1 B7, Sept 2026): 17...Bxe5 took the knight that the
+# record's 19...Nxe5 captures; nothing penalized it, reach could not tell (the
+# continuation was noisy either way), and the searches built three more wrong
+# "fixes" on top of it. The recorded future is evidence about the past:
+#
+#   (a) A later recorded capture 'x' onto square S by side C needs an enemy
+#       piece on S at that ply. A candidate that removes the piece that is on S
+#       (captures it, or is that piece moving away), or occupies S with a C
+#       piece, breaks that capture unless a recorded move of the other side
+#       lands on S in between.
+#   (b) A later recorded castling by side C needs the king and that rook
+#       unmoved. A candidate by C that moves the king, or that rook, breaks it.
+#
+# Only the FIRST later recorded reference to S is used (as fut_cap does):
+# what happens after it depends on moves we cannot trust yet. Everything is
+# read from the recorded text, so it works where reach cannot: when the
+# continuation is too noisy to replay. It is record consistency, not move
+# quality - no piece values, no judgement of the position (CLAUDE.md rule).
+# Weight set by the offline measurement in move_prior/analyze_record_break.py.
+RECORD_BREAK_WINDOW = 12   # plies of recorded future to consult
+W_RECORD_BREAK = 0         # per broken requirement; set from the measurement
+
+_CASTLE_RE = re.compile(r'^[O0o]-[O0o](-[O0o])?')
+
+
+def compute_record_break_penalty(board: chess.Board, move: chess.Move, fix_ply: int,
+                                 moves: List[str], window: int = RECORD_BREAK_WINDOW,
+                                 verbose: bool = False) -> Tuple[int, List[str]]:
+    """Number of later recorded requirements the candidate `move` (played at
+    `fix_ply` from `board`) makes impossible, and a short reason per break.
+    Pure: `board` is not modified. See the block comment above."""
+    reasons: List[str] = []
+    mover = board.turn
+    after = board.copy(stack=False)
+    try:
+        after.push(move)
+    except Exception:
+        return 0, reasons
+    end = min(len(moves), fix_ply + 1 + window)
+
+    # (b) castling rights consumed by this candidate
+    lost_k = board.has_kingside_castling_rights(mover) and not after.has_kingside_castling_rights(mover)
+    lost_q = board.has_queenside_castling_rights(mover) and not after.has_queenside_castling_rights(mover)
+    if lost_k or lost_q:
+        for k in range(fix_ply + 1, end):
+            if (k % 2 == 0) != (mover == chess.WHITE):
+                continue
+            t = (moves[k] or '').strip()
+            m = _CASTLE_RE.match(t)
+            if not m:
+                continue
+            long_side = bool(m.group(1))
+            if (long_side and lost_q) or (not long_side and lost_k):
+                reasons.append(f"recorded {t} at {ply_to_str(k)} needs castling rights")
+            break   # first recorded castling by this side only
+
+    # (a) recorded captures whose target this candidate removes
+    seen: set = set()
+    for k in range(fix_ply + 1, end):
+        t = (moves[k] or '').strip()
+        dest = extract_destination(t)
+        if not dest or dest in seen:
+            continue
+        seen.add(dest)                       # first reference to this square only
+        if 'x' not in t:
+            continue
+        capturer = chess.WHITE if k % 2 == 0 else chess.BLACK
+        sq = chess.parse_square(dest)
+        before_pc = board.piece_at(sq)
+        after_pc = after.piece_at(sq)
+        target_before = before_pc is not None and before_pc.color != capturer
+        target_after = after_pc is not None and after_pc.color != capturer
+        if not target_before or target_after:
+            continue
+        # A recorded move of the target's side landing on S before ply k could
+        # supply a new target; then the capture is not necessarily broken.
+        resupplied = False
+        for j in range(fix_ply + 1, k):
+            if (j % 2 == 0) == (capturer == chess.WHITE):
+                continue
+            if extract_destination((moves[j] or '').strip()) == dest:
+                resupplied = True
+                break
+        if not resupplied:
+            reasons.append(f"recorded {t} at {ply_to_str(k)} needs a piece on {dest}")
+    if verbose and reasons:
+        print(f"      [REC-BRK] {board.san(move)}: " + '; '.join(reasons))
+    return len(reasons), reasons
+
+
+# =============================================================================
 # PHASE 3: CHECK-BLOCKING SQUARE SEARCH
 # =============================================================================
 
 def _get_check_blocking_squares(board: chess.Board) -> Set[int]:
     """
-    Get squares that would block the current check.
-    Returns set of square indices, or empty set for knight/pawn checks.
+    Get squares that would neutralize the current check: the ray between a
+    sliding checker and the king, plus every checker's own square (capture).
+    A knight or pawn check has no ray, so only the checker's square is
+    returned. Empty only when the board is not in check.
     """
     if not board.is_check():
         return set()
@@ -2461,7 +2561,7 @@ def find_check_blocking_fixes(
     blocking_squares = _get_check_blocking_squares(board)
     if not blocking_squares:
         if verbose:
-            print(f"   [PHASE 3] No blocking squares (knight/pawn check) — aborting")
+            print(f"   [PHASE 3] No check-neutralizing squares — aborting")
         return []
 
     blocking_names = [chess.square_name(sq) for sq in blocking_squares]
@@ -4403,6 +4503,27 @@ def _search_single_ply_for_fixes(
         if future_capture_bonus != 0:
             unified_score += future_capture_bonus
 
+        # === PENALTY: breaks a later recorded capture / castling (rec_brk) ===
+        # Mirror of fut_cap; see compute_record_break_penalty. Measured Sept 27
+        # 2026 (move_prior/analyze_record_break.py): inert in ranking - Crown
+        # 1166 decisions 806 -> 806 CV (905 -> 904 with the prior), Premier
+        # 1232 697 -> 700 CV (836 -> 835 with the prior), and at 18-19
+        # decisions per corpus the CORRECT fix itself "breaks" a requirement
+        # because the later recorded move is the misread one. So W stays 0 and
+        # the count is kept as a labelled diagnostic: the oracle replays one
+        # error at a time, where reach already sees the break; the case that
+        # motivated it (compounded errors, unreplayable continuation) is not in
+        # these corpora.
+        record_breaks = 0
+        try:
+            record_breaks, _rb_why = compute_record_break_penalty(
+                board, legal_move, fix_ply, moves, verbose=verbose)
+        except Exception:
+            record_breaks = 0
+        record_break_penalty = W_RECORD_BREAK * record_breaks
+        if record_break_penalty:
+            unified_score -= record_break_penalty
+
         # === VERBOSE: Show scoring breakdown for candidates ===
         # At stuck_ply: show ALL legal candidates regardless of reach. Even
         # a zero-reach candidate (e.g. a disambig variant like Rdg2 that the
@@ -4456,6 +4577,7 @@ def _search_single_ply_for_fixes(
             'dist': -distance_penalty,
             'stuck': stuck_bonus,
             'fut_cap': future_capture_bonus,
+            'rec_brk': -record_break_penalty,
         }
 
         # === VERBOSE: Show score component breakdown for candidates we logged above ===

@@ -4,7 +4,7 @@
 // This is the app's version register: bump it on every shipped change, and
 // update the footer in index.html to match (they silently diverged for 18
 // versions after v0.8.0).
-const CACHE_NAME = 'zugwise-v0.12.1';    // comment refresh after v0.12.0 paper release
+const CACHE_NAME = 'zugwise-v0.12.7';    // re-copy inserted placeholders after deletes too
 
 // Origins that don't send CORS headers — must use no-cors (gives opaque responses)
 const NO_CORS_ORIGINS = ['docs.opencv.org', 'cdn.tailwindcss.com'];
@@ -78,6 +78,7 @@ const STATIC_ASSETS = [
   './js/sheets.js',
   './js/board.js',
   './js/navigation.js',
+  './js/move-list-sheets.js',
   './js/ui.js',
   './js/fixes.js',
   './js/shift-ops.js',
@@ -103,6 +104,7 @@ const STATIC_ASSETS = [
   './js/verification-ui.js',
   './js/batch-dashboard.js',
   './js/batch-game-list.js',
+  './js/batch-edit-log.js',
   './js/pgn-batch.js',
   './js/batch-grid-template.js',
   './js/batch-scoresheet-collect.js',
@@ -166,6 +168,17 @@ const CDN_ASSETS = [
   
   // Tailwind CSS (if using CDN version)
   'https://cdn.tailwindcss.com',
+
+  // Lazily loaded libraries. These MUST be precached: the runtime cache-first
+  // fallback only keeps what was fetched since the last CACHE_NAME bump, and
+  // activate deletes the old cache, so a library used once before an update
+  // silently stops working offline after it. Found offline in Sept 2026: PDF
+  // scans failed with "pdf.js CDN unavailable".
+  //   pdf.js 4.x ships ES modules only (batch-pdf.js imports these two).
+  'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.min.mjs',
+  'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.worker.min.mjs',
+  //   SheetJS, for SwissManager .xls/.xlsx pairing files (batch-tournament.js, app.js)
+  'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js',
 ];
 
 // Install event - cache all static assets

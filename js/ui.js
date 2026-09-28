@@ -578,6 +578,10 @@ function renderMoveList(){
     tbody.appendChild(tr);
   });
 
+  // Optional side-by-side dual-sheet layout (move-list-sheets.js) adds the
+  // per-sheet cells to the rows just built; no-op in the stacked layout.
+  if (window.MoveListSheets) window.MoveListSheets.decorate();
+
   // Add click handlers for delete buttons
   document.querySelectorAll('.delete-from-here').forEach(function(btn){
     btn.onclick = function(e){

@@ -933,6 +933,7 @@ function deleteDualPly(moveNum, plyColor, sheetColor) {
 
   sheet.splice(idx, 1);
   renumberSheetCells(sheet);
+  refreshInsertedPlaceholders();
   var changePly = (moveNum - 1) * 2 + (plyColor === 'w' ? 0 : 1);
   // Drop stale per-sheet metadata at/after the change point — see helper docs.
   clearStaleMetadataFromMoveNum(moveNum);
@@ -949,6 +950,12 @@ function deleteDualPly(moveNum, plyColor, sheetColor) {
 function _backfillPlaceholdersFromOtherSheet(sheet, sheetColor) {
   var otherSheet = (sheetColor === 'w') ? state.ocrCellsSheet2 : state.ocrCellsSheet1;
   if (!otherSheet) return;
+
+  // Earlier placeholders were filled once, at their own insert; this insert
+  // shifted them (and, for the other sheet's placeholders, their source).
+  // Re-copy every placeholder on both sheets from its CURRENT position first.
+  _refreshInsertedPlaceholderCopies(sheet, otherSheet);
+  _refreshInsertedPlaceholderCopies(otherSheet, sheet);
 
   // Index the other sheet by (num, color)
   var otherIndex = {};
@@ -971,6 +978,45 @@ function _backfillPlaceholdersFromOtherSheet(sheet, sheetColor) {
       if (other.lenientAlternatives) sheet[i].lenientAlternatives = other.lenientAlternatives.slice();
       log('📋 Back-filled ' + key + ' from other sheet: "' + other.move + '"');
     }
+  }
+}
+
+/**
+ * Re-copy already back-filled placeholders from the other sheet's cell at
+ * their current (num, color). A placeholder's text is a copy made when it was
+ * inserted; a second insert on the same sheet shifts it one ply on (two
+ * inserts before 8.W both held the other sheet's 8.W text), so it must be
+ * refreshed after every insert. In dual-sheet mode a placeholder's move is
+ * only ever '???' or such a copy — user corrections live in _correctedMove —
+ * so overwriting it loses nothing. No real reading there → back to '???'.
+ * @param {Array} sheet - sheet whose placeholders are refreshed
+ * @param {Array} otherSheet - sheet they are copied from
+ */
+function refreshInsertedPlaceholders() {
+  // After a delete (which shifts placeholders just like an insert does).
+  _refreshInsertedPlaceholderCopies(state.ocrCellsSheet1, state.ocrCellsSheet2);
+  _refreshInsertedPlaceholderCopies(state.ocrCellsSheet2, state.ocrCellsSheet1);
+}
+
+function _refreshInsertedPlaceholderCopies(sheet, otherSheet) {
+  if (!sheet || !otherSheet) return;
+  var otherIndex = {};
+  for (var i = 0; i < otherSheet.length; i++) {
+    otherIndex[otherSheet[i].num + '_' + otherSheet[i].color] = otherSheet[i];
+  }
+  for (var j = 0; j < sheet.length; j++) {
+    var cell = sheet[j];
+    if (cell._source !== 'user-insert' || cell.move === '???') continue;
+    var key = cell.num + '_' + cell.color;
+    var src = otherIndex[key];
+    var real = src && src._source !== 'user-insert' && src.move && src.move !== '???';
+    var next = real ? src.move : '???';
+    if (cell.move === next) continue;
+    log('📋 Re-copied placeholder ' + key + ': "' + cell.move + '" → "' + next + '"');
+    cell.move = next;
+    cell.confidence = real ? (src.confidence || 0) : 0;
+    cell.alternatives = (real && src.alternatives) ? src.alternatives.slice() : [];
+    cell.lenientAlternatives = (real && src.lenientAlternatives) ? src.lenientAlternatives.slice() : [];
   }
 }
 

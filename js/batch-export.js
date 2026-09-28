@@ -202,7 +202,8 @@ var BatchExport = (function() {
     bs.games.forEach(function(g) {
       if (g.round !== round) return;
       // Verified state comes from game-list status constants.
-      var isVerified = (g.status === 'verified' || g.status === 'exported');
+      var isVerified = (g.status === 'verified' || g.status === 'exported') ||
+                       !!_savedRecordSans(g);
       var hasResult = !!(bs.reconstructResults && bs.reconstructResults[g.gameId] &&
                          bs.reconstructResults[g.gameId].picked);
       if (!isVerified && !(includeUnverified && hasResult)) return;
@@ -218,7 +219,8 @@ var BatchExport = (function() {
 
     var pgns = [];
     games.forEach(function(g) {
-      var moves = _movesForGame(g, bs);
+      var isV = (g.status === 'verified' || g.status === 'exported');
+      var moves = (!isV && _savedRecordSans(g)) || _movesForGame(g, bs);
       if (!moves || moves.length === 0) return;
 
       var headers = _headersForGame(g, tournamentData, options);
@@ -294,7 +296,7 @@ var BatchExport = (function() {
     bs.games.forEach(function(g) {
       if (g.round !== round) return;
       var isVerified = (g.status === 'verified' || g.status === 'exported');
-      if (isVerified) return;
+      if (isVerified || _savedRecordSans(g)) return;
       games.push(g);
       if (g.section) sections[g.section] = true;
     });
@@ -420,10 +422,16 @@ var BatchExport = (function() {
     games.forEach(function(g) {
       var isVerified = (g.status === 'verified' || g.status === 'exported');
       var headers = _headersForGame(g, tournamentData, options);
+      // A game with a saved record (locked, or reopened and not re-verified)
+      // exports that record, never a partial rebuilt from raw OCR.
+      var savedSans = isVerified ? null : _savedRecordSans(g);
 
       if (isVerified) {
         var moves = _movesForGame(g, bs);
         pgns.push(generatePgn(g, moves, headers));
+        verifiedCount++;
+      } else if (savedSans) {
+        pgns.push(generatePgn(g, savedSans, headers));
         verifiedCount++;
       } else {
         var confirmedMoves = _confirmedPrefixForGame(g, bs);
@@ -544,10 +552,16 @@ var BatchExport = (function() {
     games.forEach(function(g) {
       var isVerified = (g.status === 'verified' || g.status === 'exported');
       var headers = _headersForGame(g, tournamentData, options);
+      // A game with a saved record (locked, or reopened and not re-verified)
+      // exports that record, never a partial rebuilt from raw OCR.
+      var savedSans = isVerified ? null : _savedRecordSans(g);
 
       if (isVerified) {
         var moves = _movesForGame(g, bs);
         pgns.push(generatePgn(g, moves, headers));
+        verifiedCount++;
+      } else if (savedSans) {
+        pgns.push(generatePgn(g, savedSans, headers));
         verifiedCount++;
       } else {
         var confirmedMoves = _confirmedPrefixForGame(g, bs);
@@ -999,7 +1013,34 @@ var BatchExport = (function() {
   // Helpers — shared
   // =========================================================================
 
+  /**
+   * The game's last SAVED record, when it is the authority for export:
+   *   - locked (resumed from its saved PGN, not reopened): game.savedPgn
+   *   - reopened but not verified again: game._reopenedFrom (the saved PGN
+   *     stays the record until the operator re-verifies; batch-edit-log.js)
+   * Returns a SAN array or null.
+   *
+   * Why: a resumed game's live state / workingState is rebuilt from raw
+   * cached OCR (or is absent if the game was never opened this session), so
+   * exporting from it wrote finished games as empty or as short "incomplete"
+   * prefixes and overwrote a good round PGN (Sept 2026, Premier R1: B9/B10
+   * with 0 plies, B6/B8 as 18- and 39-ply incompletes, while their own saved
+   * PGNs had 88-120 plies).
+   */
+  function _savedRecordSans(game) {
+    if (!game) return null;
+    var rec = game.savedPgn || game._reopenedFrom || null;
+    if (rec && Array.isArray(rec.sans) && rec.sans.length > 0) return rec.sans.slice();
+    return null;
+  }
+
   function _movesForGame(game, bs) {
+    // A locked (resumed, not reopened) game: the saved PGN IS the record; the
+    // live state shows raw OCR. See _savedRecordSans.
+    if (game && game.savedPgn) {
+      var _saved = _savedRecordSans(game);
+      if (_saved) return _saved;
+    }
     // The user-confirmed move list is authoritative — NOT the raw algorithm
     // `picked` output. `picked.result.moves` is the algorithm's *proposal*; it
     // is never rewritten when the user overrides a fix during verification

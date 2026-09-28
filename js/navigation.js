@@ -272,6 +272,12 @@ async function updateOcrContextPanel(overridePly){
   var content=document.getElementById('ocr-context-content');
   if(!panel||!content)return;
 
+  // Side-by-side layout shows every row's sheet cells in the move list itself.
+  if(window.MoveListSheets && window.MoveListSheets.isActive()){
+    panel.classList.add('hidden');
+    return;
+  }
+
   // Hide for PGN input (no OCR data)
   if(state.inputMode==='pgn'||(!state.hasGridImage&&(!state.ocrCells||state.ocrCells.length===0))){
     panel.classList.add('hidden');
@@ -323,13 +329,20 @@ async function updateOcrContextPanel(overridePly){
           numHtml += '<img src="data:image/jpeg;base64,' + data.image + '" class="rounded border border-gray-600 w-full" alt="OCR context">';
           numHtml += '</div>';
           content.innerHTML = numHtml;
-          panel.classList.remove('hidden');
+          if(!(window.MoveListSheets && window.MoveListSheets.isActive())) panel.classList.remove('hidden');
           return;
         }
       }
     }catch(e){
       log('⚠ OCR context fetch error: '+e.message);
     }
+  }
+
+  // Re-check after the await above: the layout may have been switched to
+  // side-by-side while the fetch was in flight.
+  if(window.MoveListSheets && window.MoveListSheets.isActive()){
+    panel.classList.add('hidden');
+    return;
   }
 
   // Dual-sheet mode: show both sheets' OCR context side by side

@@ -705,6 +705,12 @@ var BatchOcrQueue = (function() {
 
     try {
       var result = await this._processGame(item.game);
+      // Replay the operator's structural edits (truncation, inserts/deletes,
+      // NW edits) onto cached OCR before anything sees it; a fresh OCR drops
+      // the old log. See batch-edit-log.js. Never throws.
+      if (window.BatchEditLog) {
+        await window.BatchEditLog.attach(this.outputDirHandle, item.gameId, result);
+      }
       this.results[item.gameId] = result;
 
       // Cache hits installed theirs inside _processGame (restoreCachedCtcLogits).

@@ -10,7 +10,7 @@
  *     <original images, e.g. Section/Round N/Board N/...>   (untouched)
  *     Zugwise/
  *       PGN/    .pgn, _incomplete.pgn, error .csv
- *       OCR/    .txt, .p1.txt, .p2.txt
+ *       OCR/    .txt, .p1.txt, .p2.txt, .edits.json (structural edit log)
  *       grid/   .grid.json, .p1.grid.json, .p2.grid.json
  *       logits/ .logits.bin — raw per-cell CTC logits (see below)
  *
@@ -51,6 +51,9 @@ var BatchPaths = (function() {
   function subdirFor(filename) {
     if (/\.logits\.(bin|npz)$/i.test(filename)) return 'logits';
     if (/\.grid\.json$/i.test(filename)) return 'grid';
+    // Structural edit log (batch-edit-log.js) lives beside the OCR it edits;
+    // .edits.stale.json is the set-aside copy of a log that no longer fits.
+    if (/\.edits(\.stale)?\.json$/i.test(filename)) return 'OCR';
     if (/\.txt$/i.test(filename)) return 'OCR';
     if (/\.(pgn|csv)$/i.test(filename)) return 'PGN';
     return null;
@@ -162,12 +165,34 @@ var BatchPaths = (function() {
     return await _readBinFrom(baseHandle, filename);
   }
 
+  /**
+   * readText plus the file's lastModified (ms), with the same subfolder-first
+   * fallback. Used by resume to tell which of two saved records is newer.
+   * @returns {Promise<{text:string, lastModified:number}|null>}
+   */
+  async function readTextWithMeta(baseHandle, filename) {
+    async function from(dirHandle) {
+      try {
+        var fh = await dirHandle.getFileHandle(filename);
+        var file = await fh.getFile();
+        return { text: await file.text(), lastModified: file.lastModified || 0 };
+      } catch (e) { return null; }
+    }
+    var dir = await resolveDir(baseHandle, filename, false);
+    if (dir && dir !== baseHandle) {
+      var hit = await from(dir);
+      if (hit) return hit;
+    }
+    return await from(baseHandle);
+  }
+
   return {
     ROOT_DIR: ROOT_DIR,
     subdirFor: subdirFor,
     resolveDir: resolveDir,
     writeText: writeText,
     readText: readText,
+    readTextWithMeta: readTextWithMeta,
     writeBinary: writeBinary,
     readBinary: readBinary
   };

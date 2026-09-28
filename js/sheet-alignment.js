@@ -2072,6 +2072,7 @@
       sheet.splice(idx, spliceCount);
 
       if (typeof renumberSheetCells === 'function') renumberSheetCells(sheet);
+      if (typeof refreshInsertedPlaceholders === 'function') refreshInsertedPlaceholders();
       // changePly = ply of the deleted full move on the merged sequence —
       // moves before this stay confirmed so re-validation resumes near the
       // edit instead of jumping back to move 1.
@@ -3704,6 +3705,9 @@
     // Backfill placeholders from other sheet for inserts.
     if (sug.action === 'insert' && typeof _backfillPlaceholdersFromOtherSheet === 'function') {
       _backfillPlaceholdersFromOtherSheet(sheet, sheetSide);
+    } else if (typeof refreshInsertedPlaceholders === 'function') {
+      // Deletes shift earlier placeholders too; re-copy them.
+      refreshInsertedPlaceholders();
     }
     // Advance searchFrom past the change so the next pass continues forward.
     state.nwSearchFrom = Math.max(0, changePly - 4);

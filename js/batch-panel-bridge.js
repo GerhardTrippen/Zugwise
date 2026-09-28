@@ -114,14 +114,17 @@ var BatchPanelBridge = (function() {
       try { setSearchButtonsEnabled(true); } catch (e) {}
     }
 
+    // Make sure the panels are visible — clearPanelLog doesn't toggle the
+    // container (#search-progress, hidden by default). This used to run only
+    // AFTER the no-aggregate early return below, so a game opened before the
+    // orchestrator reached it (e.g. while it waited for truncation) kept the
+    // Algorithm Lab empty for the whole run: every step rendered into hidden
+    // panels (Sept 2026, Premier R1 B7).
+    if (typeof showSearchPanels === 'function') showSearchPanels(true);
+
     if (!_orchestrator || typeof _orchestrator.getResult !== 'function') return;
     var agg = _orchestrator.getResult(gameId);
     if (!agg) return;
-
-    // Make sure the panels are visible — clearPanelLog doesn't toggle the
-    // container, and the user may have hit this game before the orchestrator
-    // ever reached it.
-    if (typeof showSearchPanels === 'function') showSearchPanels(true);
 
     // If the game is already verified (or exported), the stored orchestrator
     // result is a completed-past-tense view — replaying it would paint
@@ -230,6 +233,9 @@ var BatchPanelBridge = (function() {
     // an already-'running' method). handleSearchComplete hides it again on
     // completion.
     if (step && !step.done) _setCancelVisible(method, true);
+    // Belt and braces for the same hidden-container case: a live step for the
+    // open game must be visible.
+    if (typeof showSearchPanels === 'function') showSearchPanels(true);
     if (typeof handleSearchStep === 'function') {
       handleSearchStep(method, step);
     }

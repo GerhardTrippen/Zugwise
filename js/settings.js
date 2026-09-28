@@ -33,7 +33,11 @@ var DEFAULT_SETTINGS = {
   // extracted cell before OCR. Defeats the "|a5"→Ng6 corruption where the rule
   // is read as a leading piece letter. Read by grid-slide.js via the
   // window.currentSettings mirror.
-  clean_vertical_lines: true
+  clean_vertical_lines: true,
+  // Dual-sheet review layout: 'stacked' = OCR context panel above the move
+  // list (default); 'side_by_side' = both sheets' cells beside every move
+  // (move-list-sheets.js). Toggled from the Moves header, not this modal.
+  move_list_layout: 'stacked'
 };
 
 var currentSettings = null;

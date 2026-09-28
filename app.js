@@ -174,7 +174,7 @@ document.addEventListener('DOMContentLoaded',async function(){
     hidePyodideLoadingOverlay();
   }
 
-  log('Zugwise v0.8.0 ready'+(CONFIG.usePyodide?' (client-side mode)':' (server mode)'));
+  log('Zugwise v0.12.7 ready'+(CONFIG.usePyodide?' (client-side mode)':' (server mode)'));
 });
 
 function setupEventListeners(){
@@ -458,6 +458,18 @@ function resetGameState(){
   if(fixList) fixList.innerHTML='';
   var legalMoves=document.getElementById('legal-moves');
   if(legalMoves) legalMoves.innerHTML='';
+  // The "All legal moves at 1.W (20)" header lives in two spans outside
+  // #legal-moves and survived the reset, as did the batch "✂️ Next (4) →"
+  // button (renderNextReadyNav only runs from batch code). Seen Sept 2026
+  // after leaving batch mode for single-game mode.
+  var legalPos=document.getElementById('legal-position');
+  if(legalPos) legalPos.textContent='';
+  var legalCount=document.getElementById('legal-count');
+  if(legalCount) legalCount.textContent='0';
+  var nextNav=document.getElementById('batch-next-ready-nav');
+  if(nextNav){ nextNav.innerHTML=''; nextNav.classList.add('hidden'); }
+  var fixDetails=document.getElementById('fix-details');
+  if(fixDetails) fixDetails.classList.add('hidden');
   var srcPreview=document.getElementById('source-preview');
   if(srcPreview) srcPreview.classList.add('hidden');
   var ocrCtx=document.getElementById('ocr-context-panel');
@@ -665,6 +677,17 @@ function initBatchHandlers() {
   var playerSelect = document.getElementById('batch-player-select');
   var btnStart = document.getElementById('btn-batch-start');
   var btnCancel = document.getElementById('btn-batch-cancel');
+  // Pulse Start after a round/player is picked until it is clicked. Picking a
+  // round only lists its games; nothing (not even cached OCR) loads until
+  // Start, and forgetting that made rows look dead. Auto-start was rejected on
+  // purpose: the user may want to look at the round first, or picked the wrong
+  // one. A disabled button never pulses (disabled:animate-none in index.html).
+  function _setStartPulse(on) {
+    ['animate-pulse', 'ring-2', 'ring-green-300'].forEach(function(c) {
+      btnStart.classList.toggle(c, !!on);
+    });
+    btnStart.title = on ? 'Click to load this round: finished games come from their cache, new ones are read' : '';
+  }
   var btnTournament = document.getElementById('btn-batch-tournament');
   var tournamentInput = document.getElementById('batch-tournament-input');
 
@@ -1119,6 +1142,7 @@ function initBatchHandlers() {
     }
     window.BatchGameList.selectRound(round);
     btnStart.disabled = false;
+    _setStartPulse(true);
     var summary = document.getElementById('batch-summary');
     var games = window.BatchGameList.batchState.games;
     var sec = window.BatchGameList.batchState.selectedSection;
@@ -1232,6 +1256,7 @@ function initBatchHandlers() {
       }
       window.BatchGameList.selectPlayer(key);
       btnStart.disabled = false;
+      _setStartPulse(true);
       var summary = document.getElementById('batch-summary');
       var games = window.BatchGameList.batchState.games;
       var name = window.BatchGameList.batchState.selectedPlayerName || 'player';
@@ -1248,6 +1273,7 @@ function initBatchHandlers() {
 
   // Start batch OCR
   btnStart.onclick = function() {
+    _setStartPulse(false);
     btnStart.disabled = true;
     btnCancel.classList.remove('hidden');
     window.BatchGameList.startBatchOcr();

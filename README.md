@@ -124,9 +124,25 @@ The OCR model architecture is informed by work from Eicher, Farmer, Li, and Maji
 
 ## License
 
-This project is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). You are free to use and share Zugwise for any non-commercial purpose, including chess clubs and tournaments (even those with entry fees).
+Copyright (C) 2025-2026 Gerhard Trippen
 
-For commercial inquiries, please contact the author.
+Zugwise is free software: you can redistribute it and/or modify it under the
+terms of the [GNU Affero General Public License](LICENSE) as published by the
+Free Software Foundation, either version 3 of the License, or (at your option)
+any later version (SPDX: `AGPL-3.0-or-later`).
+
+Zugwise is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+If you run a modified version of Zugwise for others over a network, the AGPL
+requires you to offer them its source code. The source of this deployment is
+this repository.
+
+Third-party components keep their own licences, among them
+[python-chess](https://python-chess.readthedocs.io/) (GPL-3.0-or-later, with
+which the AGPL is compatible) and the piece sets listed in
+`frontend/pieces/PIECES-LICENSE.md`.
 
 ---
 
